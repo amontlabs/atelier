@@ -4,8 +4,8 @@
 //! the shared state and its locks, runs with process groups and the survivor scan, the tree id,
 //! and plain refs. Module 3.3: `start`, `follow` and the branch record rules (`stack`). Module
 //! 3.4: `approve`, `merge` (`gate`, `bisect`), `promote` and the versioned records (`ledger`).
-//! Module 3.5: `tmp` and `clean`. Module 3.6: machines, `test` and remote runs. Other commands
-//! come in later modules.
+//! Module 3.5: `tmp` and `clean`. Module 3.6: machines, `test` and remote runs. Module 3.8:
+//! `status` and the conflict forecast.
 
 pub mod agents;
 pub mod approve;
@@ -18,6 +18,7 @@ pub mod dispatch;
 pub mod exchange;
 pub mod exit;
 pub mod follow;
+pub mod forecast;
 pub mod fsutil;
 pub mod gate;
 pub mod gate_machines;
@@ -45,6 +46,7 @@ pub mod source;
 pub mod stack;
 pub mod start;
 pub mod state;
+pub mod status;
 pub mod task;
 pub mod template;
 pub mod testcmd;

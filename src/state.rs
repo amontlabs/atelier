@@ -134,6 +134,23 @@ impl State {
         Ok(Versioned { dir, _state: self })
     }
 
+    /// The versioned layer as it is, for `status`: read only, never created or converted.
+    /// `Ok(None)` when it does not exist yet; refuses (4) a format other than `current`.
+    pub fn versioned_view(&self, current: u32) -> Result<Option<Versioned<'_>>> {
+        match self.format()? {
+            None => Ok(None),
+            Some(f) if f == current => Ok(Some(Versioned {
+                dir: self.versioned_dir(),
+                _state: self,
+            })),
+            Some(_) => Err(Failure::refused(
+                self.format_line(current)
+                    .err()
+                    .unwrap_or_else(|| "state format differs".to_owned()),
+            )),
+        }
+    }
+
     /// Reports whether the versioned layer matches, for `status`, which never converts.
     pub fn format_line(&self, current: u32) -> std::result::Result<(), String> {
         match self.format() {

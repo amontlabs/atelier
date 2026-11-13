@@ -166,8 +166,7 @@ fn each_worktree_runs_the_version_its_tree_pins() {
     .unwrap();
 
     let out = repo.atelier(&["status"]);
-    assert_eq!(code(&out), 2, "{}", stderr(&out));
-    assert!(stderr(&out).contains("status: not built yet"));
+    assert_eq!(code(&out), 0, "{}", stderr(&out));
 
     let out = repo.atelier_in(&wt, &["status"]);
     assert_eq!(code(&out), 4);
@@ -176,21 +175,6 @@ fn each_worktree_runs_the_version_its_tree_pins() {
     // One state folder, in the common git dir, shared by every worktree.
     assert!(repo.root.join(".git/atelier/state.lock").is_file());
     assert!(!repo.root.join(".git/worktrees/wt/atelier").exists());
-}
-
-#[test]
-fn stub_commands_preflight_then_exit_2() {
-    let repo = Repo::new();
-    repo.install_self(VERSION);
-    repo.write_settings(VERSION);
-    repo.commit_all("pin");
-    let out = repo.atelier(&["status"]);
-    assert_eq!(code(&out), 2, "{}", stderr(&out));
-    assert!(
-        stderr(&out).contains("not built yet (module 3.8)"),
-        "{}",
-        stderr(&out)
-    );
 }
 
 #[test]
@@ -287,7 +271,7 @@ fn versioned_commands_need_the_version_pinned_on_main() {
     assert!(stderr(&out).contains("runs only with the atelier version pinned on main (9.9.9)"));
     assert!(!repo.root.join(".git/atelier/versioned").exists());
     // Commands of the frozen layer still run.
-    assert_eq!(code(&repo.atelier(&["status"])), 2);
+    assert_eq!(code(&repo.atelier(&["status"])), 0);
 
     // The version pinned on main creates the layer with its format.
     repo.commit_all("pin back");
@@ -337,7 +321,7 @@ fn status_reports_every_failed_preflight_line() {
         ),
     );
     let out = repo.atelier(&["status"]);
-    assert_eq!(code(&out), 2);
+    assert_eq!(code(&out), 0);
     let text = stdout(&out);
     assert!(text.contains("ok     version"), "{text}");
     assert!(text.contains("FAILED settings"), "{text}");

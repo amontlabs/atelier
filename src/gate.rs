@@ -262,6 +262,24 @@ pub fn run_with(
             )));
         }
     }
+
+    // The forecast only warns.
+    let open = crate::forecast::open_branches(&stack);
+    let main = crate::forecast::Open {
+        name: integration.clone(),
+        tip: old.clone(),
+    };
+    let forecast = crate::forecast::forecast(
+        &ctx.checkout,
+        &main,
+        &open,
+        &regenerated_paths(&old_settings),
+    );
+    let batch: Vec<String> = items.iter().map(|i| i.name.clone()).collect();
+    for line in crate::forecast::warning_lines(&forecast, &batch) {
+        println!("{line}");
+    }
+
     let names: Vec<String> = platform_names(&merged)
         .into_iter()
         .filter(|p| waived(waivers, p).is_none())
@@ -1141,7 +1159,7 @@ pub enum Merged {
 /// The configuration every git command of the gate's merges carries: no global attributes
 /// file (with `GIT_ATTR_NOSYSTEM=1`, no system one either), no reused resolutions, no
 /// renormalization, renames found.
-const GATE_CONFIG: &[&str] = &[
+pub(crate) const GATE_CONFIG: &[&str] = &[
     "-c",
     "core.attributesFile=/dev/null",
     "-c",

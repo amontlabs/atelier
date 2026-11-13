@@ -4,6 +4,7 @@
 use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use crate::exit::{Failure, Result};
 
@@ -19,10 +20,21 @@ const REDIRECTING_VARS: &[&str] = &[
     "GIT_ALTERNATE_OBJECT_DIRECTORIES",
 ];
 
+static READ_ONLY: AtomicBool = AtomicBool::new(false);
+
+/// Makes every git command this process starts leave the repository as it is: `git status` and
+/// friends then never refresh the index (`GIT_OPTIONAL_LOCKS=0`). `status` turns it on.
+pub fn set_read_only() {
+    READ_ONLY.store(true, Ordering::Relaxed);
+}
+
 /// A git command in a given folder.
 pub fn command(dir: &Path) -> Command {
     let mut cmd = Command::new("git");
     cmd.current_dir(dir).stdin(Stdio::null());
+    if READ_ONLY.load(Ordering::Relaxed) {
+        cmd.env("GIT_OPTIONAL_LOCKS", "0");
+    }
     for var in REDIRECTING_VARS {
         cmd.env_remove(var);
     }

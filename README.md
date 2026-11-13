@@ -10,7 +10,7 @@ parts the project uses.
 The design is kept outside this repository (`DESIGN.md`, revision 5, with mechanics in
 `DESIGN-r4.md`). The formats every version shares are in [docs/FROZEN-LAYER.md](docs/FROZEN-LAYER.md).
 
-## Status: modules 3.1 to 3.7
+## Status: modules 3.1 to 3.8
 
 Built so far, with tests on throwaway git repositories:
 
@@ -62,7 +62,13 @@ commit's pinned atelier, mode A promotion (checks a–e, one local push in its o
 the wait and exit 7, interrupted promotions reported path by path), and red batch bisection.
 Platforms of other machines run on machines chosen as `atelier test` chooses them, all at once.
 
-The other command (`status`) comes in a later module.
+`atelier status [--json]` (module 3.8, [docs/STATUS.md](docs/STATUS.md)) is the one read-only view:
+the preflight lines, `main` and any pending or interrupted promotion, approvals not yet merged,
+merges not yet cleaned, the last runs, each platform's last result and the waivers since, the
+machines as `atelier machines` prints them, branches that must `follow`, worktrees with no merge
+record, flaky tests, and the conflict forecast (`git merge-tree` for every pair of open branches
+and each against `main`, touching no file). `merge` prints the forecast's pairs that involve the
+batch as warnings and refuses nothing.
 
 ## Layout
 
@@ -87,6 +93,7 @@ The other command (`status`) comes in a later module.
 | `approve`, `gate`, `promote`, `bisect` | `approve`; `merge` (preconditions, gate worktree, merges, hooks, platforms); mode A promotion and `promote`; red batch bisection |
 | `gate_machines` | the gate's platforms on the owner's machines: availability first, every platform at once, remote runs bound to the merged commit |
 | `ledger` | the versioned layer's approvals, `merges.tsv` and promotion record |
+| `status`, `forecast` | `status` (module 3.8); the conflict forecast `status` and `merge` print |
 | `check`, `prereq`, `nextest` | the `check` command; tool and mbx prerequisites; nextest flags, file refusals and result parsing |
 | `testcmd` | `test`, `machines`, `machines init` |
 | `jobs` | a platform's job (preparation, command or run) and the machine preflight |

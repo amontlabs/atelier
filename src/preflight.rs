@@ -151,57 +151,80 @@ pub struct Line {
     pub detail: String,
 }
 
+/// What `status` learns from the preflight: its lines, and the pieces that could be read. The
+/// state lock is held shared while `state` lives.
+#[derive(Debug, Default)]
+pub struct Report {
+    pub lines: Vec<Line>,
+    pub state: Option<State>,
+    pub checkout: Option<Checkout>,
+    pub settings: Option<Settings>,
+    /// The version pinned on the integration branch matches this program: only then are the
+    /// versioned records read.
+    pub pinned_here: bool,
+}
+
 /// The preflight as `status` reports it: every check, none stopping the others, nothing
-/// converted. Also returns the shared state lock when it could be taken, held by the caller.
-pub fn report(cwd: &Path) -> (Vec<Line>, Option<State>) {
-    let mut lines = Vec::new();
-    let mut push =
-        |ok: bool, what: &'static str, detail: String| lines.push(Line { ok, what, detail });
+/// converted.
+pub fn report(cwd: &Path) -> Report {
+    let mut r = Report::default();
+    let push = |r: &mut Report, ok: bool, what: &'static str, detail: String| {
+        r.lines.push(Line { ok, what, detail })
+    };
     let (checkout, text) = match locate(cwd) {
         Ok(x) => x,
         Err(e) => {
-            push(false, "project", e.message);
-            return (lines, None);
+            push(&mut r, false, "project", e.message);
+            return r;
         }
     };
-    push(true, "project", checkout.root.display().to_string());
-    let state = match State::open(&checkout) {
+    push(&mut r, true, "project", checkout.root.display().to_string());
+    match State::open(&checkout) {
         Ok(s) => {
-            push(true, "state", s.root().display().to_string());
-            Some(s)
+            push(&mut r, true, "state", s.root().display().to_string());
+            r.state = Some(s);
         }
-        Err(e) => {
-            push(false, "state", e.message);
-            None
-        }
-    };
-    match settings::read_pin(&text).and_then(|p| check_version(&p).map(|()| p)) {
-        Ok(p) => push(true, "version", p),
-        Err(e) => push(false, "version", e.message),
+        Err(e) => push(&mut r, false, "state", e.message),
     }
-    let settings = match Settings::load(&checkout.root) {
+    match settings::read_pin(&text).and_then(|p| check_version(&p).map(|()| p)) {
+        Ok(p) => push(&mut r, true, "version", p),
+        Err(e) => push(&mut r, false, "version", e.message),
+    }
+    match Settings::load(&checkout.root) {
         Ok(s) => {
-            push(true, "settings", SETTINGS_PATH.to_owned());
-            Some(s)
+            push(&mut r, true, "settings", SETTINGS_PATH.to_owned());
+            r.settings = Some(s);
         }
-        Err(e) => {
-            push(false, "settings", e.message);
-            None
+        Err(e) => push(&mut r, false, "settings", e.message),
+    }
+    if let Some(settings) = r.settings.take() {
+        match rules::verify(&checkout, &settings) {
+            Ok(()) => push(&mut r, true, "rules", "current".to_owned()),
+            Err(e) => push(&mut r, false, "rules", e.message),
         }
-    };
-    if let Some(settings) = &settings {
-        match rules::verify(&checkout, settings) {
-            Ok(()) => push(true, "rules", "current".to_owned()),
-            Err(e) => push(false, "rules", e.message),
+        match integration_pin(&checkout, "the versioned state") {
+            Ok((_, branch, pin)) if pin == VERSION => {
+                r.pinned_here = true;
+                push(&mut r, true, "integration", format!("{branch} pins {pin}"));
+            }
+            Ok((_, branch, pin)) => push(
+                &mut r,
+                false,
+                "integration",
+                format!("{branch} pins {pin}; this is {VERSION}"),
+            ),
+            Err(e) => push(&mut r, false, "integration", e.message),
         }
-        if let Some(state) = &state
-            && integration_pin(&checkout, "the versioned state").is_ok_and(|(_, _, p)| p == VERSION)
+        if r.pinned_here
+            && let Some(state) = &r.state
         {
             match state.format_line(CURRENT_FORMAT) {
-                Ok(()) => push(true, "state format", CURRENT_FORMAT.to_string()),
-                Err(m) => push(false, "state format", m),
+                Ok(()) => push(&mut r, true, "state format", CURRENT_FORMAT.to_string()),
+                Err(m) => push(&mut r, false, "state format", m),
             }
         }
+        r.settings = Some(settings);
     }
-    (lines, state)
+    r.checkout = Some(checkout);
+    r
 }

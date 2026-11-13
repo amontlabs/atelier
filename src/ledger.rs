@@ -83,6 +83,33 @@ impl Approval {
         Ok(Some(a))
     }
 
+    /// Every approval that can be read, sorted by branch, and a line for each that cannot.
+    pub fn list(v: &Versioned) -> (Vec<Approval>, Vec<String>) {
+        let mut out = Vec::new();
+        let mut problems = Vec::new();
+        let Ok(entries) = fs::read_dir(approvals_dir(v)) else {
+            return (out, problems);
+        };
+        for entry in entries.flatten() {
+            let Some(branch) = entry
+                .file_name()
+                .to_str()
+                .and_then(|n| n.strip_suffix(".toml"))
+                .and_then(names::unkey)
+            else {
+                continue;
+            };
+            match Approval::read(v, &branch) {
+                Ok(Some(a)) => out.push(a),
+                Ok(None) => {}
+                Err(e) => problems.push(e.message),
+            }
+        }
+        out.sort_by(|a, b| a.branch.cmp(&b.branch));
+        problems.sort();
+        (out, problems)
+    }
+
     pub fn write(&self, v: &Versioned) -> Result<()> {
         check_oid(&self.commit)?;
         let dir = approvals_dir(v);

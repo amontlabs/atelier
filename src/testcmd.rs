@@ -498,6 +498,15 @@ fn outcome_of(o: &Outcome) -> Ended {
 /// is reachable, ready (with the first failing line; a remote machine's prerequisites only when
 /// a run starts) and busy.
 pub fn list(ctx: &Context) -> Result<Exit> {
+    for line in machine_table(ctx)? {
+        println!("{line}");
+    }
+    Ok(Exit::Ok)
+}
+
+/// The lines `atelier machines` prints: a header, then one line per machine. It probes every
+/// machine at once and takes no machine lock.
+pub fn machine_table(ctx: &Context) -> Result<Vec<String>> {
     let home = home()?;
     let file = MachinesFile::load_owner(&home)?;
     let mut all: Vec<(&String, &Machine)> = file.machines.iter().collect();
@@ -516,21 +525,21 @@ pub fn list(ctx: &Context) -> Result<Exit> {
             .collect()
     });
     let width = all.iter().map(|(n, _)| n.len()).max().unwrap_or(4).max(4);
-    println!(
+    let mut lines = vec![format!(
         "{:width$}  {:14}  {:3}  {:>8}  {:20}  STATE",
         "NAME", "PLATFORM", "GUI", "PRIORITY", "WHERE"
-    );
+    )];
     for ((name, m), state) in all.iter().zip(states) {
-        println!(
+        lines.push(format!(
             "{:width$}  {:14}  {:3}  {:>8}  {:20}  {state}",
             name,
             m.platform,
             if m.gui { "yes" } else { "no" },
             m.priority,
             m.place(),
-        );
+        ));
     }
-    Ok(Exit::Ok)
+    Ok(lines)
 }
 
 /// A remote machine's readiness as the probe knows it: the tool prerequisites depend on the

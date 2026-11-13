@@ -231,6 +231,36 @@ impl<'s> Stack<'s> {
         Ok(out)
     }
 
+    /// Every branch record that can be read, sorted by name, and a line for each that cannot.
+    /// For `status`, which reports what it finds instead of refusing.
+    pub fn all_records_lenient(&self) -> (Vec<BranchRecord>, Vec<String>) {
+        let dir = self.state.root().join("branches");
+        let mut out = Vec::new();
+        let mut problems = Vec::new();
+        let Ok(entries) = fs::read_dir(&dir) else {
+            return (out, problems);
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            let Some(name) = path
+                .file_name()
+                .and_then(|n| n.to_str())
+                .and_then(|n| n.strip_suffix(".toml"))
+                .and_then(names::unkey)
+            else {
+                continue;
+            };
+            match BranchRecord::read(self.state, &name) {
+                Ok(Some(r)) => out.push(r),
+                Ok(None) => {}
+                Err(e) => problems.push(e.message),
+            }
+        }
+        out.sort_by(|a, b| a.name.cmp(&b.name));
+        problems.sort();
+        (out, problems)
+    }
+
     /// The active branches whose record names `lower` with this lifetime as their lower
     /// branch, unfinished starts included: while any exists, `clean` keeps `lower`'s record and
     /// `start` refuses its name.

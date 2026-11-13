@@ -129,7 +129,11 @@ pub enum Cmd {
     /// Print the roles from ~/.config/atelier/agents.toml.
     Agents,
     /// Read-only view of the preflight and of what the commands recorded.
-    Status,
+    Status {
+        /// Print the sections as JSON (name, lines, omitted) instead of text.
+        #[arg(long)]
+        json: bool,
+    },
     /// List the machines, or set one up for this project.
     Machines {
         #[command(subcommand)]
@@ -171,7 +175,7 @@ impl Cmd {
             Cmd::Test { .. } => "test",
             Cmd::Task { .. } => "task",
             Cmd::Agents => "agents",
-            Cmd::Status => "status",
+            Cmd::Status { .. } => "status",
             Cmd::Machines { .. } => "machines",
             Cmd::RemoteRun { .. } => "remote-run",
         }
@@ -186,13 +190,13 @@ impl Cmd {
             Cmd::Tmp { .. } | Cmd::Clean { .. } => "3.5",
             Cmd::Test { .. } | Cmd::Machines { .. } | Cmd::RemoteRun { .. } => "3.6",
             Cmd::Init { .. } | Cmd::Rules | Cmd::Task { .. } | Cmd::Agents => "3.7",
-            Cmd::Status => "3.8",
+            Cmd::Status { .. } => "3.8",
         }
     }
 
     fn needs(&self) -> Needs {
         match self {
-            Cmd::Init { .. } | Cmd::Rules | Cmd::Status => Needs::default(),
+            Cmd::Init { .. } | Cmd::Rules | Cmd::Status { .. } => Needs::default(),
             Cmd::Approve { .. } | Cmd::Merge { .. } | Cmd::Promote { .. } | Cmd::Clean { .. } => {
                 Needs {
                     rules: true,
@@ -324,17 +328,7 @@ pub fn run(cmd: Cmd, cwd: &Path) -> Result<Exit> {
             println!("{}", task::prompt_line(&path));
             return Ok(Exit::Ok);
         }
-        Cmd::Status => {
-            let (lines, _state) = preflight::report(cwd);
-            for l in &lines {
-                println!(
-                    "{} {}: {}",
-                    if l.ok { "ok    " } else { "FAILED" },
-                    l.what,
-                    l.detail
-                );
-            }
-        }
+        Cmd::Status { json } => return crate::status::run(cwd, *json),
         Cmd::Check { compile_only, only } => {
             let context = preflight::run(cwd, cmd.name(), cmd.needs())?;
             let only = match only {
