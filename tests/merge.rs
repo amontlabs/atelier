@@ -1042,10 +1042,12 @@ fn after_a_crash_main_at_old_is_pending_and_a_merge_found_record_is_settled_firs
     p.assert_merged("feat", &c);
 }
 
-/// Marks the pending promotion's push as started and not ended.
+/// Marks the pending promotion's push as started and not ended, its group (long gone)
+/// recorded: git ran.
 fn mark_push_started(p: &Proj, rec: &Promotion) {
     let mut r = rec.clone();
     r.push_started = Some("2026-11-13T10:00:00Z".into());
+    r.push_pgid = Some(999_999);
     r.push_ended = None;
     p.write_promotion(&r);
 }

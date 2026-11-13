@@ -13,7 +13,10 @@
 //! `.ts`, `.tsx`, `.toml` or `.json` file, whose three stages are that path's file in the
 //! commits being merged (no rename), is first given to `mergiraf solve --stdout`; atelier
 //! writes a result with no conflict left itself, through the folder's descriptor, stages it
-//! in the open rebase and prints it. Any other conflict is left as git's.
+//! in the open rebase and prints it. Any other conflict is left as git's. A conflict only in
+//! paths a `merge.after` hook with `commit` regenerates (named so in the target's committed
+//! settings and in the rebased result's) is settled as the gate settles it: this branch's side
+//! is taken and the rebase continues; the worker is told to rerun the generator.
 //!
 //! The outcome is the settled record's: a rebase that finished is exit 0 even when a hook left
 //! processes behind, which are stopped and named in a warning.
@@ -223,8 +226,56 @@ fn rebase(
         )));
     }
 
-    if stack.rebase_open(branch)?.is_some() {
-        return Err(conflict(root, branch, &target.commit, resolver, &log)?);
+    // A conflict only in paths a merge.after hook regenerates (named so in the target's
+    // committed settings and in the replayed result's) is settled with this branch's side, as
+    // the gate settles it, and the rebase goes on; the worker then reruns the generator.
+    let old_regen = match crate::gate::settings_at(root, &target.commit) {
+        Ok(Some(s)) => crate::gate::regenerated_paths(&s),
+        _ => Default::default(),
+    };
+    let mut settled: std::collections::BTreeSet<String> = Default::default();
+    let mut log = log;
+    while stack.rebase_open(branch)?.is_some() {
+        let files = conflicted(root)?;
+        let regen: std::collections::BTreeSet<String> = match crate::gate::settings_at(root, "") {
+            Ok(Some(s)) if !old_regen.is_empty() => crate::gate::regenerated_paths(&s)
+                .intersection(&old_regen)
+                .cloned()
+                .collect(),
+            _ => Default::default(),
+        };
+        if files.is_empty() || !files.iter().all(|(f, _)| regen.contains(f)) {
+            return Err(conflict(root, branch, &target.commit, resolver, &log)?);
+        }
+        for (f, _) in &files {
+            let theirs = git::output(root, ["checkout", "--theirs", "--", f])?;
+            let staged = if theirs.status.success() {
+                git::output(root, ["add", "--", f])?
+            } else {
+                // This branch's commit deleted it.
+                git::output(root, ["rm", "-q", "-f", "--", f])?
+            };
+            if !staged.status.success() {
+                return Err(conflict(root, branch, &target.commit, resolver, &log)?);
+            }
+            println!(
+                "follow: conflict in {f} settled with {branch}'s side: a merge.after hook regenerates it"
+            );
+            settled.insert(f.clone());
+        }
+        let mut cont: Vec<String> = vec!["env".into()];
+        for var in REDIRECTING_VARS {
+            cont.extend(["-u".into(), (*var).into()]);
+        }
+        cont.extend(["git", "-c", "core.editor=:", "rebase", "--continue"].map(String::from));
+        let step = run.step("rebase-continue", &cont, root, &env)?;
+        log = fs::read_to_string(run.dir().join(&step.log)).unwrap_or_default();
+        if step.status == StepStatus::Interrupted {
+            return Err(Failure::refused(format!(
+                "follow was interrupted during the rebase of {branch}; run atelier follow again (git's output: {})",
+                run.dir().join(&step.log).display()
+            )));
+        }
     }
     let new_tip = stack
         .tip(branch)?
@@ -248,6 +299,12 @@ fn rebase(
         short(root, &rec.base),
         commits(root, &rec.base, &new_tip)?
     );
+    if !settled.is_empty() {
+        println!(
+            "follow: {} took {branch}'s side where only regenerated paths conflicted; run the generator and commit what it writes",
+            settled.into_iter().collect::<Vec<_>>().join(", ")
+        );
+    }
     Ok(Exit::Ok)
 }
 

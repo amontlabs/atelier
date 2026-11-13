@@ -51,8 +51,47 @@ const RETRY_PAUSE: Duration = Duration::from_secs(2);
 const BRANCH_LOCK_WAIT: Duration = Duration::from_secs(10);
 
 /// The receiving side's settings, carried with the command so the repository's configuration
-/// is neither needed nor changed [P3].
-pub const RECEIVE_PACK: &str = "git -c receive.denyCurrentBranch=updateInstead -c receive.denyNonFastForwards=true receive-pack";
+/// is neither needed nor changed [P3]. `core.hooksPath` names an empty folder atelier owns, so
+/// none of the repository's hooks (`pre-receive`, `update`, `reference-transaction`,
+/// `push-to-checkout`, …) runs: git's own test that the main checkout is clean decides.
+pub fn receive_pack(empty_hooks: &Path) -> String {
+    format!(
+        "git -c receive.denyCurrentBranch=updateInstead -c receive.denyNonFastForwards=true -c core.hooksPath={} receive-pack",
+        crate::remote::sq(&empty_hooks.to_string_lossy())
+    )
+}
+
+/// `<state>/empty-hooks`: an empty folder, created when missing. Refuses (4) when something is
+/// in it or it is not a real folder: atelier never empties it.
+pub fn empty_hooks(state: &crate::state::State) -> Result<PathBuf> {
+    let dir = state.root().join("empty-hooks");
+    match fs::symlink_metadata(&dir) {
+        Err(e) if e.kind() == ErrorKind::NotFound => {
+            fs::create_dir(&dir).ctx(dir.display())?;
+        }
+        Err(e) => return Err(Failure::refused(format!("{}: {e}", dir.display()))),
+        Ok(meta) if !meta.is_dir() => {
+            return Err(Failure::refused(format!(
+                "{} is not a folder: atelier keeps it as an empty hooks folder for the promotion's push; move it away",
+                dir.display()
+            )));
+        }
+        Ok(_) => {}
+    }
+    let inside: Vec<String> = fs::read_dir(&dir)
+        .ctx(dir.display())?
+        .flatten()
+        .map(|e| e.file_name().to_string_lossy().into_owned())
+        .collect();
+    if !inside.is_empty() {
+        return Err(Failure::refused(format!(
+            "{} must stay empty (the promotion's push runs no hooks), and it holds: {}; remove them",
+            dir.display(),
+            inside.join(", ")
+        )));
+    }
+    Ok(dir)
+}
 
 /// Variables that would point git at another repository; removed from the push's environment.
 const REDIRECTING_VARS: &[&str] = &[
@@ -222,15 +261,16 @@ pub fn tracked_changes(root: &Path) -> Result<Vec<String>> {
     Ok(paths)
 }
 
-/// The paths `M` adds (`git diff --name-only --no-renames --diff-filter=A OLD M`).
-fn added_paths(root: &Path, old: &str, m: &str) -> Result<Vec<String>> {
+/// The paths `git diff --name-only --no-renames --diff-filter=<filter> OLD M` names: `A` for
+/// the ones `M` adds, `D` for the ones it deletes.
+fn diff_paths(root: &Path, old: &str, m: &str, filter: &str) -> Result<Vec<String>> {
     let out = git::output(
         root,
         [
             "diff",
             "--name-only",
             "--no-renames",
-            "--diff-filter=A",
+            &format!("--diff-filter={filter}"),
             "-z",
             old,
             m,
@@ -254,28 +294,109 @@ fn split_z(bytes: &[u8]) -> Vec<String> {
         .collect()
 }
 
+/// True when the volume holding `root` ignores case: `.git` and `.GIT` are one entry.
+fn ignores_case(root: &Path) -> bool {
+    use std::os::unix::fs::MetadataExt;
+    match (
+        fs::symlink_metadata(root.join(".git")),
+        fs::symlink_metadata(root.join(".GIT")),
+    ) {
+        (Ok(a), Ok(b)) => a.dev() == b.dev() && a.ino() == b.ino(),
+        _ => false,
+    }
+}
+
+/// The paths OLD tracks and `M` deletes, as the volume compares names: git removes them when it
+/// checks `M` out, so what stands there is no obstruction.
+struct Leaving {
+    paths: BTreeSet<String>,
+    fold: bool,
+}
+
+impl Leaving {
+    fn key(&self, p: &str) -> String {
+        if self.fold {
+            p.to_lowercase()
+        } else {
+            p.to_owned()
+        }
+    }
+
+    /// `rel` is one of them.
+    fn has(&self, rel: &str) -> bool {
+        self.paths.contains(&self.key(rel))
+    }
+
+    /// Everything inside the folder `dir` (at `rel`) is one of them, folders aside: the folder
+    /// goes once git has removed them. The first other entry otherwise.
+    fn holds_only_leaving(&self, dir: &Path, rel: &str) -> std::result::Result<(), String> {
+        let entries = fs::read_dir(dir).map_err(|e| format!("{rel}: {e}"))?;
+        for e in entries {
+            let e = e.map_err(|e| format!("{rel}: {e}"))?;
+            let name = e.file_name().to_string_lossy().into_owned();
+            let child = format!("{rel}/{name}");
+            let meta = fs::symlink_metadata(e.path()).map_err(|e| format!("{child}: {e}"))?;
+            if meta.is_dir() {
+                self.holds_only_leaving(&e.path(), &child)?;
+            } else if !self.has(&child) {
+                return Err(child);
+            }
+        }
+        Ok(())
+    }
+}
+
 /// Check e: nothing exists at a path `M` adds, and each of its parent folders that exists is a
-/// real folder. Returns the obstructions.
+/// real folder; except what git itself removes first: a path OLD tracks and `M` deletes (by the
+/// volume's comparison of names, so a case-only rename on a volume that ignores case is none), or
+/// a folder holding only such paths. Check d has made sure those hold OLD's content. Returns the
+/// obstructions.
 pub fn check_e(root: &Path, old: &str, m: &str) -> Result<Vec<String>> {
     let mut out = Vec::new();
-    for rel in added_paths(root, old, m)? {
+    let added = diff_paths(root, old, m, "A")?;
+    if added.is_empty() {
+        return Ok(out);
+    }
+    let fold = ignores_case(root);
+    let mut leaving = Leaving {
+        paths: BTreeSet::new(),
+        fold,
+    };
+    leaving.paths = diff_paths(root, old, m, "D")?
+        .iter()
+        .map(|p| leaving.key(p))
+        .collect();
+    for rel in added {
         let mut prefix = root.to_path_buf();
         let parts: Vec<&str> = rel.split('/').collect();
         for (i, part) in parts.iter().enumerate() {
             prefix.push(part);
             let last = i + 1 == parts.len();
+            let at = parts[..=i].join("/");
             match fs::symlink_metadata(&prefix) {
                 Ok(meta) => {
+                    if !meta.is_dir() && leaving.has(&at) {
+                        // OLD's own file, removed by git before it writes here.
+                        break;
+                    }
                     if last {
-                        out.push(format!(
-                            "{rel}: {} is there, where the merge adds a file",
-                            kind(&meta)
-                        ));
+                        if meta.is_dir() {
+                            match leaving.holds_only_leaving(&prefix, &at) {
+                                Ok(()) => break,
+                                Err(other) => out.push(format!(
+                                    "{rel}: a folder is there, where the merge adds a file, holding {other}"
+                                )),
+                            }
+                        } else {
+                            out.push(format!(
+                                "{rel}: {} is there, where the merge adds a file",
+                                kind(&meta)
+                            ));
+                        }
                     } else if !meta.is_dir() {
                         out.push(format!(
-                            "{rel}: {} is at {}, where the merge needs a folder",
+                            "{rel}: {} is at {at}, where the merge needs a folder",
                             kind(&meta),
-                            parts[..=i].join("/")
                         ));
                     } else {
                         continue;
@@ -341,11 +462,13 @@ struct Pushed {
 /// gate lock while it lives.
 fn push(
     root: &Path,
+    state: &crate::state::State,
     v: &Versioned,
     lock: &mut HeldLock,
     rec: &mut Promotion,
     log: &Path,
 ) -> Result<Pushed> {
+    let hooks = empty_hooks(state)?;
     rec.push_started = Some(fsutil::rfc3339(fsutil::now_secs()));
     rec.push_pgid = None;
     rec.push_ended = None;
@@ -363,10 +486,13 @@ fn push(
         STEP_TRAMPOLINE,
         "atelier-push",
         "git",
+        "-c",
+        "push.gpgSign=false",
         "push",
         "--porcelain",
+        "--no-verify",
     ])
-    .arg(format!("--receive-pack={RECEIVE_PACK}"))
+    .arg(format!("--receive-pack={}", receive_pack(&hooks)))
     .arg(format!("--force-with-lease={refname}:{}", rec.old))
     .arg(".")
     .arg(format!("{}:{refname}", rec.m))
@@ -417,6 +543,16 @@ fn push(
         output,
         signalled: status.is_some_and(|s| s.signal().is_some()),
     })
+}
+
+/// True when git refused the ref for a reason it reports (`--porcelain`: a `!` line for the
+/// ref, then `Done`): git ran to its end and wrote nothing.
+fn clean_refusal(output: &str) -> bool {
+    let lines: Vec<&str> = output.lines().map(str::trim_end).collect();
+    lines
+        .iter()
+        .any(|l| l.starts_with("!\t") || l.starts_with("! "))
+        && lines.contains(&"Done")
 }
 
 /// git's reason for refusing a push, from its output: the lines that say why.
@@ -489,7 +625,7 @@ pub fn promote(
         if reasons.is_empty() {
             tries += 1;
             let log = caller.log_dir.join(format!("push-{tries}.log"));
-            let pushed = push(&root, v, lock, &mut rec, &log)?;
+            let pushed = push(&root, &ctx.state, v, lock, &mut rec, &log)?;
             match facts(&root, &rec)? {
                 Facts::Promoted => {
                     rec.push_ended = Some(fsutil::rfc3339(fsutil::now_secs()));
@@ -502,10 +638,13 @@ pub fn promote(
                 }
                 Facts::Pending => {}
             }
-            // Checks d and e passed just before the push. If the push was killed, or the
-            // checkout changed while git ran, the push did not end cleanly: the record keeps
-            // `push_started` without `push_ended`, and the report below applies.
-            if pushed.signalled || disturbed(&root, &rec)? {
+            // Checks d and e passed just before the push. A refusal git reports for the ref
+            // changed nothing (git writes the files only for a ref it accepts), whatever the
+            // checkout holds now. A push killed, or one that ended otherwise while the checkout
+            // changed, did not end cleanly: the record keeps `push_started` without
+            // `push_ended`, and the report below applies.
+            let refused = !pushed.signalled && clean_refusal(&pushed.output);
+            if !refused && (pushed.signalled || disturbed(&root, &rec)?) {
                 return Err(interrupted_report(&root, &rec, caller)?);
             }
             rec.push_ended = Some(fsutil::rfc3339(fsutil::now_secs()));
@@ -536,7 +675,8 @@ pub fn promote(
 /// An interrupted promotion (r4 §3.8 8A): a push started and did not end cleanly, the ref is
 /// still at `OLD`, and check d or e fails.
 pub fn interrupted(root: &Path, rec: &Promotion) -> Result<bool> {
-    if !rec.push_unfinished() {
+    // No recorded group: atelier ended before releasing the push, so git never ran.
+    if !rec.push_unfinished() || rec.push_pgid.is_none() {
         return Ok(false);
     }
     let tip = refs::read(root, &names::branch_ref(&rec.integration))?;
@@ -773,9 +913,20 @@ fn indent(text: &str) -> String {
     out
 }
 
-/// Step 9: one `merges.tsv` line per branch (once), each branch's record marked merged and its
-/// approval removed, then the promotion record removed and `merged <branch> <commit>` printed.
-/// A branch whose lock stays held keeps the record: the next `promote` or `merge` finishes.
+/// Step 9: one `merges.tsv` line per branch (once); each branch's record marked merged and its
+/// approval removed; the lines printed (`merged <branch> <commit>`); then the promotion record
+/// removed. Idempotent: a crash anywhere is finished by the next `promote` or `merge`, which
+/// prints the lines again.
+///
+/// A branch that moved past its approved commit during the gate, or was approved again at
+/// another commit, has newer commits that are not merged: its approved commit is merged
+/// (`merges.tsv`, the printed line), but its record stays `active`, without merge facts, so the
+/// branch stays usable (`follow` takes the newer commits onto the integration branch) and
+/// `clean` deletes nothing of it. The newer approval stays.
+///
+/// Each record is written under the branch lock taken shared (as `tmp` and `check` hold it):
+/// only `start`, `follow` and `clean`, which hold it exclusive, make it wait; after
+/// [`BRANCH_LOCK_WAIT`] the record is kept and the next `promote` or `merge` finishes.
 pub fn finish(ctx: &Context, v: &Versioned, rec: &Promotion) -> Result<Exit> {
     let root = &ctx.checkout.root;
     let stack = Stack::new(&ctx.checkout, &ctx.state, &rec.integration);
@@ -788,6 +939,7 @@ pub fn finish(ctx: &Context, v: &Versioned, rec: &Promotion) -> Result<Exit> {
             MergeLine::new(rec, b).append(v)?;
         }
     }
+    let mut newer: Vec<String> = Vec::new();
     for b in &rec.branches {
         let lock = take_branch_lock(&ctx.state, &b.name).map_err(|e| {
             Failure::refused(format!(
@@ -798,20 +950,36 @@ pub fn finish(ctx: &Context, v: &Versioned, rec: &Promotion) -> Result<Exit> {
                 e.message
             ))
         })?;
+        let tip = refs::read(root, &names::branch_ref(&b.name))?;
+        let approval = Approval::read(v, &b.name)?;
+        let reapproved = approval
+            .as_ref()
+            .is_some_and(|a| a.lifetime == b.lifetime && a.commit != b.commit);
+        let moved = tip.as_deref().is_some_and(|t| t != b.commit);
         if let Some(r) = stack.record(&b.name)?
             && r.lifetime == b.lifetime
             && r.state == BranchState::Active
         {
-            MergeFacts {
-                commit: b.commit.clone(),
-                worktree: b.worktree.clone(),
-                dev: b.dev,
-                ino: b.ino,
-                later: toml::Table::new(),
+            if moved || reapproved {
+                let at = tip.as_deref().unwrap_or(&b.commit);
+                newer.push(format!(
+                    "{} moved to {} after its approval at {}: its later commits are not merged; it stays active (atelier follow in its worktree, then approve it again)",
+                    b.name,
+                    short(root, at),
+                    short(root, &b.commit)
+                ));
+            } else {
+                MergeFacts {
+                    commit: b.commit.clone(),
+                    worktree: b.worktree.clone(),
+                    dev: b.dev,
+                    ino: b.ino,
+                    later: toml::Table::new(),
+                }
+                .record(&ctx.state, &b.name, &b.lifetime)?;
             }
-            .record(&ctx.state, &b.name, &b.lifetime)?;
         }
-        if let Some(a) = Approval::read(v, &b.name)?
+        if let Some(a) = approval
             && a.lifetime == b.lifetime
             && a.commit == b.commit
         {
@@ -819,23 +987,26 @@ pub fn finish(ctx: &Context, v: &Versioned, rec: &Promotion) -> Result<Exit> {
         }
         drop(lock);
     }
-    Promotion::remove(v)?;
     if let Some(line) = &rec.summary {
         println!("{line}");
     }
     for b in &rec.branches {
         println!("merged {} {}", b.name, short(root, &b.commit));
     }
+    for line in &newer {
+        println!("{line}");
+    }
     if rec.rules_changed {
         println!("rules changed");
     }
+    Promotion::remove(v)?;
     Ok(Exit::Ok)
 }
 
 fn take_branch_lock(state: &crate::state::State, branch: &str) -> Result<HeldLock> {
     let deadline = Instant::now() + BRANCH_LOCK_WAIT;
     loop {
-        match HeldLock::acquire(state, LockKey::branch(branch)) {
+        match HeldLock::acquire_shared(state, LockKey::branch(branch)) {
             Ok(l) => return Ok(l),
             Err(e) if Instant::now() >= deadline => return Err(e),
             Err(_) => sleep(Duration::from_millis(200)),
