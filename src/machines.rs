@@ -852,6 +852,21 @@ priority = 1
         );
     }
 
+    /// Takes the lock this test released: retried for a moment while it looks held, because a
+    /// child another test thread is spawning holds a copy of the descriptor until it execs.
+    fn take_after_release(home: &Path) -> MachineLock {
+        let deadline = std::time::Instant::now() + Duration::from_secs(3);
+        loop {
+            match MachineLock::try_take(home, "other").unwrap() {
+                Some(l) => return l,
+                None if std::time::Instant::now() < deadline => {
+                    std::thread::sleep(Duration::from_millis(10))
+                }
+                None => panic!("the machine lock stays held"),
+            }
+        }
+    }
+
     #[test]
     fn a_look_at_the_lock_reads_the_holder_and_leaves_the_lock_alone() {
         let home = tempfile::tempdir().unwrap();
@@ -876,7 +891,7 @@ priority = 1
             assert_eq!(MachineLock::held_by(home.path()), None);
         }
         // Reading takes no lock: a real taker is never refused by a look.
-        assert!(MachineLock::try_take(home.path(), "run").unwrap().is_some());
+        take_after_release(home.path());
     }
 
     #[test]
@@ -918,10 +933,6 @@ priority = 1
         );
         drop(first);
         assert_eq!(MachineLock::holder(home.path()), "");
-        assert!(
-            MachineLock::try_take(home.path(), "other")
-                .unwrap()
-                .is_some()
-        );
+        take_after_release(home.path());
     }
 }

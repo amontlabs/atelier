@@ -914,10 +914,27 @@ mod tests {
             fake_install(&from, &format!("new {tag}"));
             from
         };
+        // A lock this test just released can look held for a moment: a child that another test
+        // thread is spawning holds a copy of the descriptor until it execs (see locks.rs). Such
+        // a holder wrote no holder file.
+        let install_after_release = |tag: &str, expect: &str| {
+            let deadline = std::time::Instant::now() + Duration::from_secs(3);
+            loop {
+                let from = new(tag);
+                match install(home, &from, expect) {
+                    Ok(Installed::Busy(h))
+                        if h.is_empty() && std::time::Instant::now() < deadline =>
+                    {
+                        sleep(Duration::from_millis(10));
+                    }
+                    other => return (from, other),
+                }
+            }
+        };
 
         // Nothing installed yet: a plain rename.
-        let from = new("a");
-        assert_eq!(install(home, &from, "none"), Ok(Installed::Done(None)));
+        let (from, r) = install_after_release("a", "none");
+        assert_eq!(r, Ok(Installed::Done(None)));
         assert!(!from.exists());
         assert!(
             fs::read_to_string(to.join("bin/atelier"))
@@ -926,11 +943,8 @@ mod tests {
         );
 
         // Another install than expected: nothing replaced, the new folder removed.
-        let from = new("b");
-        assert_eq!(
-            install(home, &from, "something else"),
-            Ok(Installed::Changed("new a".to_owned()))
-        );
+        let (from, r) = install_after_release("b", "something else");
+        assert_eq!(r, Ok(Installed::Changed("new a".to_owned())));
         assert!(!from.exists());
         assert!(
             fs::read_to_string(to.join("bin/atelier"))
@@ -939,7 +953,14 @@ mod tests {
         );
 
         // The machine lock held: busy, nothing replaced.
-        let held = MachineLock::try_take(home, "a run").unwrap().unwrap();
+        let deadline = std::time::Instant::now() + Duration::from_secs(3);
+        let held = loop {
+            match MachineLock::try_take(home, "a run").unwrap() {
+                Some(l) => break l,
+                None if std::time::Instant::now() < deadline => sleep(Duration::from_millis(10)),
+                None => panic!("the machine lock stays held"),
+            }
+        };
         let from = new("c");
         match install(home, &from, "new a") {
             Ok(Installed::Busy(h)) => assert!(h.ends_with("a run"), "{h}"),
@@ -949,8 +970,8 @@ mod tests {
         drop(held);
 
         // The expected install: exchanged, the old folder kept beside it.
-        let from = new("d");
-        let kept = match install(home, &from, "new a") {
+        let (from, r) = install_after_release("d", "new a");
+        let kept = match r {
             Ok(Installed::Done(Some(k))) => k,
             other => panic!("{other:?}"),
         };

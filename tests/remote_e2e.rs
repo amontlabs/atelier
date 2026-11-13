@@ -7,9 +7,11 @@
 //! It uses a throwaway project here, and on the machine only `~/atelier-exp/` (the project's
 //! checkout), `~/.local/share/atelier/<version>/` (the pinned atelier, built there by
 //! `machines init`) and `~/.local/state/atelier/` (the machine lock). It removes none of them:
-//! whoever runs it cleans the machine afterwards. Covered: `machines init` building from source,
-//! `machines`, a passing and a failing `test`, and a connection killed mid-run (`ssh -tt`, the
-//! terminal hang-up and the watcher): `connection lost`, exit 3, the remote group stopped.
+//! whoever runs it cleans the machine afterwards. Covered: `machines init` building from source
+//! (its plan; replacing an install of other source only with `--yes`, swapped in with
+//! `renameat2(RENAME_EXCHANGE)` and the old folder kept), `machines`, a passing and a failing
+//! `test`, the remote tree recorded, and a connection killed mid-run (`ssh -tt`, the terminal
+//! hang-up and the watcher): `connection lost`, exit 3, the remote group stopped.
 
 mod common;
 
@@ -53,6 +55,7 @@ fn a_real_linux_machine() {
             "atelier = \"{VERSION}\"\n\n[platforms.linux-x86_64]\nprepare = [\"sh\", \"-c\", \"echo prepared on $(uname -s)\"]\nrun = [\"sh\", \"-c\", \"uname -sm | grep -q 'Linux x86_64'\"]\n"
         ),
     );
+    repo.write_rules();
     repo.write("sub/keep", "x\n");
     repo.commit_all("settings");
     let machines = format!(
@@ -89,6 +92,35 @@ checkouts = "~/atelier-exp/checkouts"
         .unwrap();
     eprintln!("machines init ({:?}):\n{}", t.elapsed(), both(&out));
     assert_eq!(code(&out), 0);
+    assert!(stdout(&out).starts_with("linux-box: plan\n"));
+
+    // An install of other source there: replaced only with --yes, the old folder kept.
+    let bin = format!("~/.local/share/atelier/{VERSION}/bin/atelier");
+    let o = ssh(
+        &host,
+        &format!(
+            "rm {bin} && printf '#!/bin/sh\\necho {VERSION} 0000000000000000\\n' > {bin} && chmod +x {bin}"
+        ),
+    );
+    assert!(o.status.success(), "{}", both(&o));
+    let out = atelier(&["machines", "init", "linux-box"])
+        .output()
+        .unwrap();
+    eprintln!("machines init over another install:\n{}", both(&out));
+    assert_eq!(code(&out), 4);
+    assert!(stderr(&out).contains("--yes"));
+    let t = Instant::now();
+    let out = atelier(&["machines", "init", "linux-box", "--yes"])
+        .output()
+        .unwrap();
+    eprintln!("machines init --yes ({:?}):\n{}", t.elapsed(), both(&out));
+    assert_eq!(code(&out), 0);
+    assert!(stdout(&out).contains("the replaced install is kept at "));
+    let o = ssh(
+        &host,
+        &format!("cat ~/.local/share/atelier/.{VERSION}.replaced-*/bin/atelier"),
+    );
+    assert!(stdout(&o).contains("0000000000000000"), "{}", both(&o));
 
     let out = atelier(&["machines"]).output().unwrap();
     eprintln!("machines:\n{}", both(&out));
@@ -99,6 +131,14 @@ checkouts = "~/atelier-exp/checkouts"
     eprintln!("full run ({:?}):\n{}", t.elapsed(), both(&out));
     assert_eq!(code(&out), 0);
     assert_eq!(stdout(&out).trim(), "linux-x86_64: PASS on linux-box");
+    let o = ssh(
+        &host,
+        "cd ~/atelier-exp/checkouts/* && git rev-parse HEAD^{tree} && grep -h '^tree = ' .git/atelier/runs/*/result",
+    );
+    eprintln!("remote tree and recorded trees:\n{}", stdout(&o));
+    let text = stdout(&o);
+    let lines: Vec<&str> = text.lines().collect();
+    assert!(lines.len() >= 2 && lines[1..].iter().all(|l| l.contains(lines[0])));
 
     let mut c = atelier(&[
         "test",
