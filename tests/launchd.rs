@@ -40,10 +40,18 @@ mod mac {
         let Ok(mode) = std::env::var(PROBE) else {
             return;
         };
+        if mode == "missing-shim" {
+            std::process::exit(probe_missing_shim());
+        }
         steps_use_atelier();
         let code = match mode.as_str() {
             "env" => probe_env(),
             "nested-killed" => probe_nested_killed(),
+            "die-after-bootstrap" => probe_die_after_bootstrap(),
+            "sleep" => {
+                sleep(Duration::from_secs(30));
+                0
+            }
             other => panic!("unknown probe mode {other}"),
         };
         std::process::exit(code);
@@ -106,6 +114,75 @@ mod mac {
         0
     }
 
+    /// Starts jobs with a shim that does not exist: the job, then the probe of a new state.
+    /// Writes `<seconds> <message>` lines for each to `ATELIER_TEST_OUT`.
+    fn probe_missing_shim() -> i32 {
+        let out = PathBuf::from(std::env::var("ATELIER_TEST_OUT").unwrap());
+        let missing = out.join("no-such-atelier");
+        launchd::use_program(&missing);
+        let mut lines = Vec::new();
+        let label = format!("atelier.test.{}.missing", std::process::id());
+        let spec = launchd::Spec {
+            argv: vec!["/usr/bin/true".into()],
+            cwd: "/".into(),
+            env: Vec::new(),
+            stdout: out.join("o"),
+            stderr: out.join("o"),
+        };
+        let t = Instant::now();
+        let msg = match launchd::launch(&label, &spec, &mut || false) {
+            Ok(_) => "started".to_owned(),
+            Err(launchd::LaunchError::Unavailable(m)) => format!("unavailable: {m}"),
+            Err(e) => format!("{e:?}"),
+        };
+        lines.push(format!("{:.3} {msg}", t.elapsed().as_secs_f64()));
+        lines.push(format!("loaded {}", label_loaded(&label)));
+        let state = State::open_at(out.join("state")).unwrap();
+        let t = Instant::now();
+        let msg = match Run::start(
+            &state,
+            LockKey::branch("x"),
+            RunKind::Check,
+            "p",
+            Path::new("/"),
+        ) {
+            Ok(_) => "started".to_owned(),
+            Err(e) => e.message,
+        };
+        lines.push(format!("{:.3} {msg}", t.elapsed().as_secs_f64()));
+        fs::write(out.join("result"), lines.join("\n")).unwrap();
+        0
+    }
+
+    /// Leaves three jobs loaded and dies: a probe-shaped job and a step-shaped job whose `Job`
+    /// is forgotten (never booted out), then a job whose launch is cut short by `_exit` right
+    /// after its bootstrap, before its shim reports. The step jobs are of run
+    /// `ATELIER_TEST_RUN`.
+    fn probe_die_after_bootstrap() -> i32 {
+        let run = std::env::var("ATELIER_TEST_RUN").unwrap();
+        let labels = [
+            format!("atelier.probe.{}.0a1b", std::process::id()),
+            format!("atelier.{run}.1"),
+            format!("atelier.{run}.2"),
+        ];
+        let spec = launchd::Spec {
+            argv: vec!["/usr/bin/true".into()],
+            cwd: "/".into(),
+            env: Vec::new(),
+            stdout: "/dev/null".into(),
+            stderr: "/dev/null".into(),
+        };
+        for l in &labels[..2] {
+            let job = launchd::launch(l, &spec, &mut || false).unwrap();
+            std::mem::forget(job);
+        }
+        let _ = launchd::launch(&labels[2], &spec, &mut || {
+            // SAFETY: ends this test child at once, as a KILL would.
+            unsafe { libc::_exit(9) }
+        });
+        1
+    }
+
     fn nofile() -> u64 {
         let mut rl = libc::rlimit {
             rlim_cur: 0,
@@ -145,10 +222,19 @@ mod mac {
     /// A shell command that starts `/bin/sleep 30` in a new session after a double fork (with an
     /// empty environment when `env_i`), writes its pid to `pidfile`, and returns once it has.
     fn daemonize_cmd(pidfile: &str, env_i: bool) -> String {
-        let perl = r#"use POSIX; my $f = shift; defined(my $p = fork) or die; if ($p) { select(undef, undef, undef, 0.01) until -s $f; exit 0 } POSIX::setsid(); defined($p = fork) or die; exit 0 if $p; open(my $h, ">", "$f.tmp") or die; print $h $$; close $h; rename("$f.tmp", $f); exec "/bin/sleep", "30""#;
+        daemonize_exec(pidfile, env_i, &["/bin/sleep", "30"])
+    }
+
+    /// As [`daemonize_cmd`], the daemon running `argv` (no quotes in it).
+    fn daemonize_exec(pidfile: &str, env_i: bool, argv: &[&str]) -> String {
+        let perl = r#"use POSIX; my $f = shift; defined(my $p = fork) or die; if ($p) { select(undef, undef, undef, 0.01) until -s $f; exit 0 } POSIX::setsid(); defined($p = fork) or die; exit 0 if $p; open(my $h, ">", "$f.tmp") or die; print $h $$; close $h; rename("$f.tmp", $f); exec @ARGV"#;
         format!(
-            "{}/usr/bin/perl -e '{perl}' '{pidfile}'",
-            if env_i { "/usr/bin/env -i " } else { "" }
+            "{}/usr/bin/perl -e '{perl}' '{pidfile}' {}",
+            if env_i { "/usr/bin/env -i " } else { "" },
+            argv.iter()
+                .map(|a| format!("'{a}'"))
+                .collect::<Vec<_>>()
+                .join(" ")
         )
     }
 
@@ -240,6 +326,7 @@ mod mac {
                     "ATELIER_RUN_ID",
                     "ATELIER_RUN",
                     "ATELIER_RUNS",
+                    "ATELIER_COALITIONS",
                 ]
                 .iter()
                 .any(|x| k == x)
@@ -252,6 +339,13 @@ mod mac {
         }
         want.push(format!("ATELIER_RUN={}", run.id()).into_bytes());
         want.push(format!("ATELIER_RUNS={}", info.runs.join(":")).into_bytes());
+        want.push(
+            format!(
+                "ATELIER_COALITIONS={}",
+                run.dir().join("coalitions").display()
+            )
+            .into_bytes(),
+        );
         want.sort();
         let mut got: Vec<Vec<u8>> = fs::read(out.join("env"))
             .unwrap()
@@ -300,12 +394,22 @@ mod mac {
         for (script, exit, signal) in [
             ("exit 7", Some(7), None),
             ("exit 100", Some(100), None),
+            // launchd prints 64 to 78 with their sysexits names (`64: EX_USAGE`).
+            ("exit 64", Some(64), None),
+            ("exit 75", Some(75), None),
+            ("exit 78", Some(78), None),
             ("kill -TERM $$", None, Some(15)),
             ("kill -KILL $$", None, Some(9)),
         ] {
+            let t = Instant::now();
             let s = run.step("code", &sh(script), &repo.root, &[]).unwrap();
             assert_eq!(s.status, StepStatus::Failed, "{script}: {s:?}");
             assert_eq!((s.exit, s.signal), (exit, signal), "{script}");
+            assert!(
+                t.elapsed() < Duration::from_secs(3),
+                "{script}: {:?}",
+                t.elapsed()
+            );
         }
         let argv: Vec<String> = [
             "/bin/sh",
@@ -331,9 +435,15 @@ mod mac {
             fs::read_to_string(run.dir().join("io.log")).unwrap(),
             "to-stderr \t tab\n"
         );
-        // The job folders are gone once each job is booted out.
-        let jobs = run.dir().join("jobs");
-        assert_eq!(fs::read_dir(&jobs).unwrap().count(), 0, "{jobs:?}");
+        // The job folders are in the user's temporary folder, and gone once each job is booted
+        // out; none is in the run folder.
+        for n in 1..=9 {
+            let label = format!("atelier.{}.{n}", run.id());
+            assert!(!launchd::job_dir(&label).exists(), "{label}");
+            assert!(!label_loaded(&label), "{label}");
+        }
+        assert!(!run.dir().join("jobs").exists());
+        assert!(launchd::jobs_root().starts_with(launchd::user_temp_dir()));
         let r = run.finish(true).unwrap();
         assert_eq!(r.outcome, Outcome::Failed);
         assert!(r.survivors.is_empty(), "{:?}", r.survivors);
@@ -427,15 +537,22 @@ mod mac {
     }
 
     #[test]
-    fn a_decoy_outside_the_job_is_never_reported_or_signalled() {
+    fn a_marked_process_outside_the_jobs_is_reported_by_the_marker_scan_and_never_signalled() {
         let repo = Repo::new();
         let state = State::open(&repo.checkout()).unwrap();
         let mut run = start(&state, LockKey::branch("x")).unwrap();
-        // A sleeper in its own session that even carries this run's marker: the marker scan
-        // would take it for a survivor; the coalition does not.
+        // A sleeper in its own session, outside every job's coalition, that carries this run's
+        // marker: the coalition scan does not see it, the marker scan does. It is this test
+        // program: macOS shows no other process the environment of Apple's own programs.
         let decoy_file = repo.tmp.path().join("decoy.pid");
+        let argv = probe_argv();
+        let argv: Vec<&str> = argv.iter().map(String::as_str).collect();
         let status = Command::new("/bin/sh")
-            .args(["-c", &daemonize_cmd(&decoy_file.to_string_lossy(), false)])
+            .args([
+                "-c",
+                &daemonize_exec(&decoy_file.to_string_lossy(), false, &argv),
+            ])
+            .env(PROBE, "sleep")
             .env("ATELIER_RUN", run.id())
             .stdin(Stdio::null())
             .status()
@@ -445,16 +562,25 @@ mod mac {
         let step = run.step("t", &sh("true"), &repo.root, &[]).unwrap();
         assert_eq!(step.status, StepStatus::Passed, "{step:?}");
         let result = run.finish(true).unwrap();
-        assert_eq!(result.outcome, Outcome::Passed, "{:?}", result.failures);
-        assert!(result.survivors.is_empty());
+        assert_eq!(result.outcome, Outcome::Failed, "{:?}", result.failures);
+        assert!(
+            result
+                .survivors
+                .iter()
+                .any(|s| s.starts_with(&format!("{decoy} "))),
+            "{:?}",
+            result.survivors
+        );
+        assert!(alive(decoy), "a marked process is named, not signalled");
+        // While it lives, the next run under the lock refuses, naming it.
+        let e = start(&state, LockKey::branch("x")).unwrap_err();
+        assert!(e.message.contains(&format!("{decoy} ")), "{}", e.message);
         assert!(alive(decoy));
-        // The next run under the lock is not refused for it either.
+        kill_and_wait(decoy);
         start(&state, LockKey::branch("x"))
             .unwrap()
             .finish(true)
             .unwrap();
-        assert!(alive(decoy));
-        kill_and_wait(decoy);
     }
 
     #[test]
@@ -529,14 +655,236 @@ mod mac {
     }
 
     #[test]
+    fn an_outer_run_stops_what_a_killed_nested_atelier_on_another_state_left() {
+        let repo = Repo::new();
+        let state = State::open(&repo.checkout()).unwrap();
+        let other = repo.tmp.path().join("other-state");
+        let pidfile = repo.tmp.path().join("sleeper.pid");
+        let inner_file = repo.tmp.path().join("inner");
+        let mut run = start(&state, LockKey::Gate).unwrap();
+        let step = run
+            .step(
+                "nested",
+                &probe_argv(),
+                &repo.root,
+                &[
+                    (PROBE.into(), "nested-killed".into()),
+                    (
+                        "ATELIER_TEST_STATE".into(),
+                        other.to_string_lossy().into_owned(),
+                    ),
+                    (
+                        "ATELIER_TEST_PIDFILE".into(),
+                        pidfile.to_string_lossy().into_owned(),
+                    ),
+                    (
+                        "ATELIER_TEST_INNER".into(),
+                        inner_file.to_string_lossy().into_owned(),
+                    ),
+                ],
+            )
+            .unwrap();
+        assert_eq!(step.signal, Some(9), "{step:?}");
+        let sleeper = read_pid(&pidfile);
+        assert!(alive(sleeper));
+        let inner = fs::read_to_string(&inner_file).unwrap();
+        let inner_id = inner.split(' ').next().unwrap().to_owned();
+        let inner_label = format!("atelier.{inner_id}.1");
+        // The inner run is in the other state, and its job is listed in the outer run's file.
+        assert!(other.join("runs").join(&inner_id).is_dir());
+        assert!(!state.runs_dir().join(&inner_id).exists());
+        let lines = coalition::read_run_file(run.dir()).unwrap().unwrap();
+        assert!(lines.iter().any(|l| l.label == inner_label), "{lines:?}");
+
+        let result = run.finish(true).unwrap();
+        assert_eq!(result.outcome, Outcome::Failed, "{result:?}");
+        assert!(
+            result
+                .survivors
+                .iter()
+                .any(|s| s.starts_with(&format!("{sleeper} "))),
+            "{:?}",
+            result.survivors
+        );
+        assert!(!alive(sleeper), "the outer run stopped it");
+        // The job the dead inner atelier left loaded is removed by the outer run's end, though
+        // nobody takes the other state's lock again.
+        wait_for(
+            "the inner job to be removed",
+            Duration::from_secs(10),
+            || {
+                launchd::sweep(&|_| false);
+                !label_loaded(&inner_label)
+            },
+        );
+        start(&state, LockKey::Gate).unwrap().finish(true).unwrap();
+    }
+
+    #[test]
+    fn a_shim_launchd_cannot_spawn_is_reported_at_once() {
+        let dir = tempfile::tempdir().unwrap();
+        let out = fs::canonicalize(dir.path()).unwrap();
+        let status = Command::new(std::env::current_exe().unwrap())
+            .args(&probe_argv()[1..])
+            .env(PROBE, "missing-shim")
+            .env("ATELIER_TEST_OUT", &out)
+            .stdin(Stdio::null())
+            .status()
+            .unwrap();
+        assert!(status.success());
+        let text = fs::read_to_string(out.join("result")).unwrap();
+        let lines: Vec<&str> = text.lines().collect();
+        let missing = out.join("no-such-atelier");
+        for (i, what) in [
+            (0, "unavailable: "),
+            (2, "launchd jobs cannot be started: "),
+        ] {
+            let (secs, msg) = lines[i].split_once(' ').unwrap();
+            let secs: f64 = secs.parse().unwrap();
+            assert!(secs < 2.5, "{text}");
+            assert!(msg.contains(what), "{text}");
+            assert!(
+                msg.contains(&format!(
+                    "launchd could not start the shim: {}: No such file",
+                    missing.display()
+                )),
+                "{text}"
+            );
+        }
+        assert_eq!(lines[1], "loaded false", "{text}");
+    }
+
+    #[test]
+    fn jobs_an_atelier_left_loaded_when_it_died_are_removed() {
+        let fake_run = atelier::runs::new_run_id().unwrap();
+        let mut child = Command::new(std::env::current_exe().unwrap())
+            .args(&probe_argv()[1..])
+            .env(PROBE, "die-after-bootstrap")
+            .env("ATELIER_TEST_RUN", &fake_run)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap();
+        let labels = [
+            format!("atelier.probe.{}.0a1b", child.id()),
+            format!("atelier.{fake_run}.1"),
+            format!("atelier.{fake_run}.2"),
+        ];
+        let status = child.wait().unwrap();
+        assert_eq!(status.code(), Some(9));
+        // All three are loaded, and every folder names the dead child as owner.
+        for l in &labels {
+            assert!(label_loaded(l), "{l}");
+            assert!(launchd::job_dir(l).join("owner").is_file(), "{l}");
+        }
+        // Without a folder, the probe job is known by the pid in its label, the step job by
+        // its run, which `dead_run` says is dead.
+        fs::remove_dir_all(launchd::job_dir(&labels[0])).unwrap();
+        fs::remove_dir_all(launchd::job_dir(&labels[1])).unwrap();
+        wait_for("the jobs to be removed", Duration::from_secs(15), || {
+            launchd::sweep(&|id| id == fake_run.as_str());
+            labels.iter().all(|l| !label_loaded(l))
+        });
+        for l in &labels {
+            assert!(!launchd::job_dir(l).exists(), "{l}");
+        }
+    }
+
+    #[test]
+    fn a_member_that_refuses_the_signal_is_reported_at_once() {
+        let repo = Repo::new();
+        let state = State::open(&repo.checkout()).unwrap();
+        // `kill` answers EPERM for the pids in this file, as for a process `sudo` started.
+        let deny = std::env::temp_dir().join(format!("atelier-deny-{}", std::process::id()));
+        fs::write(&deny, "").unwrap();
+        coalition::deny_signals_listed_in(&deny);
+        let pidfile = repo.tmp.path().join("sleeper.pid");
+        let mut run = start(&state, LockKey::branch("x")).unwrap();
+        let t = Instant::now();
+        let step = run
+            .step(
+                "sudo",
+                &sh(&format!(
+                    "{} && cat '{}' >> '{}'",
+                    daemonize_cmd(&pidfile.to_string_lossy(), false),
+                    pidfile.display(),
+                    deny.display()
+                )),
+                &repo.root,
+                &[],
+            )
+            .unwrap();
+        let took = t.elapsed();
+        let sleeper = read_pid(&pidfile);
+        let user = String::from_utf8(
+            Command::new("/usr/bin/id")
+                .arg("-un")
+                .output()
+                .unwrap()
+                .stdout,
+        )
+        .unwrap()
+        .trim()
+        .to_owned();
+        let want = format!("cannot stop {sleeper} (owned by {user})");
+        assert_eq!(step.status, StepStatus::LeftProcesses, "{step:?}");
+        assert_eq!(step.unstoppable, std::slice::from_ref(&want), "{step:?}");
+        assert!(took < Duration::from_secs(5), "no retry rounds: {took:?}");
+        assert!(alive(sleeper));
+        let t = Instant::now();
+        let result = run.finish(true).unwrap();
+        assert!(t.elapsed() < Duration::from_secs(5), "{:?}", t.elapsed());
+        assert_eq!(result.outcome, Outcome::Failed);
+        assert!(
+            result.failures.contains(&format!("sudo: {want}")),
+            "{:?}",
+            result.failures
+        );
+        assert!(result.failures.contains(&want), "{:?}", result.failures);
+        fs::write(&deny, "").unwrap();
+        kill_and_wait(sleeper);
+        let _ = fs::remove_file(&deny);
+    }
+
+    /// A run in a folder under `~/Documents`, which macOS protects (TCC). Not run by default: a
+    /// launchd job is its own responsible process, so the first access from each new build of
+    /// atelier (a new code signature) asks the owner in a dialog, which a headless run cannot
+    /// answer and which would appear on the owner's screen during `scripts/check.sh`. Run it by
+    /// hand at a Mac, once per release: `cargo test --test launchd -- --ignored documents`.
+    #[test]
+    #[ignore = "may show a macOS privacy dialog; run by hand"]
+    fn a_run_in_a_folder_under_documents_works() {
+        let Some(home) = std::env::var_os("HOME") else {
+            return;
+        };
+        let docs = PathBuf::from(home).join("Documents");
+        if !docs.is_dir() {
+            eprintln!("skipped: no ~/Documents");
+            return;
+        }
+        let dir = tempfile::tempdir_in(&docs).unwrap();
+        let state = State::open_at(dir.path().join("state")).unwrap();
+        let mut run = start(&state, LockKey::branch("x")).unwrap();
+        fs::write(dir.path().join("in.txt"), "hello\n").unwrap();
+        let s = run
+            .step("read", &sh("cat in.txt"), dir.path(), &[])
+            .unwrap();
+        assert_eq!(s.status, StepStatus::Passed, "{s:?}");
+        assert_eq!(
+            fs::read_to_string(run.dir().join("read.log")).unwrap(),
+            "hello\n"
+        );
+        assert_eq!(run.finish(true).unwrap().outcome, Outcome::Passed);
+    }
+
+    #[test]
     fn a_job_never_runs_its_program_unless_released() {
         steps_use_atelier();
         let dir = tempfile::tempdir().unwrap();
         let dir = fs::canonicalize(dir.path()).unwrap();
         let marker = dir.join("ran");
         for release in [false, true] {
-            let job_dir = dir.join(format!("job-{release}"));
-            fs::create_dir(&job_dir).unwrap();
             let spec = launchd::Spec {
                 argv: vec!["/usr/bin/touch".into(), marker.clone().into()],
                 cwd: dir.clone(),
@@ -545,7 +893,15 @@ mod mac {
                 stderr: dir.join("err"),
             };
             let label = format!("atelier.test.{}.{release}", std::process::id());
-            let mut job = launchd::launch(&job_dir, &label, &spec, &mut || false).unwrap();
+            let mut job = launchd::launch(&label, &spec, &mut || false).unwrap();
+            let job_dir = launchd::job_dir(&label);
+            assert_eq!(job.dir(), job_dir);
+            // The intent record names this process.
+            let owner = fs::read_to_string(job_dir.join("owner")).unwrap();
+            assert!(
+                owner.starts_with(&format!("{} ", std::process::id())),
+                "{owner}"
+            );
             assert!(job.coalition.id > 0);
             assert_eq!(atelier::procs::start_time(job.pid), job.start);
             if release {

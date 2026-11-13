@@ -57,15 +57,20 @@ for its run when that id is free (the gate names its inner check's run this way)
 sees it.
 
 A process belongs to run `X` when `ATELIER_RUN=X`, or when `X` is an element of `ATELIER_RUNS`.
-So an outer run, the gate for one, finds what an inner atelier left behind. A step cannot set
-either variable (refused, 2).
+So an outer run, the gate for one, finds what an inner atelier left behind.
+
+On macOS every process of a step also carries `ATELIER_COALITIONS=<path>:<path>:…`: the absolute
+paths of the coalitions files (below) of the runs it is nested in, then its own run's, whatever
+state each run is in. A step cannot set any of the three variables (refused, 2).
 
 ## Coalitions (macOS)
 
 On macOS each step is a launchd job (DESIGN §8.4) with its own resource coalition, which every
 process the step starts keeps (after `setsid`, a double fork or `env -i` too). There a process
-belongs to run `X` when its coalition is listed in `runs/X/coalitions`; the markers are still set,
-but this version does not look for them in its own runs. A coalition is written
+belongs to run `X` when its coalition is listed in `runs/X/coalitions`, and also, as everywhere,
+when it carries `X`'s marker: the end-of-run scan and the lock's next taker look for both, so
+either catches a survivor. Members of the coalitions are stopped; marked processes outside them
+are named and not signalled. A coalition is written
 `<coalition id>@<boot session uuid>` (`kern.bootsessionuuid`): coalition ids only grow within a
 boot, and a coalition of another boot has no members.
 
@@ -75,12 +80,25 @@ boot, and a coalition of another boot has no members.
 <coalition> <launchd label> [<later fields>...]
 ```
 
-A step's line is appended before its program runs, to its run's file and to the file of every run
-named in its `ATELIER_RUNS` whose folder is in the same state, so an outer run also finds what a
-nested atelier left when that atelier died. The label is `atelier.<run id>.<n>` in `gui/<uid>` or
-`user/<uid>`; a job still loaded when the lock's next taker finds nothing alive is booted out.
-Lines this version cannot read are skipped. A run without the file (Linux, or an older version)
-is looked for by its markers.
+A step's line is appended before its program runs, to its run's file and to every outer run's
+file: those its `ATELIER_COALITIONS` names (any state; only an existing file named `coalitions`
+in a run folder with `run.toml`), and those of the runs named in its `ATELIER_RUNS` whose folder
+is in the same state. So an outer run also finds what a nested atelier left when that atelier
+died. Lines this version cannot read are skipped. A run without the file (Linux, or an older
+version) is looked for by its markers only.
+
+The job's label is `atelier.<run id>.<n>` (a step) or `atelier.probe.<pid>.<hex>` (the probe), in
+`gui/<uid>` or `user/<uid>`. Its files (spec, FIFOs, plist, launchd's log) are in
+`<user temp>/atelier-jobs/<label>/`, where `<user temp>` is `getconf DARWIN_USER_TEMP_DIR`, never in
+the state. That folder is created before `launchctl bootstrap` with a file `owner`, `<pid> <start
+time>\n` of the atelier process that starts the job (start time as in lock records, or `-`), and
+is removed after `launchctl bootout`. Loaded jobs that atelier processes which died left behind
+are removed (`launchctl bootout`) when a run starts, when it ends, and when the lock's next taker
+finds nothing alive: every loaded `atelier.*` job whose process does not run and whose folder's
+owner is gone; without a folder, a probe job whose pid is gone, or a step job whose run (in the
+state doing the cleanup) has a `run.toml` whose process is gone. A job whose process still runs is
+left until it ends (its processes are survivors, found as above). Folders of dead owners whose job
+is not loaded are removed too.
 
 `probes/coalition-<uid>.toml`: `macos` (`<product version> (<build>)`), `passed` (RFC 3339 UTC),
 `atelier_version`. Written when the probe (a job that starts a sleeper with `setsid` and a double
@@ -157,10 +175,10 @@ When nothing lives, the record is removed.
 | `ended` | string | RFC 3339 UTC |
 | `signal` | string, optional | `SIGTERM`, `SIGINT` or `SIGHUP` when a stop signal ended the run |
 | `failures` | array of strings | why the run failed |
-| `survivors` | array of strings | processes carrying the run's marker at its end (Linux; never signalled), or live members of its coalitions (macOS; stopped) |
+| `survivors` | array of strings | processes carrying the run's marker at its end (never signalled), and on macOS live members of its coalitions (stopped) |
 | `test_results` | string, optional | the per-test results, relative to the run folder |
 | `tests` | table, optional | `passed`, `failed`, `flaky` (failed, then passed when retried), `skipped`, `excluded` |
-| `steps` | array of tables | `name`, `status` (`passed`, `failed`, `left-processes`, `interrupted`, `not-started`), `exit`, `signal`, `log`, `left`, `unstoppable` |
+| `steps` | array of tables | `name`, `status` (`passed`, `failed`, `left-processes`, `interrupted`, `not-started`), `exit`, `signal`, `log`, `left`, `unstoppable` (`<pid> <program>`, or `cannot stop <pid> (owned by <user>)` for a process that refused the signal) |
 
 ## Branch records
 

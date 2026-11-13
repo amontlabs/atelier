@@ -209,21 +209,90 @@ pub fn describe(pids: &[i32]) -> Vec<ProcInfo> {
         .collect()
 }
 
-/// Sends `sig` to every member of `ids`, re-reading each one's coalition just before: a pid
-/// that left (ended and was reused) is never signalled, nor is this process. Returns the pids
-/// signalled.
+/// A test's stand-in for `kill`: pids listed in this file answer EPERM.
 #[cfg(target_os = "macos")]
-fn signal_members(ids: &[Coalition], sig: libc::c_int) -> Vec<i32> {
-    let mut sent = Vec::new();
+static DENY_FILE: std::sync::OnceLock<std::path::PathBuf> = std::sync::OnceLock::new();
+
+/// Makes `kill` answer EPERM for the pids listed in `path` (one per line), as for another
+/// user's process: for tests, which cannot start one. The first call wins.
+#[cfg(target_os = "macos")]
+#[doc(hidden)]
+pub fn deny_signals_listed_in(path: impl Into<std::path::PathBuf>) {
+    let _ = DENY_FILE.set(path.into());
+}
+
+#[cfg(target_os = "macos")]
+fn kill(pid: i32, sig: libc::c_int) -> std::io::Result<()> {
+    if let Some(f) = DENY_FILE.get()
+        && std::fs::read_to_string(f)
+            .unwrap_or_default()
+            .lines()
+            .any(|l| l.trim().parse() == Ok(pid))
+    {
+        return Err(std::io::Error::from_raw_os_error(libc::EPERM));
+    }
+    // SAFETY: plain syscall to one pid.
+    if unsafe { libc::kill(pid, sig) } == 0 {
+        Ok(())
+    } else {
+        Err(std::io::Error::last_os_error())
+    }
+}
+
+/// Sends `sig` to every member of `ids` not in `skip`, re-reading each one's coalition just
+/// before: a pid that left (ended and was reused) is never signalled, nor is this process.
+/// Returns the pids that refused the signal (EPERM: another user's process).
+#[cfg(target_os = "macos")]
+fn signal_members(ids: &[Coalition], sig: libc::c_int, skip: &[i32]) -> Vec<i32> {
+    let mut denied = Vec::new();
     for (pid, c) in members(ids) {
-        if of(pid) == Some(c) {
-            // SAFETY: plain syscall to one pid whose coalition was just checked.
-            if unsafe { libc::kill(pid, sig) } == 0 {
-                sent.push(pid);
-            }
+        if skip.contains(&pid) || of(pid) != Some(c) {
+            continue;
+        }
+        if let Err(e) = kill(pid, sig)
+            && e.raw_os_error() == Some(libc::EPERM)
+        {
+            denied.push(pid);
         }
     }
-    sent
+    denied
+}
+
+/// The user that owns a process, by name (by uid when it has none); `?` when it cannot be read.
+#[cfg(target_os = "macos")]
+pub fn owner(pid: i32) -> String {
+    // SAFETY: proc_bsdshortinfo is plain data; proc_pidinfo fills it.
+    let mut info: libc::proc_bsdshortinfo = unsafe { std::mem::zeroed() };
+    let size = std::mem::size_of::<libc::proc_bsdshortinfo>() as libc::c_int;
+    // SAFETY: proc_pidinfo writes at most `size` bytes into info.
+    let n = unsafe {
+        libc::proc_pidinfo(
+            pid,
+            libc::PROC_PIDT_SHORTBSDINFO,
+            0,
+            (&mut info as *mut libc::proc_bsdshortinfo).cast(),
+            size,
+        )
+    };
+    if n != size {
+        return "?".into();
+    }
+    let uid = info.pbsi_uid;
+    // SAFETY: getpwuid_r writes into pw and buf, at most buf.len() bytes.
+    unsafe {
+        let mut pw: libc::passwd = std::mem::zeroed();
+        let mut out: *mut libc::passwd = std::ptr::null_mut();
+        let mut buf = vec![0 as libc::c_char; 4096];
+        if libc::getpwuid_r(uid, &mut pw, buf.as_mut_ptr(), buf.len(), &mut out) == 0
+            && !out.is_null()
+            && !pw.pw_name.is_null()
+        {
+            return std::ffi::CStr::from_ptr(pw.pw_name)
+                .to_string_lossy()
+                .into_owned();
+        }
+    }
+    uid.to_string()
 }
 
 /// How long the members of a step's coalition get to end on their own once the step has ended,
@@ -234,11 +303,13 @@ pub const SETTLE: Duration = Duration::from_secs(1);
 /// Waits up to `within` for the members of `ids` to end on their own. True when none is left.
 #[cfg(target_os = "macos")]
 pub fn settle(ids: &[Coalition], within: Duration) -> bool {
-    wait_empty(ids, within)
+    wait_empty(ids, within, &[])
 }
 
 /// Stops every member of `ids`: TERM (and CONT), wait up to `grace`, KILL, wait; up to five
-/// rounds while new members appear. Members still there at the end are `remaining`.
+/// rounds while new members appear. A member that refuses the signal (EPERM: another user's,
+/// after `sudo`) is not signalled again nor waited for: it is in `denied` (and `remaining`) at
+/// once. Members still there at the end are `remaining`.
 #[cfg(target_os = "macos")]
 pub fn stop(ids: &[Coalition], grace: Duration) -> Stopped {
     let mut out = Stopped::default();
@@ -250,31 +321,56 @@ pub fn stop(ids: &[Coalition], grace: Duration) -> Stopped {
     if out.members.is_empty() {
         return out;
     }
+    let mut skip: Vec<i32> = Vec::new();
+    let deny = |pids: Vec<i32>, skip: &mut Vec<i32>| {
+        for p in pids {
+            if !skip.contains(&p) {
+                skip.push(p);
+            }
+        }
+    };
     for _ in 0..5 {
-        if members(ids).is_empty() {
+        if members_except(ids, &skip).is_empty() {
             break;
         }
-        signal_members(ids, libc::SIGTERM);
-        signal_members(ids, libc::SIGCONT);
-        if wait_empty(ids, grace) {
+        let d = signal_members(ids, libc::SIGTERM, &skip);
+        deny(d, &mut skip);
+        signal_members(ids, libc::SIGCONT, &skip);
+        if wait_empty(ids, grace, &skip) {
             break;
         }
         out.killed = true;
-        signal_members(ids, libc::SIGKILL);
-        if wait_empty(ids, Duration::from_secs(5)) {
+        let d = signal_members(ids, libc::SIGKILL, &skip);
+        deny(d, &mut skip);
+        if wait_empty(ids, Duration::from_secs(5), &skip) {
             break;
         }
     }
     let left: Vec<i32> = members(ids).into_iter().map(|(p, _)| p).collect();
     out.remaining = describe(&left);
+    out.denied = out
+        .remaining
+        .iter()
+        .filter(|p| skip.contains(&p.pid))
+        .map(|p| (p.pid, owner(p.pid)))
+        .collect();
     out
 }
 
 #[cfg(target_os = "macos")]
-fn wait_empty(ids: &[Coalition], within: Duration) -> bool {
+fn members_except(ids: &[Coalition], skip: &[i32]) -> Vec<i32> {
+    members(ids)
+        .into_iter()
+        .map(|(p, _)| p)
+        .filter(|p| !skip.contains(p))
+        .collect()
+}
+
+#[cfg(target_os = "macos")]
+fn wait_empty(ids: &[Coalition], within: Duration, skip: &[i32]) -> bool {
     let deadline = Instant::now() + within;
     loop {
-        if members(ids).is_empty() {
+        if members_except(ids, skip).is_empty() {
             return true;
         }
         if Instant::now() >= deadline {
@@ -322,6 +418,14 @@ pub fn append_run_file(run_dir: &std::path::Path, line: &JobLine) -> std::io::Re
         .create(true)
         .append(true)
         .open(run_dir.join(RUN_FILE))?;
+    f.write_all(format!("{} {}\n", line.coalition, line.label).as_bytes())
+}
+
+/// Appends a line to an outer run's coalitions file, only when the file already exists (the
+/// outer run created it when it listed the step this run is nested in).
+pub fn append_existing_file(path: &std::path::Path, line: &JobLine) -> std::io::Result<()> {
+    use std::io::Write;
+    let mut f = std::fs::OpenOptions::new().append(true).open(path)?;
     f.write_all(format!("{} {}\n", line.coalition, line.label).as_bytes())
 }
 
@@ -393,14 +497,9 @@ pub fn ensure_probed(state: &crate::state::State) -> crate::exit::Result<()> {
     {
         return Ok(());
     }
-    // A folder of its own: two commands may probe at once.
-    let random =
-        crate::fsutil::random_hex(8).map_err(|e| Failure::refused(format!("random bytes: {e}")))?;
-    let dir = path.with_extension(format!("job-{random}"));
-    std::fs::create_dir_all(&dir)
-        .map_err(|e| Failure::refused(format!("{}: {e}", dir.display())))?;
-    let found = crate::launchd::probe(&dir);
-    let _ = std::fs::remove_dir_all(&dir);
+    // The probe's job has a folder of its own (its label is unique): two commands may probe at
+    // once.
+    let found = crate::launchd::probe();
     match found {
         Ok(()) => {
             let rec = ProbeRecord {
@@ -409,6 +508,10 @@ pub fn ensure_probed(state: &crate::state::State) -> crate::exit::Result<()> {
                 atelier_version: crate::dispatch::VERSION.to_owned(),
             };
             let text = toml::to_string(&rec).map_err(|e| Failure::refused(e.to_string()))?;
+            if let Some(parent) = path.parent() {
+                std::fs::create_dir_all(parent)
+                    .map_err(|e| Failure::refused(format!("{}: {e}", parent.display())))?;
+            }
             crate::fsutil::write_atomic(&path, text.as_bytes())
                 .map_err(|e| Failure::refused(format!("{}: {e}", path.display())))?;
             Ok(())

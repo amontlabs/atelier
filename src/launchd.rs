@@ -16,6 +16,13 @@
 //! atelier waits for the job's pid with `kqueue` (`EVFILT_PROC`, `NOTE_EXIT`) and reads the exit
 //! status from `launchctl print`: text, not API, so the preflight probe ([`probe`]) checks it on
 //! each macOS version. `launchctl bootout` comes last: it does not stop survivors.
+//!
+//! Each job's files (the spec, the two FIFOs, the plist and launchd's log) are in a folder of its
+//! own under the user's temporary folder (`getconf DARWIN_USER_TEMP_DIR`), never in the project
+//! or the state, which may be in a folder macOS protects (`~/Documents`). The folder is named by
+//! the job's label and is created, with an `owner` file naming this atelier process, before the
+//! job is bootstrapped; it is removed after the `bootout`. A loaded `atelier.*` job whose folder
+//! names a dead owner is removed by [`sweep`].
 
 use std::ffi::{OsStr, OsString};
 use std::fs::{self, File, OpenOptions};
@@ -42,6 +49,45 @@ const START_WITHIN: Duration = Duration::from_secs(60);
 
 /// How long `launchctl print` gets to report a status after the job's process ended.
 const STATUS_WITHIN: Duration = Duration::from_secs(10);
+
+/// The exit status launchd records when it cannot spawn a job's program (`EX_CONFIG`): a
+/// program that is missing or cannot be run. The shim itself never exits 78 before it reports.
+const SPAWN_FAILED: i32 = 78;
+
+/// The folder of job folders, in the user's temporary folder.
+const JOBS_DIR: &str = "atelier-jobs";
+
+/// The file in a job folder that names the atelier process that started the job.
+const OWNER_FILE: &str = "owner";
+
+/// The user's own temporary folder (`confstr(_CS_DARWIN_USER_TEMP_DIR)`), whatever `TMPDIR` a
+/// step set; `std::env::temp_dir()` when it cannot be read.
+pub fn user_temp_dir() -> PathBuf {
+    let mut buf = vec![0u8; 1024];
+    // SAFETY: confstr writes at most `buf.len()` bytes, NUL included.
+    let n = unsafe {
+        libc::confstr(
+            libc::_CS_DARWIN_USER_TEMP_DIR,
+            buf.as_mut_ptr().cast(),
+            buf.len(),
+        )
+    };
+    if n == 0 || n > buf.len() {
+        return std::env::temp_dir();
+    }
+    buf.truncate(n - 1);
+    PathBuf::from(OsString::from_vec(buf))
+}
+
+/// Where the job folders are: `<user temp>/atelier-jobs/`.
+pub fn jobs_root() -> PathBuf {
+    user_temp_dir().join(JOBS_DIR)
+}
+
+/// The folder of the job with `label`.
+pub fn job_dir(label: &str) -> PathBuf {
+    jobs_root().join(label)
+}
 
 /// What a step job runs, and where.
 #[derive(Debug, Clone)]
@@ -229,6 +275,8 @@ struct Print {
     running: bool,
     exit: Option<i32>,
     signal: Option<i32>,
+    /// `last exit code` as printed, `78: EX_CONFIG`.
+    exit_text: Option<String>,
 }
 
 fn parse_print(text: &str) -> Print {
@@ -238,7 +286,9 @@ fn parse_print(text: &str) -> Print {
             p.running = true;
         }
         if let Some(v) = l.strip_prefix("last exit code = ") {
-            p.exit = v.trim().parse().ok();
+            // `7`, or with a sysexits name for 64 to 78: `78: EX_CONFIG`.
+            p.exit = v.split(':').next().and_then(|n| n.trim().parse().ok());
+            p.exit_text = Some(v.trim().to_owned());
         }
         if let Some(v) = l.strip_prefix("last terminating signal = ") {
             // `Terminated: 15`
@@ -255,19 +305,46 @@ fn print_job(target: &str) -> Option<Print> {
         .then(|| parse_print(&String::from_utf8_lossy(&out.stdout)))
 }
 
-/// Starts a step job in `dir` (a new empty folder) and waits until its shim reports, its
-/// program not yet released. `interrupted` is polled while waiting.
+/// Starts a step job with `label` and waits until its shim reports, its program not yet
+/// released. `interrupted` is polled while waiting. The job's folder ([`job_dir`]) must not
+/// exist yet.
 pub fn launch(
-    dir: &Path,
     label: &str,
     spec: &Spec,
     interrupted: &mut dyn FnMut() -> bool,
 ) -> Result<Job, LaunchError> {
-    launch_inner(dir, label, spec, false, interrupted)
+    launch_inner(label, spec, false, interrupted)
+}
+
+/// Removes a job folder unless defused: the folder of a job that was never bootstrapped.
+struct DirGuard(Option<PathBuf>);
+
+impl Drop for DirGuard {
+    fn drop(&mut self) {
+        if let Some(d) = self.0.take() {
+            let _ = fs::remove_dir_all(d);
+        }
+    }
+}
+
+/// Why launchd could not spawn the shim, from what the program path is.
+fn spawn_failure(program: &str, exit_text: Option<&str>) -> String {
+    let path = Path::new(program);
+    let why = match fs::metadata(path) {
+        Err(e) => format!("{program}: {e}"),
+        Ok(m) if !m.is_file() => format!("{program} is not a file"),
+        Ok(m) if std::os::unix::fs::PermissionsExt::mode(&m.permissions()) & 0o111 == 0 => {
+            format!("{program} is not executable")
+        }
+        Ok(_) => format!("{program} cannot be run"),
+    };
+    format!(
+        "launchd could not start the shim: {why} (launchctl print: last exit code = {})",
+        exit_text.unwrap_or("78")
+    )
 }
 
 fn launch_inner(
-    dir: &Path,
     label: &str,
     spec: &Spec,
     probe: bool,
@@ -279,6 +356,21 @@ fn launch_inner(
     let boot = coalition::boot_session().ok_or_else(|| {
         LaunchError::Unavailable("cannot read this boot's session id (kern.bootsessionuuid)".into())
     })?;
+    let dir = job_dir(label);
+    fs::create_dir_all(jobs_root()).map_err(|e| io("the job folders", e))?;
+    fs::create_dir(&dir).map_err(|e| io(&format!("{}", dir.display()), e))?;
+    let mut guard = DirGuard(Some(dir.clone()));
+    // The intent record: written before the bootstrap, so a job this process leaves loaded when
+    // it dies is found by `sweep`.
+    let me = std::process::id() as i32;
+    fs::write(
+        dir.join(OWNER_FILE),
+        format!(
+            "{me} {}\n",
+            procs::start_time(me).unwrap_or_else(|| "-".into())
+        ),
+    )
+    .map_err(|e| io("the job's owner file", e))?;
     let (ready_path, go_path) = (dir.join("ready"), dir.join("go"));
     let (spec_path, plist_path, log_path) = (
         dir.join("spec"),
@@ -310,8 +402,8 @@ fn launch_inner(
     };
 
     let program = utf8(&program, "the atelier program")?.to_owned();
-    let spec_s = utf8(&spec_path, "the run folder")?.to_owned();
-    let log_s = utf8(&log_path, "the run folder")?.to_owned();
+    let spec_s = utf8(&spec_path, "the job folder")?.to_owned();
+    let log_s = utf8(&log_path, "the job folder")?.to_owned();
     let uid = uid();
     let order: &[u8] = match DOMAIN.load(Ordering::Relaxed) {
         2 => &[2, 1],
@@ -329,7 +421,7 @@ fn launch_inner(
             plist(label, &program, &spec_s, &log_s, background),
         )
         .map_err(|e| io("the job's plist", e))?;
-        let plist_s = utf8(&plist_path, "the run folder")?;
+        let plist_s = utf8(&plist_path, "the job folder")?;
         match launchctl(&["bootstrap", &domain, plist_s]) {
             Ok(out) if out.status.success() => {
                 DOMAIN.store(*d, Ordering::Relaxed);
@@ -346,10 +438,12 @@ fn launch_inner(
     let Some(target) = target else {
         return Err(LaunchError::Unavailable(errors.join("; ")));
     };
+    // From here the job's bootout removes the folder.
+    guard.0 = None;
     let mut job = Job {
         label: label.to_owned(),
         target,
-        dir: dir.to_path_buf(),
+        dir,
         pid: 0,
         start: None,
         coalition: Coalition { id: 0, boot },
@@ -384,6 +478,14 @@ fn launch_inner(
                 }
                 if line.ends_with(b"\n") {
                     break;
+                }
+                if p.exit == Some(SPAWN_FAILED) && p.signal.is_none() {
+                    // launchd could not spawn the shim at all (`spawn scheduled`, EX_CONFIG):
+                    // no step can start with this program.
+                    return Err(LaunchError::Unavailable(spawn_failure(
+                        &program,
+                        p.exit_text.as_deref(),
+                    )));
                 }
                 let log = fs::read_to_string(&log_path).unwrap_or_default();
                 return Err(LaunchError::NotStarted(format!(
@@ -434,6 +536,11 @@ fn describe_status(exit: Option<i32>, signal: Option<i32>) -> String {
 }
 
 impl Job {
+    /// The job's folder ([`job_dir`]), removed by [`Job::bootout`].
+    pub fn dir(&self) -> &Path {
+        &self.dir
+    }
+
     /// Lets the shim run the program. False when the shim is gone.
     pub fn release(&mut self) -> bool {
         match self.go.take() {
@@ -564,31 +671,141 @@ impl Drop for Job {
 }
 
 /// Removes a job left loaded by an atelier that died (its label from a run's coalitions file),
-/// in whichever domain it is. Errors are ignored: the job is usually gone.
+/// in whichever domain it is, and its folder. Errors are ignored: the job is usually gone.
 pub fn bootout_label(label: &str) {
     let uid = uid();
     for d in ["gui", "user"] {
         let _ = launchctl(&["bootout", &format!("{d}/{uid}/{label}")]);
     }
+    if !label.is_empty() && !label.contains('/') && label.starts_with("atelier.") {
+        let _ = fs::remove_dir_all(job_dir(label));
+    }
+}
+
+/// The `atelier.*` jobs loaded in this user's `gui` and `user` domains, each with whether its
+/// process runs, from the `services` lists of `launchctl print` (`<pid> <status> <label>`, pid 0
+/// when not running).
+fn loaded_jobs() -> Vec<(String, bool)> {
+    let uid = uid();
+    let mut out: Vec<(String, bool)> = Vec::new();
+    for d in ["gui", "user"] {
+        let Ok(o) = launchctl(&["print", &format!("{d}/{uid}")]) else {
+            continue;
+        };
+        if !o.status.success() {
+            continue;
+        }
+        let text = String::from_utf8_lossy(&o.stdout);
+        let mut inside = false;
+        for l in text.lines() {
+            let t = l.trim();
+            if t == "services = {" {
+                inside = true;
+                continue;
+            }
+            if inside && t == "}" {
+                break;
+            }
+            if !inside {
+                continue;
+            }
+            let f: Vec<&str> = t.split_whitespace().collect();
+            if let [pid, .., label] = f.as_slice()
+                && label.starts_with("atelier.")
+                && !out.iter().any(|(l, _)| l == label)
+            {
+                out.push(((*label).to_owned(), pid.parse::<i32>().is_ok_and(|p| p > 0)));
+            }
+        }
+    }
+    out
+}
+
+/// What the owner file of a job folder says: `Some(true)` when the atelier process it names is
+/// alive, `Some(false)` when it is gone, `None` when there is no readable owner file.
+fn owner_alive(dir: &Path) -> Option<bool> {
+    let text = fs::read_to_string(dir.join(OWNER_FILE)).ok()?;
+    let mut it = text.split_whitespace();
+    let pid: i32 = it.next()?.parse().ok()?;
+    let start = it.next().filter(|s| *s != "-");
+    if pid <= 1 {
+        return None;
+    }
+    let now = procs::start_time(pid);
+    Some(match start {
+        Some(s) => now.as_deref() == Some(s),
+        // SAFETY: an existence check only.
+        None => now.is_some() || unsafe { libc::kill(pid, 0) } == 0,
+    })
+}
+
+/// Removes the jobs atelier processes that died left behind: every loaded `atelier.*` job that
+/// does not run and whose folder names a dead owner; a probe job (`atelier.probe.<pid>.<hex>`)
+/// whose pid is gone; and a job of a run `dead_run` says is dead (`atelier.<run id>.<n>`).
+/// Folders of dead owners whose job is not loaded go too. A job whose process still runs is left
+/// alone: what it runs is a survivor, found by coalition or marker, and the next sweep after it
+/// ends removes it. Returns the labels booted out.
+pub fn sweep(dead_run: &dyn Fn(&str) -> bool) -> Vec<String> {
+    let mut removed = Vec::new();
+    let loaded = loaded_jobs();
+    for (label, running) in &loaded {
+        if *running {
+            continue;
+        }
+        let dead = match owner_alive(&job_dir(label)) {
+            Some(alive) => !alive,
+            None => {
+                let rest = &label["atelier.".len()..];
+                if let Some(p) = rest.strip_prefix("probe.") {
+                    p.split('.')
+                        .next()
+                        .and_then(|p| p.parse::<i32>().ok())
+                        .filter(|p| *p > 1)
+                        // SAFETY: an existence check only.
+                        .is_some_and(|p| unsafe { libc::kill(p, 0) } != 0)
+                } else {
+                    rest.rsplit_once('.')
+                        .is_some_and(|(id, n)| n.parse::<u32>().is_ok() && dead_run(id))
+                }
+            }
+        };
+        if dead {
+            bootout_label(label);
+            removed.push(label.clone());
+        }
+    }
+    if let Ok(entries) = fs::read_dir(jobs_root()) {
+        for e in entries.flatten() {
+            let name = e.file_name().to_string_lossy().into_owned();
+            if loaded.iter().any(|(l, _)| *l == name) {
+                continue;
+            }
+            if owner_alive(&e.path()) == Some(false) {
+                let _ = fs::remove_dir_all(e.path());
+            }
+        }
+    }
+    removed
 }
 
 /// The preflight's probe: a job whose program starts a sleeper in a new session with a double
 /// fork and an empty environment, then exits 3. Passes when `launchctl print` reports exit 3
 /// and the sleeper is found by the job's coalition and stopped.
-pub fn probe(dir: &Path) -> Result<(), String> {
-    let spec = Spec {
-        argv: vec!["/bin/sleep".into(), "30".into()],
-        cwd: PathBuf::from("/"),
-        env: Vec::new(),
-        stdout: dir.join("probe.log"),
-        stderr: dir.join("probe.log"),
-    };
+pub fn probe() -> Result<(), String> {
     let label = format!(
         "atelier.probe.{}.{}",
         std::process::id(),
         crate::fsutil::random_hex(4).map_err(|e| e.to_string())?
     );
-    let mut job = match launch_inner(dir, &label, &spec, true, &mut || false) {
+    let log = job_dir(&label).join("probe.log");
+    let spec = Spec {
+        argv: vec!["/bin/sleep".into(), "30".into()],
+        cwd: PathBuf::from("/"),
+        env: Vec::new(),
+        stdout: log.clone(),
+        stderr: log,
+    };
+    let mut job = match launch_inner(&label, &spec, true, &mut || false) {
         Ok(j) => j,
         Err(LaunchError::Unavailable(m) | LaunchError::NotStarted(m)) => {
             return Err(format!("launchd jobs cannot be started: {m}"));
@@ -846,7 +1063,8 @@ mod tests {
             Print {
                 running: false,
                 exit: Some(7),
-                signal: None
+                signal: None,
+                exit_text: Some("7".into()),
             }
         );
         let text = "\tstate = running\n\tlast exit code = (never exited)\n";
@@ -855,11 +1073,22 @@ mod tests {
             Print {
                 running: true,
                 exit: None,
-                signal: None
+                signal: None,
+                exit_text: Some("(never exited)".into()),
             }
         );
         let text = "\tstate = not running\n\tlast terminating signal = Terminated: 15\n";
         assert_eq!(parse_print(text).signal, Some(15));
+        // launchd names the sysexits codes 64 to 78.
+        for (line, code) in [
+            ("last exit code = 64: EX_USAGE", 64),
+            ("last exit code = 70: EX_SOFTWARE", 70),
+            ("last exit code = 78: EX_CONFIG", 78),
+            ("last exit code = 255", 255),
+        ] {
+            let p = parse_print(&format!("\tstate = spawn scheduled\n\t{line}\n"));
+            assert_eq!((p.running, p.exit), (false, Some(code)), "{line}");
+        }
     }
 
     #[test]

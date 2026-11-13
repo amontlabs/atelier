@@ -24,6 +24,11 @@ pub const RUN_MARKER: &str = "ATELIER_RUN";
 /// it is nested in (outermost first).
 pub const RUNS_MARKER: &str = "ATELIER_RUNS";
 
+/// macOS: the coalitions files (`runs/<id>/coalitions`, absolute paths, colon-separated) of the
+/// run and of every run it is nested in, whatever state each is in. A nested atelier lists its
+/// step jobs in all of them, so an outer run finds what a nested atelier that died left behind.
+pub const COALITIONS_VAR: &str = "ATELIER_COALITIONS";
+
 /// How long a group gets between TERM and KILL, by default.
 pub const DEFAULT_GRACE: Duration = Duration::from_secs(5);
 
@@ -146,6 +151,24 @@ pub struct Stopped {
     pub killed: bool,
     /// Members still present at the end (the group could not be emptied).
     pub remaining: Vec<ProcInfo>,
+    /// Members of `remaining` that refused the signal (EPERM), each with the user that owns it.
+    pub denied: Vec<(i32, String)>,
+}
+
+impl Stopped {
+    /// The lines that name what could not be stopped: `cannot stop <pid> (owned by <user>)` for
+    /// a member that refused the signal, `<pid> <program>` for the others.
+    pub fn unstoppable(&self) -> Vec<String> {
+        self.remaining
+            .iter()
+            .map(
+                |p| match self.denied.iter().find(|(pid, _)| *pid == p.pid) {
+                    Some((pid, user)) => format!("cannot stop {pid} (owned by {user})"),
+                    None => p.describe(),
+                },
+            )
+            .collect()
+    }
 }
 
 impl Stopped {

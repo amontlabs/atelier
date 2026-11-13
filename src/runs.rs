@@ -19,11 +19,12 @@
 //! and held until its group and coalition are recorded under the lock. When it ends, every
 //! process of its coalition still alive after [`crate::coalition::SETTLE`] (those that left the
 //! group, the session or the environment included) is stopped and the step fails with "left
-//! processes behind". The run's coalitions,
-//! and those of runs nested in it, are listed in the run folder; the end-of-run scan looks
-//! through them instead of the markers, stops what it finds, and the run fails. A run refuses
-//! (4) to start on a macOS where the preflight probe ([`crate::coalition::ensure_probed`])
-//! fails: there is no fallback to the marker scan.
+//! processes behind". The run's coalitions, and those of runs nested in it (in any state: a
+//! nested atelier appends its jobs to every coalitions file `ATELIER_COALITIONS` names), are
+//! listed in the run folder. The end-of-run scan stops every live member of them, then also runs
+//! the marker scan, so either catches a survivor; the run fails. A run refuses (4) to start on a
+//! macOS where the preflight probe ([`crate::coalition::ensure_probed`]) fails: there is no
+//! fallback to the marker scan alone.
 
 use std::fs::{self, File};
 use std::io::{ErrorKind, Write};
@@ -45,7 +46,7 @@ use crate::git;
 use crate::locks::{HeldLock, LockKey};
 use crate::names;
 use crate::platform::Platform;
-use crate::procs::{self, RUN_MARKER, RUNS_MARKER};
+use crate::procs::{self, COALITIONS_VAR, RUN_MARKER, RUNS_MARKER};
 use crate::signals;
 use crate::state::State;
 
@@ -319,10 +320,13 @@ pub struct Run {
     /// Step jobs started so far (macOS), for their labels and folders.
     #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
     jobs: u32,
-    /// The folders of the runs this one is nested in, in the same state: a step's coalition is
-    /// listed there too, so an outer run finds what a nested atelier left.
+    /// The coalitions files of the runs this one is nested in, in any state: a step's coalition
+    /// is listed there too, so an outer run finds what a nested atelier left.
     #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
-    outer_dirs: Vec<PathBuf>,
+    outer_files: Vec<PathBuf>,
+    /// `ATELIER_COALITIONS` of every step: `outer_files`, then this run's file.
+    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+    coalitions: String,
     _signals: signals::RunSignals,
 }
 
@@ -380,16 +384,21 @@ impl Run {
         preferred: Option<&str>,
     ) -> Result<Run> {
         #[cfg(target_os = "macos")]
-        crate::coalition::ensure_probed(state)?;
+        {
+            crate::coalition::ensure_probed(state)?;
+            let runs_dir = state.runs_dir();
+            crate::launchd::sweep(&|id| run_is_dead(&runs_dir, id));
+        }
         let (id, dir) = create_run_dir(&state.runs_dir(), preferred)?;
         let started = fsutil::rfc3339(fsutil::now_secs());
         let mut chain = procs::inherited_runs();
-        let outer_dirs = chain
+        let outer_files = outer_coalition_files(state, &chain);
+        let coalitions = outer_files
             .iter()
-            .map(|id| state.runs_dir().join(id))
-            .filter(|d| is_run_id(&d.file_name().unwrap_or_default().to_string_lossy()))
-            .filter(|d| d.is_dir())
-            .collect();
+            .chain(std::iter::once(&dir.join(crate::coalition::RUN_FILE)))
+            .map(|p| p.to_string_lossy().into_owned())
+            .collect::<Vec<_>>()
+            .join(":");
         chain.push(id.clone());
         let branch = current_branch(worktree);
         let info = RunInfo {
@@ -431,7 +440,8 @@ impl Run {
             interrupted: None,
             scan: None,
             jobs: 0,
-            outer_dirs,
+            outer_files,
+            coalitions,
             _signals: guard,
         })
     }
@@ -553,7 +563,7 @@ impl Run {
         }
         if let Some((k, _)) = env
             .iter()
-            .find(|(k, _)| k == RUN_MARKER || k == RUNS_MARKER)
+            .find(|(k, _)| k == RUN_MARKER || k == RUNS_MARKER || k == COALITIONS_VAR)
         {
             return Err(Failure::usage(format!(
                 "step {name}: {k} is set by atelier and cannot be set by a step"
@@ -738,34 +748,27 @@ impl Run {
             .ctx(log_path.display())?;
         self.jobs += 1;
         let label = format!("atelier.{}.{}", self.id, self.jobs);
-        let job_dir = self.dir.join("jobs").join(self.jobs.to_string());
-        fs::create_dir_all(&job_dir).ctx(job_dir.display())?;
         let spec = launchd::Spec {
             argv: argv.iter().map(Into::into).collect(),
             cwd: cwd.to_path_buf(),
-            env: step_env(env, &self.id, &self.runs),
+            env: step_env(env, &self.id, &self.runs, &self.coalitions),
             stdout: stdout_path.to_path_buf(),
             stderr: log_path.to_path_buf(),
         };
-        let mut job = match launchd::launch(&job_dir, &label, &spec, &mut || {
-            signals::received().is_some()
-        }) {
+        let mut job = match launchd::launch(&label, &spec, &mut || signals::received().is_some()) {
             Ok(j) => j,
             Err(LaunchError::Unavailable(m)) => {
-                let _ = fs::remove_dir_all(&job_dir);
                 return Err(Failure::refused(format!(
                     "step {}: cannot start it as a launchd job: {m}. atelier runs no step on macOS without one",
                     record.name
                 )));
             }
             Err(LaunchError::NotStarted(m)) => {
-                let _ = fs::remove_dir_all(&job_dir);
                 note(&m);
                 self.steps.push(record.clone());
                 return Ok(record);
             }
             Err(LaunchError::Interrupted) => {
-                let _ = fs::remove_dir_all(&job_dir);
                 self.interrupted = signals::received();
                 record.status = StepStatus::Interrupted;
                 self.steps.push(record.clone());
@@ -777,11 +780,12 @@ impl Run {
             coalition: job.coalition.clone(),
             label: label.clone(),
         };
-        // Listed before the program runs: this run's file, then every outer run's in this state.
+        // Listed before the program runs: this run's file, then every outer run's, whatever
+        // state it is in.
         let listed = coalition::append_run_file(&self.dir, &line)
             .ctx(self.dir.join(coalition::RUN_FILE).display());
-        for d in &self.outer_dirs {
-            let _ = coalition::append_run_file(d, &line);
+        for f in &self.outer_files {
+            let _ = coalition::append_existing_file(f, &line);
         }
         let recorded = listed.and_then(|()| {
             self.lock
@@ -823,11 +827,7 @@ impl Run {
             .iter()
             .map(procs::ProcInfo::describe)
             .collect();
-        record.unstoppable = stopped
-            .remaining
-            .iter()
-            .map(procs::ProcInfo::describe)
-            .collect();
+        record.unstoppable = stopped.unstoppable();
         record.status = if !ended {
             StepStatus::Interrupted
         } else if !released {
@@ -894,8 +894,9 @@ impl Run {
 
     /// The end-of-run scan: the survivors, described, and whether any still lives. On macOS,
     /// every live member of the coalitions in the run's coalitions file (its own steps' and
-    /// those of runs nested in it), which are stopped; elsewhere the processes carrying the run's
-    /// marker, which are not signalled.
+    /// those of runs nested in it), which are stopped, then the processes carrying the run's
+    /// marker that are not among them, which are not signalled; then the jobs atelier processes
+    /// that died left loaded are removed. Elsewhere the marker scan only.
     fn end_scan(&mut self) -> std::io::Result<(Vec<String>, bool)> {
         if let Some(scan) = self.scan {
             let found: Vec<String> = scan(std::slice::from_ref(&self.id))?
@@ -915,25 +916,29 @@ impl Run {
             }
             crate::coalition::settle(&ids, crate::coalition::SETTLE);
             let stopped = crate::coalition::stop(&ids, self.grace);
-            if !stopped.remaining.is_empty() {
-                self.failures.push(format!(
-                    "could not stop: {}",
-                    stopped
-                        .remaining
-                        .iter()
-                        .map(procs::ProcInfo::describe)
-                        .collect::<Vec<_>>()
-                        .join("; ")
-                ));
+            for line in stopped.unstoppable() {
+                self.failures.push(if line.starts_with("cannot stop ") {
+                    line
+                } else {
+                    format!("could not stop: {line}")
+                });
             }
-            Ok((
-                stopped
-                    .members
-                    .iter()
-                    .map(procs::ProcInfo::describe)
-                    .collect(),
-                !stopped.remaining.is_empty(),
-            ))
+            let mut found: Vec<String> = stopped
+                .members
+                .iter()
+                .map(procs::ProcInfo::describe)
+                .collect();
+            let mut alive = !stopped.remaining.is_empty();
+            let marked = procs::marker_survivors(std::slice::from_ref(&self.id))?;
+            for (p, _) in marked {
+                if !stopped.members.iter().any(|m| m.pid == p.pid) {
+                    found.push(p.describe());
+                    alive = true;
+                }
+            }
+            let runs_dir = self.dir.parent().map(Path::to_path_buf).unwrap_or_default();
+            crate::launchd::sweep(&|id| run_is_dead(&runs_dir, id));
+            Ok((found, alive))
         }
         #[cfg(not(target_os = "macos"))]
         {
@@ -971,11 +976,22 @@ impl Run {
                     s.left.join("; ")
                 )),
             }
-            if !s.unstoppable.is_empty() {
+            let (denied, other): (Vec<&String>, Vec<&String>) = s
+                .unstoppable
+                .iter()
+                .partition(|l| l.starts_with("cannot stop "));
+            for l in denied {
+                self.failures.push(format!("{}: {l}", s.name));
+            }
+            if !other.is_empty() {
                 self.failures.push(format!(
                     "{}: could not stop {}",
                     s.name,
-                    s.unstoppable.join("; ")
+                    other
+                        .iter()
+                        .map(|l| l.as_str())
+                        .collect::<Vec<_>>()
+                        .join("; ")
                 ));
             }
         }
@@ -1051,6 +1067,7 @@ fn step_env(
     env: &[(String, String)],
     id: &str,
     runs: &str,
+    coalitions: &str,
 ) -> Vec<(std::ffi::OsString, std::ffi::OsString)> {
     let mut out: Vec<(std::ffi::OsString, std::ffi::OsString)> = std::env::vars_os()
         .filter(|(k, _)| k != DISPATCHED_VAR && k != RUN_ID_VAR)
@@ -1064,7 +1081,54 @@ fn step_env(
     }
     set(RUN_MARKER, id);
     set(RUNS_MARKER, runs);
+    set(COALITIONS_VAR, coalitions);
     out
+}
+
+/// The coalitions files of the outer runs: those `ATELIER_COALITIONS` names, then those of the
+/// outer runs (`chain`) in this state, each once. Only a file named `coalitions` in a run folder
+/// (one with `run.toml`) counts; a path that held a `:` cannot be told apart and is dropped.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+fn outer_coalition_files(state: &State, chain: &[String]) -> Vec<PathBuf> {
+    let file = crate::coalition::RUN_FILE;
+    let inherited = std::env::var_os(COALITIONS_VAR).unwrap_or_default();
+    let mut out: Vec<PathBuf> = Vec::new();
+    let candidates = std::env::split_paths(&inherited).chain(
+        chain
+            .iter()
+            .filter(|id| is_run_id(id))
+            .map(|id| state.runs_dir().join(id).join(file)),
+    );
+    for p in candidates {
+        let ok = p.is_absolute()
+            && p.file_name().is_some_and(|n| n == file)
+            && p.parent().is_some_and(|d| {
+                d.file_name()
+                    .is_some_and(|n| is_run_id(&n.to_string_lossy()))
+                    && d.join("run.toml").is_file()
+            });
+        if ok && !out.contains(&p) {
+            out.push(p);
+        }
+    }
+    out
+}
+
+/// True when run `id` of `runs_dir` was started by an atelier process that is gone (its
+/// `run.toml`'s pid and start time); false when that cannot be told.
+pub fn run_is_dead(runs_dir: &Path, id: &str) -> bool {
+    if !is_run_id(id) {
+        return false;
+    }
+    let Ok(Some(info)) = RunInfo::read(&runs_dir.join(id)) else {
+        return false;
+    };
+    let pid = info.pid as i32;
+    match (&info.pid_start, procs::start_time(pid)) {
+        (Some(want), Some(now)) => *want != now,
+        (_, None) => true,
+        (None, Some(_)) => false,
+    }
 }
 
 /// The branch `HEAD` names in `worktree`, if it is a git worktree on a branch.

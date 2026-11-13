@@ -22,7 +22,7 @@
 //!
 //! On macOS a step is a launchd job: its group line carries the job's coalition, and the group
 //! lives while the coalition has a live member; a recorded run that has a coalitions file
-//! (`runs/<id>/coalitions`) is looked for by those coalitions instead of its marker.
+//! (`runs/<id>/coalitions`) is looked for by those coalitions and by its marker.
 //!
 //! Later versions may append fields; this version keeps them when it rewrites the file. Any other
 //! non-empty line makes the record unreadable: taking the lock refuses (4) and names the file,
@@ -407,16 +407,15 @@ impl HeldLock {
                 }
             }
         }
-        // Runs with a coalitions file (macOS steps) are looked for by coalition; the others by
-        // their marker.
-        let mut marked = Vec::new();
+        // Runs with a coalitions file (macOS steps) are looked for by coalition, and every run
+        // by its marker as well: either catches a survivor.
+        let marked = self.record.run_ids();
         let mut jobs = Vec::new();
-        for id in self.record.run_ids() {
-            match coalition::read_run_file(&self.runs_dir.join(&id)) {
-                Ok(Some(lines)) if cfg!(target_os = "macos") => {
-                    jobs.extend(lines.into_iter().map(|l| (id.clone(), l)))
-                }
-                _ => marked.push(id),
+        for id in &marked {
+            if let Ok(Some(lines)) = coalition::read_run_file(&self.runs_dir.join(id))
+                && cfg!(target_os = "macos")
+            {
+                jobs.extend(lines.into_iter().map(|l| (id.clone(), l)))
             }
         }
         let known = |alive: &Vec<String>, pid: i32| {
@@ -451,10 +450,15 @@ impl HeldLock {
                 alive.join("\n")
             )));
         }
-        // Nothing lives: jobs an atelier that died left loaded in launchd are removed.
+        // Nothing lives: jobs an atelier that died left loaded in launchd are removed, those its
+        // runs' files list and every other loaded `atelier.*` job of a dead owner or run.
         #[cfg(target_os = "macos")]
-        for (_, line) in &jobs {
-            crate::launchd::bootout_label(&line.label);
+        {
+            for (_, line) in &jobs {
+                crate::launchd::bootout_label(&line.label);
+            }
+            let runs_dir = self.runs_dir.clone();
+            crate::launchd::sweep(&|id| crate::runs::run_is_dead(&runs_dir, id));
         }
         self.record = Record::default();
         save(&self.record_path, &self.record)
