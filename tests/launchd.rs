@@ -1,4 +1,4 @@
-//! Steps as launchd jobs on macOS (DESIGN §8.4): the exact environment, exit statuses and
+//! Steps as launchd jobs on macOS: the exact environment, exit statuses and
 //! output, survivors caught by coalition and stopped, no false positives, a nested atelier, the
 //! release handshake and the preflight probe.
 //!

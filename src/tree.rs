@@ -1,4 +1,4 @@
-//! The tree id (r4 §3.1, B5): the git tree object of everything in the worktree that git does not
+//! The tree id: the git tree object of everything in the worktree that git does not
 //! ignore, tracked and untracked, hashed by content through a temporary index. The real index is
 //! never touched. A tree holding a submodule or a nested repository (mode 160000) is refused (4):
 //! its files are not part of the tree object, so a change inside it would go unseen.

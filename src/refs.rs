@@ -1,4 +1,4 @@
-//! Refs are never followed (r4 §3.1, REV2 1).
+//! Refs are never followed.
 //!
 //! Every ref atelier reads, records, moves or deletes must be a plain ref: `git symbolic-ref -q`
 //! must fail. Every `git update-ref` carries `--no-deref` and the expected old value, so even a

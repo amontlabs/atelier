@@ -1,5 +1,5 @@
-//! The owner's agents file, `~/.config/atelier/agents.toml` (DESIGN §2.6). Parsed and validated
-//! only; `atelier agents` and `atelier task` are module 3.7.
+//! The owner's agents file, `~/.config/atelier/agents.toml`. Parsed and validated
+//! only; `atelier agents` and `atelier task` are in `task`.
 //!
 //! ```toml
 //! [roles.build]
@@ -15,8 +15,8 @@ use serde::Deserialize;
 
 use crate::exit::{Failure, Result};
 
-/// The roles DESIGN §2.6 names. Another owner's file may name others.
-pub const DESIGN_ROLES: &[&str] = &[
+/// The roles atelier knows. Another owner's file may name others.
+pub const KNOWN_ROLES: &[&str] = &[
     "build",
     "build-hard",
     "review",

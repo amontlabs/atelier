@@ -1,4 +1,4 @@
-//! Tool prerequisites (DESIGN §3 intro, r4 §6): what `check` verifies after the base preflight and
+//! Tool prerequisites: what `check` verifies after the base preflight and
 //! before it takes the run lock. Every problem found is reported together in one refusal (4).
 //!
 //! - one pinned Rust toolchain per workspace, and `rustc --version` reports it;
@@ -85,7 +85,7 @@ impl Workspace {
 }
 
 /// Asks `cargo metadata` for each workspace's root and members. A failure is recorded in the
-/// workspace, not returned: a broken manifest is RED at the format step, named (r4 §3.7).
+/// workspace, not returned: a broken manifest is RED at the format step, named.
 pub fn workspaces(checkout: &Checkout, settings: &Settings, marker: &str) -> Vec<Workspace> {
     settings
         .workspaces

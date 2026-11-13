@@ -1,4 +1,4 @@
-//! cargo-nextest as `check` uses it (DESIGN §3 `check` step 6, r4 §3.7).
+//! cargo-nextest as `check` uses it.
 //!
 //! - The flags of the test step, and the filterset that leaves out `rust.exclude` entries.
 //! - The refusals for a workspace's `.config/nextest.toml`: a `default-filter` leaves tests out
@@ -24,7 +24,7 @@ pub const FLAGS: &[&str] = &[
 ];
 
 /// Environment of every job atelier starts: nextest then ignores a value exported in a shell and
-/// any file setting, as the flags do (r4 §3.7, B9).
+/// any file setting, as the flags do.
 pub const JOB_ENV: &[(&str, &str)] = &[("NEXTEST_RETRIES", "0"), ("NEXTEST_FLAKY_RESULT", "fail")];
 
 /// Environment that makes the test step print libtest JSON on standard output.

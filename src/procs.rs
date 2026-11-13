@@ -1,5 +1,5 @@
 //! Processes: process groups, stopping a group, process start times, and the environment-marker
-//! survivor scan (r4 §3.1).
+//! survivor scan.
 //!
 //! Everything atelier starts leads its own process group and carries `ATELIER_RUN=<run id>` and
 //! `ATELIER_RUNS=<outer ids>:<run id>`. The second lists every run it is nested in, so an outer
@@ -8,7 +8,7 @@
 //! this user's processes (on macOS through `KERN_PROCARGS2`, the data `ps -E` prints, matched
 //! entry by entry; on Linux `/proc/<pid>/environ`) and looks for its own marker. macOS hides the
 //! environment of Apple's own programs, and a program started under `env -i` drops the marker:
-//! both are the accepted gaps of r4 §3.1.
+//! both are accepted gaps.
 //!
 //! A recorded group is identified by its pgid and the start time of its leader ([`start_time`]),
 //! so a pgid reused by an unrelated process is told apart from the group atelier started.

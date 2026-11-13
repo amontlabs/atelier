@@ -1,10 +1,10 @@
-# Machines and remote runs (module 3.6)
+# Machines and remote runs
 
-DESIGN §2.5 and §3 `test`; the remote mechanics of r4 §4.4 and experiment B3.
+How `atelier test` and the gate choose a machine, and how a run on another machine works.
 
 ## The machines file
 
-`~/.config/atelier/machines.toml` as in DESIGN §2.5, plus one optional key for remote machines:
+`~/.config/atelier/machines.toml` plus one optional key for remote machines:
 `checkouts`, the folder that holds the projects' checkouts there (default
 `~/.local/share/atelier/projects`). `path` entries are absolute or start with `~/`.
 
@@ -145,7 +145,7 @@ cleanup. A narrow command is a test filter or a short script, far below the limi
 ## Machine preflight
 
 `jobs::machine_problems`: the platform from `uname`, then `atelier check`'s own prerequisites
-(`prereq::verify`, module 3.2) for the commit's files: the pinned Rust toolchain per workspace,
+(`prereq::verify`) for the commit's files: the pinned Rust toolchain per workspace,
 the nextest version, each `[[prerequisites.tools]]` that applies to the platform, the nextest
 configuration files, and with `[prerequisites.mbx]` mbx's version and settings, `.mbx.toml`,
 the bypass variables, absolute `PATH` entries, cargo's target folder and plain-cargo build
@@ -242,7 +242,7 @@ machine's `path`, and the identity is still equal.
   while waiting or during an attempt, a machine whose checkout is in the way passed over, a
   leading `-` in a name, the machine lock and reading its holder without it. `remote.rs`: the
   command line through every login shell found here, the tree check of a result.
-  `remote_run.rs`: the checkout refusing every layout of the 3.6 review (an ignored file, an
+  `remote_run.rs`: the checkout refusing every layout found in review (an ignored file, an
   ignored folder that becomes a file, a folder inside an ignored folder, an ignored nested
   repository, a link to a folder outside, an ignored file in a tracked folder, no `HEAD`) with
   everything unchanged and the same answer twice, case-only differences on the volume at hand,

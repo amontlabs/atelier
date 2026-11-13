@@ -1,4 +1,4 @@
-//! Steps as launchd jobs on macOS (DESIGN §8.4, experiment P22).
+//! Steps as launchd jobs on macOS.
 //!
 //! Each step is bootstrapped with a generated plist and a unique label into `gui/<uid>`, or into
 //! `user/<uid>` with `LimitLoadToSessionType = Background` when there is no GUI login. The job

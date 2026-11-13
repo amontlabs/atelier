@@ -1,6 +1,6 @@
-# status and the conflict forecast (module 3.8)
+# status and the conflict forecast
 
-DESIGN.md §3 `status` and §8.1. `atelier status [--json]` reads what the other commands recorded
+`atelier status [--json]` reads what the other commands recorded
 and prints it. It never converts the state, takes no exclusive lock and no machine lock, and
 writes nothing: git runs with `GIT_OPTIONAL_LOCKS=0` (no index refresh), and the forecast's objects
 go to a temporary folder. (It opens `.git/atelier/` and takes `state.lock` shared, as every command
@@ -45,7 +45,7 @@ run without a recorded platform is this computer's). `check --compile-only`, `ch
 a failing verdict is followed by a passing one in a later run. The same test failing on one tree
 and passing on a changed tree is a fix, not a flaky test.
 
-## Conflict forecast (DESIGN §8.1)
+## Conflict forecast
 
 `src/forecast.rs`: `git merge-tree --write-tree --name-only` (the gate's merge configuration, so a
 rerere, a renormalize or an attribute file of the owner cannot change the answer) for each open

@@ -1,4 +1,4 @@
-//! `atelier clean [<branch>…] [--yes] [--discard <commit>…]` (DESIGN §3, r4 §3.9): deletes what
+//! `atelier clean [<branch>…] [--yes] [--discard <commit>…]`: deletes what
 //! was merged and what atelier made, and nothing else.
 //!
 //! For each branch, under its lock taken exclusive (and the run lock of the worktree it deletes),

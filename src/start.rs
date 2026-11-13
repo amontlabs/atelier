@@ -1,4 +1,4 @@
-//! `atelier start <branch> [--on <lower>] [--path <worktree>]` (DESIGN §2.4): creates the branch
+//! `atelier start <branch> [--on <lower>] [--path <worktree>]`: creates the branch
 //! at the tip of its lower branch and records what it is built on. `atelier start <branch>
 //! --abandon` only undoes an earlier start of that name that did not finish.
 //!

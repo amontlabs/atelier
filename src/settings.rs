@@ -1,4 +1,4 @@
-//! `.atelier/atelier.toml` (DESIGN §2.3). Unknown keys are an error; every named path must exist.
+//! `.atelier/atelier.toml`. Unknown keys are an error; every named path must exist.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Component, Path, PathBuf};
@@ -139,7 +139,7 @@ pub struct Step {
 pub struct Merge {
     #[serde(default)]
     pub after: Vec<AfterHook>,
-    /// DESIGN §8.2: `"mergiraf"`, off when absent.
+    /// `"mergiraf"`, off when absent.
     pub resolver: Option<String>,
 }
 
@@ -150,7 +150,7 @@ pub struct AfterHook {
     pub run: Vec<String>,
     pub commit: Option<String>,
     /// Paths this hook rewrites: a gate merge whose conflicts are only in these is settled by
-    /// taking the incoming side, and the hook regenerates them (HF1).
+    /// taking the incoming side, and the hook regenerates them.
     #[serde(default)]
     pub regenerates: Vec<String>,
 }

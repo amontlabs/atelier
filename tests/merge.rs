@@ -1,5 +1,4 @@
-//! `approve`, `merge` and `promote` (DESIGN §3, §2.4, §8.3; r4 §3.8 and its failure table; B8;
-//! HF1), on throwaway repositories with the real binary. The project has no Rust workspace: its
+//! `approve`, `merge` and `promote` (including the failure table and bisection), on throwaway repositories with the real binary. The project has no Rust workspace: its
 //! one platform (this computer's) runs `atelier check`, whose only step fails when a file named
 //! `BROKEN` is in the tree.
 
@@ -402,7 +401,7 @@ fn a_branch_with_a_merge_commit_of_its_own_is_refused() {
 }
 
 // ---------------------------------------------------------------------------------------------
-// merge: refusals before the gate (r4 §3.8 failure table)
+// merge: refusals before the gate (failure table)
 
 #[test]
 fn a_branch_moved_since_approval_is_refused() {
@@ -569,7 +568,7 @@ fn no_machine_for_a_platform_exits_3_unless_waived() {
 }
 
 // ---------------------------------------------------------------------------------------------
-// merge: conflicts (step 3) and HF1's regenerated paths
+// merge: conflicts (step 3) and regenerated paths
 
 #[test]
 fn a_conflict_with_main_exits_5_naming_main_and_the_files() {
@@ -771,7 +770,7 @@ fn main_moved_during_the_gate_refuses_and_drops_the_promotion() {
 }
 
 // ---------------------------------------------------------------------------------------------
-// promotion, mode A: checks a–e (r4 §3.8 8A, B8)
+// promotion, mode A: checks a–e
 
 #[test]
 fn check_a_main_checked_out_in_another_worktree_refuses_before_the_gate() {
@@ -968,7 +967,7 @@ fn promote_discard_drops_the_record_and_keeps_the_approval() {
 }
 
 // ---------------------------------------------------------------------------------------------
-// The three questions after a crash, and interrupted promotions (B8)
+// The three questions after a crash, and interrupted promotions
 
 /// A pending promotion (exit 7 on a tracked change, then the change undone).
 fn pending(p: &Proj) -> (String, Promotion) {
@@ -1075,7 +1074,7 @@ fn snapshot(dir: &Path) -> Vec<(PathBuf, Vec<u8>)> {
 
 #[test]
 fn an_interrupted_promotion_after_receive_pack_was_killed_is_reported_and_nothing_reset() {
-    // B8: receive-pack killed: ref at OLD, files and index at M.
+    // receive-pack killed: ref at OLD, files and index at M.
     let p = Proj::new();
     let (_, rec) = pending(&p);
     mark_push_started(&p, &rec);
@@ -1111,7 +1110,7 @@ fn an_interrupted_promotion_after_receive_pack_was_killed_is_reported_and_nothin
 
 #[test]
 fn an_interrupted_promotion_with_a_partial_checkout_lists_the_empty_file() {
-    // B8: the process group killed while read-tree wrote files: ref and index at OLD, a file M
+    // the process group killed while read-tree wrote files: ref and index at OLD, a file M
     // deletes already deleted, new files written untracked, one of them empty.
     let p = Proj::new();
     p.repo.write("gone.txt", "old\n");
@@ -1166,7 +1165,7 @@ fn an_interrupted_promotion_with_a_partial_checkout_lists_the_empty_file() {
 
 #[test]
 fn a_push_that_left_nothing_is_pending_and_promote_repeats_it() {
-    // B8: the push killed at 0 ms: nothing changed. Not an interruption: the push is repeated.
+    // the push killed at 0 ms: nothing changed. Not an interruption: the push is repeated.
     let p = Proj::new();
     let (c, rec) = pending(&p);
     mark_push_started(&p, &rec);
@@ -1248,7 +1247,7 @@ fn atelier_killed_during_the_push_the_push_finishes_and_promote_records_it() {
 }
 
 // ---------------------------------------------------------------------------------------------
-// Bisection (DESIGN §8.3)
+// Bisection
 
 #[test]
 fn a_red_batch_names_the_culprit_and_the_green_prefix_lands_after_one_full_gate() {
@@ -1474,7 +1473,7 @@ fn bisection_reruns_the_failed_tests_by_name_on_a_rust_workspace() {
 }
 
 // ---------------------------------------------------------------------------------------------
-// 3.4 review, round 1: each probe of atelier-3.4-review.md, and the owner's decisions
+// Probes found in review, and the owner's decisions
 
 fn other_platform() -> &'static str {
     if this_platform() == "linux-x86_64" {
@@ -1979,7 +1978,7 @@ fn r7_a_refusal_by_git_after_the_checkout_changed_is_an_interrupted_promotion() 
     p.assert_merged("feat", &c);
 }
 
-/// The probe of round 2's N1: git refuses the ref after writing part of M.
+/// The probe: git refuses the ref after writing part of M.
 #[test]
 fn r34b_a_refused_push_that_wrote_files_is_an_interrupted_promotion() {
     use std::os::unix::fs::PermissionsExt;
@@ -2243,7 +2242,7 @@ fn follow_settles_a_conflict_only_in_regenerated_paths_with_the_branchs_side() {
 }
 
 // ---------------------------------------------------------------------------------------------
-// Platforms on the owner's machines (module 3.6): a fake remote machine `box` of this platform,
+// Platforms on the owner's machines: a fake remote machine `box` of this platform,
 // reached through the fake ssh, which runs its commands on this computer.
 
 /// A machines file whose one machine is `box`, with the binary under test installed there and
@@ -2391,7 +2390,7 @@ fn a_red_on_another_machine_is_bisected_on_that_machine() {
 }
 
 // ---------------------------------------------------------------------------------------------
-// 3.4 review, round 2
+// More probes found in review
 
 #[test]
 fn r34b_a_rules_item_removing_a_platform_without_machine_merges() {

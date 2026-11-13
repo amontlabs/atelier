@@ -2,8 +2,7 @@
 
 What each part of the program does, where it lives in `src/`, and what it depends on. The
 [README](../README.md) is the introduction; the other pages in this folder go deeper on one
-command each. Module numbers (3.1 to 3.10) and `DESIGN §…` are those of the design notes, which
-are kept outside this repository (`DESIGN.md`, revision 5, with mechanics in `DESIGN-r4.md`).
+command each.
 
 ## The parts
 
@@ -17,13 +16,13 @@ Everything is tested on throwaway git repositories.
   versioned layer with a format number, and `state.lock`.
 - Locks, runs, process groups and the survivor scan, stop signals, the tree id, and plain refs.
 
-### `start` and `follow` (module 3.3)
+### `start` and `follow`
 
 Branch records with lifetime ids, the base kept in the branch, `follow`'s pending rebase settled
 from ancestry alone, the transitive "current" guard, and optional Mergiraf resolution of
 conflicted code files in `follow`.
 
-### `init`, `rules`, `task` and `agents` (module 3.7)
+### `init`, `rules`, `task` and `agents`
 
 The generated rules (`WORKER.md`, `ORCHESTRATOR.md`, the `AGENTS.md` block, the `@AGENTS.md`
 import lines), verified byte for byte by every command's preflight, and the task templates in
@@ -31,7 +30,7 @@ import lines), verified byte for byte by every command's preflight, and the task
 here because the Mustache crates render derived Rust structs and implement the whole
 specification, where these templates have run-time fields and anything else must be an error.
 
-### `check` (module 3.2)
+### `check`
 
 `atelier check [--compile-only]` proves the tree in a worktree: tool prerequisites (Rust
 toolchain, nextest pin, declared tools, nextest-file refusals (default filters, retries, flaky
@@ -42,13 +41,13 @@ run lock, the tree id, `check.prepare` hooks, format, compile, nextest with the 
 flags, `check.steps`, the survivor scan. Per-test results are kept in the run folder (`tests.tsv`,
 nextest's libtest JSON in `tests-<workspace>.jsonl`).
 
-### `machines` and `test` (module 3.6)
+### `machines` and `test`
 
 The owner's machines file, `atelier machines`, `atelier machines init <name>`, `atelier test
 <platform>|--all [-- <command>…]`, and remote runs over ssh (`ssh -tt`, the hang-up watcher, the
 result read with a second ssh). See [MACHINES.md](MACHINES.md).
 
-### `tmp` and `clean` (module 3.5)
+### `tmp` and `clean`
 
 `atelier tmp [--short] -- <command>` runs a command with a registered temp folder in
 `ATELIER_TMP` for the branch checked out in the current worktree, holding the branch lock shared
@@ -60,7 +59,7 @@ repository or a hidden local edit is in what it would delete, or when the branch
 work only it remembers. It reads the merged commit and the recorded worktree from the branch
 record's `merged` table ([FROZEN-LAYER.md](FROZEN-LAYER.md)), which `merge` writes.
 
-### `approve`, `merge` and `promote` (module 3.4)
+### `approve`, `merge` and `promote`
 
 Approvals bound to one commit and one worktree, the gate worktree `<main checkout>.gate`,
 `--no-ff` merges with conflicts in regenerated paths settled by the after-merge hook, the check
@@ -69,7 +68,7 @@ own process group, the wait and exit 7, interrupted promotions reported path by 
 batch bisection. Platforms of other machines run on machines chosen as `atelier test` chooses
 them, all at once. See [MERGE.md](MERGE.md).
 
-### `status` (module 3.8)
+### `status`
 
 `atelier status [--json]` is the one read-only view: the preflight lines, `main` and any pending
 or interrupted promotion, approvals not yet merged, merges not yet cleaned, the last runs, each
@@ -79,7 +78,7 @@ conflict forecast (`git merge-tree` for every pair of open branches and each aga
 touching no file). `merge` prints the forecast's pairs that involve the batch as warnings and
 refuses nothing. See [STATUS.md](STATUS.md).
 
-### launchd steps and the stop hook (module 3.10)
+### launchd steps and the stop hook
 
 - On macOS every step of a run is a launchd job (`launchctl bootstrap` of a generated plist with a
   unique label, `ProcessType = Interactive`, `AbandonProcessGroup = true`; `gui/<uid>`, or
@@ -100,7 +99,7 @@ refuses nothing. See [STATUS.md](STATUS.md).
   macOS version, the preflight runs the `setsid` case once per user and refuses (4) if the
   coalition misses it; there is no fallback to the weaker scan. Linux keeps process groups and the
   marker scan. Not caught on either system: work handed to an already-running service (launchd
-  agents, a daemon), as r4 §3.1 says.
+  agents, a daemon), as the lock rules say.
 - `atelier hook stop`, registered by `init` and `rules` in `.claude/settings.json` and
   `.codex/hooks.json` as `sh -c 'atelier hook stop || true'` (a missing file is created; an
   existing one is never rewritten: the entries to add are printed): Claude Code's and Codex's Stop

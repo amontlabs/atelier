@@ -1,5 +1,5 @@
 //! `atelier test <platform>|--all [-- <command>…]`, `atelier machines` and
-//! `atelier machines init <name>` (DESIGN §2.5, §3).
+//! `atelier machines init <name>`.
 //!
 //! `test` runs this worktree's committed `HEAD` and refuses (4) uncommitted changes, which a
 //! remote machine could not see, and a caller folder that is not in that commit; it has no

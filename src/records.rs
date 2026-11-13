@@ -1,8 +1,8 @@
-//! Frozen-layer records (DESIGN §2.2, §2.4): branch records and the temp-folder registry. Their
+//! Frozen-layer records: branch records and the temp-folder registry. Their
 //! format is frozen (`docs/FROZEN-LAYER.md`), so any atelier version may read and write them:
 //! later versions may add fields, never change or remove one. A reader keeps the fields it does
 //! not know (`later`) and writes them back unchanged. Behaviour (`start`, `follow`, `tmp`,
-//! `clean`) comes in modules 3.3 and 3.5; this module fixes the files.
+//! `clean`) comes in other modules; this module fixes the files.
 
 use std::fs;
 use std::io::ErrorKind;
@@ -50,7 +50,7 @@ pub struct Starting {
     pub later: toml::Table,
 }
 
-/// One fact per branch: what it is built on (DESIGN §2.4).
+/// One fact per branch: what it is built on.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct BranchRecord {
     pub name: String,

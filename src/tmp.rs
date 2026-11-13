@@ -1,4 +1,4 @@
-//! `atelier tmp [--short] -- <command>…` (DESIGN §3): runs a command with a registered temp
+//! `atelier tmp [--short] -- <command>…`: runs a command with a registered temp
 //! folder in `ATELIER_TMP`, for the branch checked out in the worktree it runs in.
 //!
 //! The branch comes from this worktree's `HEAD`, never from an argument, so a worker cannot

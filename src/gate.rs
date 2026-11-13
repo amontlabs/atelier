@@ -1,12 +1,11 @@
-//! `atelier merge <branch>… [--waive <platform> --reason "<owner's words>"]` (DESIGN §3 `merge`,
-//! r4 §3.8): merges approved branches in the gate worktree, checks the merged tree on every
-//! platform, and moves the integration branch only when that tree is green and nobody moved the
+//! `atelier merge <branch>… [--waive <platform> --reason "<owner's words>"]`: merges approved branches in the gate
+//! worktree, checks the merged tree on every platform, and moves the integration branch only when that tree is green and nobody moved the
 //! branch meanwhile (mode A, `promote`).
 //!
 //! 1. Under the gate lock: a pending promotion is settled first (the three questions) or
 //!    refused; mode A's checks a and b; each branch approved, still at its approved commit,
 //!    current, with no merge commit of its own; a lower branch lands only when it is in the
-//!    batch, earlier, approved at a commit that contains the upper branch's base (DESIGN §2.4);
+//!    batch, earlier, approved at a commit that contains the upper branch's base;
 //!    a branch that changes `.atelier/` or the generated rules merges alone; every platform of
 //!    the settings the batch produces ([`batch_settings`]) has a machine that can run their pin,
 //!    or is waived.
@@ -16,7 +15,7 @@
 //!    attributes; a merge driver other than git's own for a path both sides changed refuses.
 //!    A conflict only in paths a `merge.after` hook with `commit` regenerates, in OLD's committed
 //!    settings and in the merged ones, is settled by taking the incoming branch's side for those
-//!    paths (HF1), never for a rules item; any other conflict aborts, returns the gate to `OLD`
+//!    paths, never for a rules item; any other conflict aborts, returns the gate to `OLD`
 //!    and exits 5 naming what the branch conflicts with.
 //! 4. The `merge.after` hooks; a hook with `commit` has its changes committed, any other change
 //!    is RED. A settled path must then hold what its hook produces. The result is `M`.
@@ -57,7 +56,7 @@ pub fn main_root(checkout: &Checkout) -> PathBuf {
     common.parent().map(Path::to_path_buf).unwrap_or(common)
 }
 
-/// The one gate worktree of a clone: `<main checkout>.gate` (DESIGN §2.2, r4 §3.8 step 2).
+/// The one gate worktree of a clone: `<main checkout>.gate`.
 /// `approve`, `merge`, `tmp` and `clean` all name it through this function.
 pub fn gate_worktree(checkout: &Checkout) -> PathBuf {
     let main = main_root(checkout);
@@ -119,7 +118,7 @@ pub enum Availability {
 }
 
 /// Runs platforms for the gate: [`crate::gate_machines::Machines`], the owner's machines file
-/// and remote runs (module 3.6).
+/// and remote runs.
 pub trait Platforms {
     /// Whether some machine can take `platform` of `settings`, in seconds (step 1, and again
     /// for a platform the merged settings add or change).
@@ -477,7 +476,7 @@ pub enum GateEnd {
 }
 
 /// The paths OLD's committed settings name in `regenerates` of a hook with `commit`: the only
-/// conflicts the gate may settle (HF1), and only when the merged settings name them too.
+/// conflicts the gate may settle, and only when the merged settings name them too.
 pub fn regenerated_paths(settings: &Settings) -> BTreeSet<String> {
     settings
         .merge
@@ -780,7 +779,7 @@ pub fn gate(
             ),
         ));
     }
-    // Step 8 of r4 §3.8: the tree is still M's, and M is built on OLD.
+    // Step 8 of the gate: the tree is still M's, and M is built on OLD.
     let mut ok = tree_is(&mut run, &gate, &m, "after the platform runs")?;
     if ok && !is_ancestor(&root, old, &m)? {
         run.fail(format!(
@@ -1295,7 +1294,7 @@ fn merge_attributes(
 /// driver other than git's text and binary merges (`BUILT_IN_DRIVERS`): `union` or a
 /// configured driver, which `.gitattributes` (either side's) or `info/attributes` assigns or
 /// `merge.default` names, or a built-in name the git configuration redefines. Such a driver
-/// could settle a conflict without a word (DESIGN §8.2: the gate never resolves anything).
+/// could settle a conflict without a word (the gate never resolves anything).
 pub fn refuse_merge_drivers(dir: &Path, head: &str, commit: &str, name: &str) -> Result<()> {
     let problems: Vec<String> = merge_driver_uses(dir, head, commit, &[None, Some(commit)])?
         .iter()
@@ -1628,7 +1627,7 @@ pub(crate) fn after_hooks(run: &mut Run, gate: &Path, settings: &Settings) -> Re
     Ok(end)
 }
 
-/// After step 4, each conflict settled with the incoming side (HF1) must hold what a hook of
+/// After step 4, each conflict settled with the incoming side must hold what a hook of
 /// the merged settings with `commit` that names it produced: its commit changed the path, or,
 /// with the path removed, running the hooks that name it again gives back exactly `M`'s tree.
 /// Otherwise RED: the path would hold one side's hand edit, not the generated content.
@@ -1761,7 +1760,7 @@ fn tree_is(run: &mut Run, gate: &Checkout, m: &str, when: &str) -> Result<bool> 
     Ok(true)
 }
 
-/// A platform run on this computer, in the gate worktree on `M` (DESIGN §2.5).
+/// A platform run on this computer, in the gate worktree on `M`.
 pub fn run_local(g: &mut GateRun<'_>, home: &Path, platform: &str) -> Result<PlatformOutcome> {
     let runs_dir = g.ctx.state.runs_dir();
     run_local_in(

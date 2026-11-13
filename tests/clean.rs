@@ -1,6 +1,5 @@
-//! `atelier tmp` and `atelier clean` (DESIGN §3, r4 §3.9) on throwaway repositories: the plan, the
-//! deletions, and every destructive case REVIEW-1 (findings 1, 2, 6, 28), REVIEW-3 (findings 1,
-//! 2, 7) and the module 3.5 review (findings 1-9) found. Merged state is set the way `merge` (module 3.4) will, through
+//! `atelier tmp` and `atelier clean` on throwaway repositories: the plan, the
+//! deletions, and every destructive case found in review. Merged state is set the way `merge` will, through
 //! `MergeFacts::record`.
 
 mod common;
@@ -298,7 +297,7 @@ fn a_branch_with_no_merge_record_is_never_touched() {
 }
 
 // ---------------------------------------------------------------------------------------------
-// clean: REVIEW-1 finding 1 and REVIEW-3 finding 1 (the worktree)
+// clean: the worktree
 
 #[test]
 fn a_worktree_switched_to_another_branch_with_committed_work_is_kept() {
@@ -620,7 +619,7 @@ fn a_rebase_open_on_the_branch_blocks_the_clean() {
 }
 
 // ---------------------------------------------------------------------------------------------
-// clean: REVIEW-1 finding 2 (the folders)
+// clean: the folders
 
 fn registered_folder(p: &Proj, wt: &Path, branch: &str) -> TmpEntry {
     let out = p.tmp(wt, false, "echo data > \"$ATELIER_TMP/data\"");
@@ -725,7 +724,7 @@ fn a_folder_with_another_identity_at_the_registered_path_is_left_alone() {
 }
 
 // ---------------------------------------------------------------------------------------------
-// tmp and clean together: REVIEW-3 finding 2 (consumers), leftovers (r4 §4.3), REVIEW-1 28
+// tmp and clean together: consumers, leftovers
 
 #[test]
 fn a_running_tmp_command_holds_its_folder_against_clean() {
@@ -1144,7 +1143,7 @@ fn merge_facts_round_trip_and_keep_what_they_do_not_know() {
 }
 
 // ---------------------------------------------------------------------------------------------
-// The module 3.5 review's probes
+// Probes found in review
 
 fn user_root() -> String {
     // SAFETY: geteuid has no preconditions.

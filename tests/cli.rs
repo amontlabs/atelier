@@ -102,7 +102,7 @@ fn a_missing_version_prints_the_install_command_and_exits_4() {
     assert_eq!(code(&out), 4);
     assert!(
         stderr(&out).contains(
-            "cargo install --git https://github.com/amontlabs/atelier --tag v9.9.9 --locked --root ~/.local/share/atelier/9.9.9"
+            "cargo +1.100.0 install --git https://github.com/amontlabs/atelier --tag v9.9.9 --locked --root ~/.local/share/atelier/9.9.9"
         ),
         "{}",
         stderr(&out)

@@ -1,4 +1,4 @@
-//! `atelier hook stop` (DESIGN §8.5, experiment P23): the Stop and SubagentStop hook of Claude
+//! `atelier hook stop`: the Stop and SubagentStop hook of Claude
 //! Code and Codex, and the project hook files that register it.
 //!
 //! The hook reads the harness's JSON on stdin and acts only when the session's folder (`cwd`) is
@@ -19,7 +19,7 @@
 //! message. When neither can be read the message is not checked.
 //!
 //! For `SubagentStop` only the message check applies: the input's folder and background tasks are
-//! the parent session's (P23). Both harnesses take the same block: `{"decision": "block",
+//! the parent session's. Both harnesses take the same block: `{"decision": "block",
 //! "reason": "…"}` on stdout, exit 0. Every other case, and any failure of the hook itself, lets
 //! the agent stop: the hook never exits 2 (which both harnesses read as a block) and is a strong
 //! nudge, not a guarantee; atelier's own commands still refuse what matters.

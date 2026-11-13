@@ -1,6 +1,6 @@
-//! `start`, `follow`, the branch record lifecycle and the dependent guard (DESIGN §2.4, §8.2), on
-//! throwaway repositories. Each REVIEW-4 probe (findings 1–5, round 2's abort-then-amend) and
-//! each S4 case is replayed against the real binary.
+//! `start`, `follow`, the branch record lifecycle and the dependent guard, on
+//! throwaway repositories. Each probe found in review (abort then follow, abort then amend,
+//! the base leaving the branch, name reuse and cycles) is replayed against the real binary.
 
 mod common;
 
@@ -412,7 +412,7 @@ fn main_merges_below_the_branch_are_not_its_own() {
 }
 
 // ---------------------------------------------------------------------------------------------
-// REVIEW-4 finding 1, round 2 finding 1, S4 cases 1 and 2: abort is never taken for a finish.
+// abort is never taken for a finish.
 
 /// A at A2 (f = "2", a2 file), B on A2 with B1 (f = "2b"); then A reset to A1 (f = "1").
 fn reset_under_dependent(p: &Proj) -> (PathBuf, PathBuf, String, String) {
@@ -459,14 +459,14 @@ fn an_aborted_follow_is_not_recorded_as_finished() {
     );
     assert_eq!(p.currency("b"), behind("b", Why::RebaseOpen));
 
-    // REVIEW-4 finding 1: abort, then follow again. It must not settle as finished (that
+    // abort, then follow again. It must not settle as finished (that
     // returned 0 and kept A2's file).
     git(&wt_b, &["rebase", "--abort"]);
     let out = p.follow(&wt_b);
     assert_eq!(code(&out), 5, "abort taken for a finish: {}", stdout(&out));
     git(&wt_b, &["rebase", "--abort"]);
 
-    // Round 2 finding 1 (S4 case 1): abort, amend B's own commit, follow again.
+    // abort, amend B's own commit, follow again.
     fs::write(wt_b.join("f"), "2b amended\n").unwrap();
     git(
         &wt_b,
@@ -481,7 +481,7 @@ fn an_aborted_follow_is_not_recorded_as_finished() {
     );
     assert_eq!(p.record("b").pending.unwrap().old_base, a2);
 
-    // S4 case 2: resolve and continue: finished.
+    // resolve and continue: finished.
     fs::write(wt_b.join("f"), "2b amended\n").unwrap();
     git(&wt_b, &["add", "f"]);
     git_edit(&wt_b, &["rebase", "--continue"]);
@@ -544,9 +544,9 @@ fn an_unsettleable_pending_follow_is_refused_naming_both_commits() {
 }
 
 // ---------------------------------------------------------------------------------------------
-// REVIEW-4 finding 2: the base must stay in the branch.
+// the base must stay in the branch.
 
-/// The exact refusal of DESIGN §2.4 for a base the branch no longer contains.
+/// The exact refusal for a base the branch no longer contains.
 fn base_lost(base: &str) -> String {
     format!(
         "your branch no longer contains its base {base}: restore it (git reflog, then git reset --hard <the commit before your rebase>) and use atelier follow"
@@ -589,7 +589,7 @@ fn a_hand_rebase_onto_the_lower_tip_is_refused_until_restored() {
     assert_eq!(read(&wt_b, "a1").as_deref(), Some("1 amended\n"));
 }
 
-/// 3.3 review 9: a wrong-range hand rebase replays a commit the lower branch dropped. The lower
+/// A wrong-range hand rebase replays a commit the lower branch dropped. The lower
 /// tip is in the branch, but that does not make the range the worker's own: refused.
 #[test]
 fn a_wrong_hand_rebase_that_replays_dropped_lower_commits_is_refused() {
@@ -640,7 +640,7 @@ fn a_base_lost_below_a_newer_lower_tip_is_refused() {
 }
 
 // ---------------------------------------------------------------------------------------------
-// REVIEW-4 finding 3: a lower branch gone without landing.
+// a lower branch gone without landing.
 
 #[test]
 fn a_lower_branch_gone_unmerged_is_refused() {
@@ -728,7 +728,7 @@ fn a_lower_gone_whose_base_main_contains_moves_onto_main() {
 }
 
 // ---------------------------------------------------------------------------------------------
-// Merged then cleaned; REVIEW-4 finding 5: name reuse and cycles.
+// Merged then cleaned: name reuse and cycles.
 
 #[test]
 fn a_lower_merged_then_cleaned_keeps_its_record_until_no_dependent_names_it() {
@@ -746,7 +746,7 @@ fn a_lower_merged_then_cleaned_keeps_its_record_until_no_dependent_names_it() {
     });
     assert_eq!(p.currency("b"), Currency::Current);
 
-    // REVIEW-4 finding 5: the name cannot be started again while b names the old a, on b
+    // the name cannot be started again while b names the old a, on b
     // (a cycle) or anywhere else.
     for on in [Some("b"), None] {
         let mut args = vec!["start", "a"];
@@ -886,7 +886,7 @@ fn rewriting_the_bottom_of_a_stack_makes_every_branch_above_not_current() {
 
 #[test]
 fn an_upper_branch_names_its_unmerged_lower_branches() {
-    // REVIEW-4 finding 4 is merge's rule (3.4); the chain gives merge what it needs: each
+    // The base-approval rule is merge's; the chain gives merge what it needs: each
     // unmerged lower branch and the base the branch above it needs.
     let p = Proj::new();
     let wt_a = p.start("a", None);
@@ -903,7 +903,7 @@ fn an_upper_branch_names_its_unmerged_lower_branches() {
 }
 
 // ---------------------------------------------------------------------------------------------
-// Mergiraf (DESIGN §8.2).
+// Mergiraf.
 
 /// A stand-in for mergiraf 0.20 on `PATH`: `--version` works; `solve --stdout` prints the file
 /// without its marker lines (both sides kept) and exits 0, except for a file containing
@@ -1055,7 +1055,7 @@ fn mergiraf_is_off_by_default_and_required_when_on() {
 }
 
 // ---------------------------------------------------------------------------------------------
-// The 3.3 review's probes.
+// Probes found in review.
 
 /// Review 1: a conflicted symbolic link is never given to mergiraf, and the file it points to
 /// is never read or written; the link conflict stays git's.
@@ -1543,7 +1543,7 @@ fn a_killed_follow_keeps_its_rebase_recorded_until_git_ends() {
 }
 
 // ---------------------------------------------------------------------------------------------
-// The 3.3 review's round-2 probes.
+// More probes found in review.
 
 const CREATE_REF: &str = "update-ref --no-deref -m atelier start";
 
@@ -1565,7 +1565,7 @@ fn start_killed_after(p: &Proj, branch: &str, on: Option<&str>, step: &str) -> P
     wt
 }
 
-/// Round 2, N1: a worktree with a rebase or a bisect of an unfinished branch open is listed as
+/// a worktree with a rebase or a bisect of an unfinished branch open is listed as
 /// detached, but the branch is in use: start again neither deletes its ref nor undoes it.
 #[test]
 fn an_unfinished_start_is_never_undone_while_a_rebase_or_bisect_of_it_is_open() {
@@ -1627,7 +1627,7 @@ fn an_unfinished_start_is_never_undone_while_a_rebase_or_bisect_of_it_is_open() 
     assert_eq!(git(&wt_c, &["symbolic-ref", "HEAD"]), "refs/heads/c");
 }
 
-/// Round 2, N2: a fresh worktree detached at the integration branch's tip, which has commits
+/// a fresh worktree detached at the integration branch's tip, which has commits
 /// the lower branch lacks, is fresh: those commits are main's, not the worktree's own.
 #[test]
 fn start_in_place_accepts_a_fresh_worktree_detached_at_a_newer_main() {
@@ -1654,7 +1654,7 @@ fn start_in_place_accepts_a_fresh_worktree_detached_at_a_newer_main() {
     assert_eq!(p.record("c").base, a_tip);
 }
 
-/// Round 2, N6: an in-place start whose checkout failed prints commands that parse: the finish
+/// an in-place start whose checkout failed prints commands that parse: the finish
 /// command run from that worktree, and `git switch --detach` (never a worktree removal) to undo
 /// it, followed by `--abandon`.
 #[test]
@@ -1723,7 +1723,7 @@ fn an_unfinished_in_place_start_prints_runnable_commands() {
     assert_eq!(p.record("b").starting, None);
 }
 
-/// Round 2, N6: an unfinished branch that holds work and is checked out nowhere: the message
+/// an unfinished branch that holds work and is checked out nowhere: the message
 /// says how to keep the work and how to undo the start; `--abandon` refuses until the ref is
 /// gone, and never deletes work.
 #[test]
@@ -1770,7 +1770,7 @@ fn an_unfinished_branch_with_work_says_how_to_keep_it_and_abandon_refuses_it() {
     );
 }
 
-/// Round 2, N6: an unfinished start of C on a merged and cleaned A keeps A's name taken; the
+/// an unfinished start of C on a merged and cleaned A keeps A's name taken; the
 /// refusal names `--abandon`, which frees it without recreating C.
 #[test]
 fn abandon_frees_a_lower_name_held_by_an_unfinished_dependent() {
@@ -1797,7 +1797,7 @@ fn abandon_frees_a_lower_name_held_by_an_unfinished_dependent() {
     assert_eq!(code(&out), 0, "{}", stderr(&out));
 }
 
-/// Round 2, N3: a rebase that finished is reported from the settled record (exit 0) even when
+/// a rebase that finished is reported from the settled record (exit 0) even when
 /// a hook left a background process, which is stopped and named in a warning.
 #[test]
 fn a_finished_rebase_whose_hook_left_a_process_is_reported_finished() {
@@ -1824,7 +1824,7 @@ fn a_finished_rebase_whose_hook_left_a_process_is_reported_finished() {
     assert_eq!((rec.base, rec.pending), (m, None));
 }
 
-/// Round 2, N4: the conflicted file, or a folder on its path, swapped for a link while
+/// the conflicted file, or a folder on its path, swapped for a link while
 /// mergiraf runs: atelier writes nothing, through the link or anywhere else, and leaves the
 /// conflict as git's.
 #[test]
@@ -1871,7 +1871,7 @@ fn a_file_or_folder_swapped_during_mergiraf_is_never_written_through() {
     }
 }
 
-/// Round 2, N5: the file keeps the permission bits git wrote (the merged mode: b removed the
+/// the file keeps the permission bits git wrote (the merged mode: b removed the
 /// executable bit), whether mergiraf resolves it or not.
 #[test]
 fn mergiraf_keeps_the_merged_permission_bits() {
@@ -1909,7 +1909,7 @@ fn mergiraf_keeps_the_merged_permission_bits() {
     }
 }
 
-/// Round 2, N7: main renamed the file while b changed it: git puts the conflict at the new
+/// main renamed the file while b changed it: git puts the conflict at the new
 /// path, which the merge base does not have. Mergiraf is not run on it; it stays git's.
 #[test]
 fn mergiraf_is_not_run_on_a_renamed_file() {

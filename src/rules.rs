@@ -1,4 +1,4 @@
-//! The generated rules (DESIGN §2.2, §3 `rules`; r4 §2.3). For given settings the program knows
+//! The generated rules. For given settings the program knows
 //! the complete generated set:
 //!
 //! - `.atelier/rules/WORKER.md` and `.atelier/rules/ORCHESTRATOR.md`, each followed by the
@@ -7,7 +7,7 @@
 //!   `.atelier/project/binding.md`;
 //! - the line `@AGENTS.md` (or `@./AGENTS.md`) in each file of `[rules] import_into` (default
 //!   `CLAUDE.md`), unless that file is `AGENTS.md` itself through a symbolic link;
-//! - the stop hook (`atelier hook stop`, DESIGN §8.5) on `Stop` and `SubagentStop` in Claude
+//! - the stop hook (`atelier hook stop`) on `Stop` and `SubagentStop` in Claude
 //!   Code's project settings `.claude/settings.json` and Codex's project hook file
 //!   `.codex/hooks.json`, merged into what the files hold: every other key and hook stays.
 //!   Codex runs project hooks only once the owner has trusted them (`/hooks` in Codex).

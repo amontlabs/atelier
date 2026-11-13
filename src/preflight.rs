@@ -1,10 +1,10 @@
-//! Preflight (DESIGN §3, r4 §3.1, §6): every command first checks, in this order, that it runs in
+//! Preflight: every command first checks, in this order, that it runs in
 //! an atelier project, takes `state.lock` shared, compares its own version with the pin, loads
 //! the settings, and verifies the rules. Commands that use the versioned layer also require being
 //! the version pinned on the integration branch, running in the main checkout while it is on that
 //! branch (as the settings committed there name it), and open that layer (converting an older
 //! format).
-//! Tool prerequisites (`check`, `merge`, `test`) belong to module 3.2.
+//! Tool prerequisites (`check`, `merge`, `test`) belong to `prereq`.
 
 use std::path::Path;
 

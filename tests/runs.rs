@@ -1,4 +1,4 @@
-//! Runs, locks, process groups, the survivor scan and stop signals (r4 §3.1).
+//! Runs, locks, process groups, the survivor scan and stop signals.
 //!
 //! Cases that need a separate atelier process (one that is killed, or signalled) re-run this
 //! test binary as a probe child: `probe_child_entry` does nothing unless `ATELIER_TEST_PROBE`

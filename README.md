@@ -145,26 +145,25 @@ Exit codes, the same for every command:
 
 ## Install
 
-From source; you need git and Rust 1.100 or newer (with rustup).
+From source; you need git and Rust 1.100.0 (with rustup, which installs it on first use).
 
 ```sh
 # 1. The version your project pins. Versions sit side by side.
-cargo +1.100.0 install --git https://github.com/amontlabs/atelier --locked --root ~/.local/share/atelier/0.1.0
+cargo +1.100.0 install --git https://github.com/amontlabs/atelier --tag v0.1.0 --locked --root ~/.local/share/atelier/0.1.0
 
 # 2. The dispatcher, once: the same program, on PATH.
 mkdir -p ~/.local/bin && cp ~/.local/share/atelier/0.1.0/bin/atelier ~/.local/bin/atelier
 ```
 
 `~/.local/bin` must be on `PATH`, for you and for your agents. `cargo install` does not read the
-repository's `rust-toolchain.toml`: drop `+1.100.0` only if your default Rust is 1.100 or newer.
+repository's `rust-toolchain.toml`, so the command names the pinned Rust (`+1.100.0`) itself.
 
 **The pin.** `atelier` on `PATH` reads `atelier = "<version>"` from `.atelier/atelier.toml` of the
 checkout it runs in and runs `~/.local/share/atelier/<version>/bin/atelier`. Each worktree runs
 the version its own tree pins. If that version is missing, it prints the install command and
 exits 4; nothing installs itself.
 
-No release is tagged yet, so step 1 builds `main`, which is version 0.1.0. The command atelier
-prints for a missing version adds `--tag v<version>`; it works once that tag exists.
+The command atelier prints for a missing version is this one with that version.
 
 ## Set up a project
 
@@ -278,8 +277,7 @@ every platform at the same time. No machine means not passed (exit 3), never a s
 | [docs/FROZEN-LAYER.md](docs/FROZEN-LAYER.md) | The state in `.git/atelier/` that every version shares, format by format |
 | [docs/INTERNALS.md](docs/INTERNALS.md) | How each command works, the source layout, the dependencies |
 
-The pages cite `DESIGN §…` and experiment names (`B8`, `P23`): those design notes are not in this
-repository. To work on atelier itself: Rust 1.100.0 is pinned, and `scripts/check.sh` runs the
+To work on atelier itself: Rust 1.100.0 is pinned, and `scripts/check.sh` runs the
 format check, clippy and every test.
 
 ## Licence

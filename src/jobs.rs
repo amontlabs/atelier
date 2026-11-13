@@ -1,4 +1,4 @@
-//! A platform's job on the machine that runs it (DESIGN §3 `test`, §2.3), the same code on this
+//! A platform's job on the machine that runs it, the same code on this
 //! computer and, through `remote-run`, on another one.
 //!
 //! Before every run, full or narrow: the `check.prepare` hooks that apply to the platform, then
@@ -8,13 +8,13 @@
 //! tree must not change: it is compared after each preparation step and at the end. A failing
 //! preparation step stops the run.
 //!
-//! A platform whose `run` is `"check"` runs the full `atelier check` (module 3.2), which runs the
+//! A platform whose `run` is `"check"` runs the full `atelier check` which runs the
 //! `check.prepare` hooks itself: the job's own run then holds only the platform's `prepare`, and
 //! the caller runs the check after finishing it ([`Ending::ThenCheck`]).
 //!
 //! The machine preflight ([`machine_problems`]) is what a machine must meet before it takes a
 //! run: its platform, then `atelier check`'s own prerequisites ([`crate::prereq::verify`]) for the
-//! files of the commit it runs (r4 §4.4, §6).
+//! files of the commit it runs.
 
 use std::path::{Path, PathBuf};
 
@@ -28,7 +28,7 @@ use crate::runs::{self, FollowUp, Run, RunKind, StepStatus};
 use crate::settings::{PlatformRun, PlatformSettings, Settings};
 use crate::tree;
 
-/// The environment every step of a platform job gets (r4 §3.7).
+/// The environment every step of a platform job gets.
 pub const STEP_ENV: &[(&str, &str)] = &[("NEXTEST_RETRIES", "0"), ("NEXTEST_FLAKY_RESULT", "fail")];
 
 /// What one platform job runs.
@@ -182,7 +182,7 @@ pub fn run_steps(ctx: &Context, run: &mut Run, job: &Job) -> Result<Ending> {
     Ok(Ending::Done(passed))
 }
 
-/// The full `atelier check` of the checkout (module 3.2): its own run (kind `check`), its own
+/// The full `atelier check` of the checkout: its own run (kind `check`), its own
 /// lock, its own report. Meant as the follow-up of the platform's run
 /// ([`Run::finish_after`]): the platform's run passes only when the check does, and its folder
 /// names the check's run in `check-run`.

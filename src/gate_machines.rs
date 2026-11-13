@@ -1,5 +1,5 @@
-//! The gate's platforms on the owner's machines (DESIGN §2.5, r4 §3.8 steps 1 and 5): the
-//! machines file and the remote runs of module 3.6, used by `merge`.
+//! The gate's platforms on the owner's machines: the
+//! machines file and the remote runs, used by `merge`.
 //!
 //! Without a machines file, the platform this computer runs runs here and every other platform
 //! has no machine. With one, each platform's machine is chosen as `atelier test` chooses it

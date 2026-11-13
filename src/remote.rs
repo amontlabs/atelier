@@ -1,4 +1,4 @@
-//! This computer's side of a run on another machine (DESIGN §2.5, r4 §4.4, B3).
+//! This computer's side of a run on another machine.
 //!
 //! Trying a remote machine takes three ssh connections, then a fourth to read the verdict:
 //!
@@ -209,7 +209,7 @@ impl Remote {
         }
     }
 
-    /// The same machine running atelier `version` (DESIGN §3 `merge` step 5: every platform runs
+    /// The same machine running atelier `version` (every platform runs
     /// through the merged commit's own pinned atelier). The probe asks the machine whether that
     /// version is installed: the version itself, and, for this program's version, this
     /// program's own source ([`crate::source::identity`]). Another version's source cannot be

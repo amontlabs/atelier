@@ -1,4 +1,4 @@
-//! `atelier status` (DESIGN §3, §8.1): one read-only view of the preflight and of what the
+//! `atelier status`: one read-only view of the preflight and of what the
 //! other commands recorded. It converts nothing, takes no exclusive lock and no machine lock,
 //! and writes nothing (git runs with `GIT_OPTIONAL_LOCKS=0`; the forecast's objects go to a
 //! temporary folder). It exits 0 whatever it finds; only a usage error exits 2.

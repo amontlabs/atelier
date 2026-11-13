@@ -1,6 +1,5 @@
 //! The source this program was built from, embedded so that `atelier machines init` can build
-//! the same program on another machine (DESIGN §2.5, r4 §4.4: the same program runs on both
-//! sides).
+//! the same program on another machine, so the same program runs on both sides.
 //!
 //! Why build there from this source: copying a binary needs a cross linker and target libraries
 //! for each machine's platform on the Mac, which a plain Rust install lacks; installing with

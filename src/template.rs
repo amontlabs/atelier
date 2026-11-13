@@ -1,4 +1,4 @@
-//! The Mustache subset atelier needs (DESIGN §2.7), used for task templates and for the rule
+//! The Mustache subset atelier needs, used for task templates and for the rule
 //! texts: `{{name}}` inserts a value; `{{#name}}…{{/name}}` keeps its content only when `name`
 //! has a non-empty value. Nothing else: no escaping, partials, lists, inverted sections or
 //! dotted names.

@@ -1,4 +1,4 @@
-//! TERM, INT and HUP during a run (r4 §3.1): the handler only records the signal; the run loop
+//! TERM, INT and HUP during a run: the handler only records the signal; the run loop
 //! stops its current process group, writes a result that says so, and the command exits.
 //!
 //! Handlers answer only while a run is active, that is while a [`RunSignals`] guard lives. Outside

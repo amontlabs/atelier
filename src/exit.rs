@@ -1,4 +1,4 @@
-//! Exit codes (DESIGN §3) and the error type every command returns.
+//! Exit codes and the error type every command returns.
 
 use std::fmt;
 

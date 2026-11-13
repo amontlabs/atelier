@@ -1,5 +1,5 @@
 //! `atelier hook stop` with recorded and documented hook inputs (`tests/fixtures/hooks/`), for
-//! each condition and harness, and the hook files `init` and `rules` write (DESIGN §8.5).
+//! each condition and harness, and the hook files `init` and `rules` write.
 
 mod common;
 
@@ -85,10 +85,10 @@ const STOPS: [&str; 2] = ["claude-stop.json", "codex-stop.json"];
 #[test]
 fn a_finished_worker_may_stop_in_both_harnesses() {
     let p = Proj::new();
-    for f in STOPS
-        .iter()
-        .chain(&["claude-subagent-stop-p23.json", "codex-subagent-stop.json"])
-    {
+    for f in STOPS.iter().chain(&[
+        "claude-subagent-stop-with-message.json",
+        "codex-subagent-stop.json",
+    ]) {
         assert_eq!(p.hook(&input(f, &p.wt, None)), None, "{f}");
     }
 }
@@ -96,10 +96,10 @@ fn a_finished_worker_may_stop_in_both_harnesses() {
 #[test]
 fn no_compile_line_blocks() {
     let p = Proj::new();
-    for f in STOPS
-        .iter()
-        .chain(&["claude-subagent-stop-p23.json", "codex-subagent-stop.json"])
-    {
+    for f in STOPS.iter().chain(&[
+        "claude-subagent-stop-with-message.json",
+        "codex-subagent-stop.json",
+    ]) {
         for msg in [
             Value::from("All done."),
             Value::from("the compile: step ran"),
@@ -124,7 +124,10 @@ fn uncommitted_changes_block_a_stop_but_not_a_subagent_stop() {
         assert!(!reason.contains("compile:` "), "{f}: {reason}");
     }
     // A subagent's input carries the parent's folder: only its message is checked.
-    for f in ["claude-subagent-stop-p23.json", "codex-subagent-stop.json"] {
+    for f in [
+        "claude-subagent-stop-with-message.json",
+        "codex-subagent-stop.json",
+    ] {
         assert_eq!(p.hook(&input(f, &p.wt, None)), None, "{f}");
     }
     // A tracked change counts too.
@@ -174,7 +177,7 @@ fn a_running_background_task_blocks_claude_code() {
         .unwrap();
     assert!(reason.contains("background tasks"), "{reason}");
     assert!(reason.contains("Trivial compile check"), "{reason}");
-    // A shell task, as P23 saw it, running and then finished.
+    // A shell task, as Claude Code reports it, running and then finished.
     let running =
         serde_json::json!([{"type": "shell", "status": "running", "command": "sleep 240"}]);
     let reason = p
@@ -197,7 +200,11 @@ fn a_running_background_task_blocks_claude_code() {
     );
     // A subagent's input lists the parent's tasks (itself included): not checked.
     assert_eq!(
-        p.hook(&input("claude-subagent-stop-p23.json", &p.wt, None)),
+        p.hook(&input(
+            "claude-subagent-stop-with-message.json",
+            &p.wt,
+            None
+        )),
         None
     );
 }

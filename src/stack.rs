@@ -1,4 +1,4 @@
-//! Stacked branches (DESIGN §2.4): the branch record lifecycle and the ancestry rules every
+//! Stacked branches: the branch record lifecycle and the ancestry rules every
 //! command that reads a record applies.
 //!
 //! A branch atelier started has one record (`records::BranchRecord`, frozen layer) naming its
@@ -7,7 +7,7 @@
 //!
 //! - how a pending `follow` ended ([`Stack::settle_view`]): finished, aborted, or not decidable;
 //! - whether the base is still in the branch ([`Stack::check_base`]); there is no automatic
-//!   repair: ancestry cannot prove which commits are the worker's own (DESIGN §2.4);
+//!   repair: ancestry cannot prove which commits are the worker's own;
 //! - whether a rebase of a branch is open in any worktree of the clone ([`Stack::rebase_open`]),
 //!   whether or not a `follow` started it;
 //! - what `follow` rebases onto ([`Stack::target`]);
@@ -375,7 +375,7 @@ impl<'s> Stack<'s> {
         }
     }
 
-    /// How a branch's pending follow ended, from ancestry alone (DESIGN §2.4, S4). Pure.
+    /// How a branch's pending follow ended, from ancestry alone. Pure.
     pub fn settle_view(&self, rec: &BranchRecord, tip: &str) -> Result<Settlement> {
         let Some(p) = &rec.pending else {
             return Ok(Settlement::None);
@@ -473,7 +473,7 @@ impl<'s> Stack<'s> {
         )))
     }
 
-    /// The base check every command that reads a record makes (DESIGN §2.4, REV4 2). Pure.
+    /// The base check every command that reads a record makes. Pure.
     /// Refuses (4) a base that is no longer in the branch. There is no repair: a lower tip in
     /// the branch also holds after a wrong hand rebase that replayed commits the lower branch
     /// dropped (3.3 review 9).
@@ -570,7 +570,7 @@ impl<'s> Stack<'s> {
         Ok(out)
     }
 
-    /// Whether a branch is current (DESIGN §2.4): its base is in its lower branch's tip (or in
+    /// Whether a branch is current: its base is in its lower branch's tip (or in
     /// the integration branch once the lower is merged), and its lower branch is current, up
     /// to the integration branch. When it is not, names the branch of its chain closest to the
     /// integration branch that must `atelier follow`. Pure. Refuses (4) records that form a
@@ -670,7 +670,7 @@ impl<'s> Stack<'s> {
     }
 
     /// Checks a new branch's lower branch for `start`: the name is not the branch itself and
-    /// no chain below it reaches the branch (a cycle, REV4 5). Refuses (4).
+    /// no chain below it reaches the branch (a cycle). Refuses (4).
     pub fn check_no_cycle(&self, branch: &str, lower: &str) -> Result<()> {
         if branch == lower {
             return Err(Failure::refused(format!(
@@ -706,7 +706,7 @@ fn cycle(out: &[Link], again: &str) -> Failure {
     Failure::refused(format!("branch records form a cycle: {}", path.join(" → ")))
 }
 
-/// The refusal for a base the branch no longer contains (DESIGN §2.4, word for word).
+/// The refusal for a base the branch no longer contains (word for word).
 pub fn base_lost(base: &str) -> Failure {
     Failure::refused(format!(
         "your branch no longer contains its base {base}: restore it (git reflog, then git reset --hard <the commit before your rebase>) and use atelier follow"

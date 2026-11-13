@@ -1,4 +1,4 @@
-//! Settings (DESIGN §2.3), on the full Silo example copied verbatim from the design.
+//! Settings, on the full Silo example copied verbatim from the design.
 
 mod common;
 

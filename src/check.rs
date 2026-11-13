@@ -1,4 +1,4 @@
-//! `atelier check [--compile-only]` (DESIGN §3, r4 §3.7): proves the tree in this worktree.
+//! `atelier check [--compile-only]`: proves the tree in this worktree.
 //!
 //! Order: prerequisites; this worktree's run lock; the tree id; the `check.prepare` hooks (the
 //! tree must not change after each, and a failing or tree-changing hook stops the run); format,
@@ -24,8 +24,8 @@ use crate::tree;
 /// The per-test results in the run folder: workspace, test, verdict, seconds, tab-separated.
 const TEST_RESULTS: &str = "tests.tsv";
 
-/// What a narrow re-run (`atelier check --only <file>`, used by the gate's bisection, DESIGN
-/// §8.3) runs: the `check.prepare` hooks, then only these tests by name and these steps whole.
+/// What a narrow re-run (`atelier check --only <file>`, used by the gate's bisection)
+/// runs: the `check.prepare` hooks, then only these tests by name and these steps whole.
 #[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct Only {
     #[serde(default)]
@@ -114,7 +114,7 @@ pub fn run_mode(
 ) -> Result<Exit> {
     let checkout = &ctx.checkout;
     // In the worktree of a branch atelier started, the branch lock is held shared for the whole
-    // check, so `clean`, `follow` and `start` refuse while it runs (r4 §3.9 step 1).
+    // check, so `clean`, `follow` and `start` refuse while it runs.
     let _branch_lock = match started_branch(ctx)? {
         Some(b) => Some(HeldLock::acquire_shared(&ctx.state, LockKey::branch(&b))?),
         None => None,

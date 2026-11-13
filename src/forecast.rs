@@ -1,4 +1,4 @@
-//! The conflict forecast (DESIGN §8.1): `git merge-tree --write-tree` for each open branch
+//! The conflict forecast: `git merge-tree --write-tree` for each open branch
 //! against the integration branch and for every pair of open branches. It warns and refuses
 //! nothing. `status` prints it and `merge` forecasts only the pairs that involve the batch.
 //!

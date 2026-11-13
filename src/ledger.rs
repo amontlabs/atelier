@@ -1,4 +1,4 @@
-//! The versioned layer's records (DESIGN §2.2, §3 `approve`, `merge`, `promote`), format 1:
+//! The versioned layer's records (`approve`, `merge`, `promote`), format 1:
 //! approvals, the merge record (`merges.tsv`) and the promotion record. Only the version pinned
 //! on the integration branch reads or writes them, in the main checkout (`preflight`), so their
 //! format may change between versions with a converter (`state::Converter`). The layout is in
@@ -192,7 +192,7 @@ pub struct PromotedBranch {
 }
 
 /// A green gate's promotion, written before the push and removed once every branch is recorded.
-/// The next `merge` or `promote` reads it and asks git three questions (r4 §3.8).
+/// The next `merge` or `promote` reads it and asks git three questions.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Promotion {
     pub integration: String,

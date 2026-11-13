@@ -1,4 +1,4 @@
-//! The command line (DESIGN §3). Every command is declared; those not built yet run their
+//! The command line. Every command is declared; those not built yet run their
 //! preflight and then exit 2 with `not built yet`.
 
 use std::ffi::OsString;
@@ -228,7 +228,7 @@ impl Cmd {
 /// The program's entry point; returns the exit code.
 pub fn main() -> i32 {
     let args: Vec<OsString> = std::env::args_os().collect();
-    // A launchd job's shim: the same program, never dispatched (DESIGN §8.4).
+    // A launchd job's shim: the same program, never dispatched.
     #[cfg(target_os = "macos")]
     if args.get(1).is_some_and(|a| a == crate::launchd::SHIM_ARG) {
         return crate::launchd::shim_main(&args);

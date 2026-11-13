@@ -1,4 +1,4 @@
-//! The dispatcher and the pin (DESIGN §2.1).
+//! The dispatcher and the pin.
 //!
 //! One binary plays both parts. Started without `ATELIER_DISPATCHED` in its environment, it is
 //! the dispatcher: it reads the pin from `.atelier/atelier.toml` of the checkout it runs in and
@@ -41,10 +41,22 @@ pub fn binary_for(home: &Path, version: &str) -> PathBuf {
     install_root(home).join(version).join("bin/atelier")
 }
 
-/// The one command that installs a version.
+/// The Rust version this program is pinned to, read from `rust-toolchain.toml` at build time.
+pub fn toolchain() -> &'static str {
+    include_str!("../rust-toolchain.toml")
+        .lines()
+        .find_map(|l| l.trim().strip_prefix("channel"))
+        .and_then(|l| l.trim_start().strip_prefix('='))
+        .map(|v| v.trim().trim_matches('"'))
+        .expect("rust-toolchain.toml names a channel")
+}
+
+/// The one command that installs a version. It names the toolchain because `cargo install` does
+/// not read the repository's `rust-toolchain.toml`.
 pub fn install_command(version: &str) -> String {
     format!(
-        "cargo install --git {REPO_URL} --tag v{version} --locked --root ~/.local/share/atelier/{version}"
+        "cargo +{} install --git {REPO_URL} --tag v{version} --locked --root ~/.local/share/atelier/{version}",
+        toolchain()
     )
 }
 
@@ -199,7 +211,7 @@ mod tests {
     fn install_command_names_the_version_folder() {
         assert_eq!(
             install_command("0.1.0"),
-            "cargo install --git https://github.com/amontlabs/atelier --tag v0.1.0 --locked --root ~/.local/share/atelier/0.1.0"
+            "cargo +1.100.0 install --git https://github.com/amontlabs/atelier --tag v0.1.0 --locked --root ~/.local/share/atelier/0.1.0"
         );
     }
 }

@@ -1,11 +1,11 @@
-//! Locks (r4 §3.1): a `flock` on a file in the frozen layer, taken by the atelier process and
+//! Locks: a `flock` on a file in the frozen layer, taken by the atelier process and
 //! held until it exits. Never handed to the programs atelier starts (they get no copy of the
 //! descriptor: Rust opens files close-on-exec), so a held lock means one thing only: "an atelier
 //! process for this is alive".
 //!
 //! A branch lock is taken shared by the commands that only use the branch while they run (`tmp`,
 //! and `check` in the branch's worktree: several may hold it at once) and exclusive by those that
-//! change or delete it (`clean`, `follow`, `start`) (r4 §3.9 step 1). Every other lock is only
+//! change or delete it (`clean`, `follow`, `start`). Every other lock is only
 //! taken exclusive.
 //!
 //! Next to each lock file, `<name>.procs` records what an atelier holding the lock started: the

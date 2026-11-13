@@ -797,7 +797,7 @@ fn a_build_folder_made_by_plain_cargo_during_the_run_is_red() {
     );
 }
 
-// ----- the review's probes (module 3.2 review, findings 1-11) -----
+// ----- probes found in review -----
 
 /// A nextest file the project ignores in git, so a hook may write it without changing the tree.
 fn ignore(fx: &Fx, lines: &str) {

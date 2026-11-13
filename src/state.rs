@@ -1,4 +1,4 @@
-//! `.git/atelier/` (DESIGN §2.2): the state every worktree of a clone shares, in two layers.
+//! `.git/atelier/`: the state every worktree of a clone shares, in two layers.
 //!
 //! **Frozen layer**, the same in every version, so any version may use it: `state.lock`, the lock
 //! files under `locks/`, the run folders under `runs/`, the temp-folder registry under `tmp/`,

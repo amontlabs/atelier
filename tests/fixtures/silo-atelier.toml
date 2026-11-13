@@ -17,7 +17,7 @@ name = "node"
 run = ["node", "--version"]
 expect = "v24."
 [[prerequisites.tools]]
-platforms = ["macos-aarch64"]          # optional: only machines that run these platforms need it [REV4 9]
+platforms = ["macos-aarch64"]          # optional: only machines that run these platforms need it
 name = "lychee"
 run = ["lychee", "--version"]
 expect = "lychee 0.24.2"
@@ -53,7 +53,7 @@ commit = "Regenerate API files"
 
 [platforms.macos-aarch64]             # what must pass, and where; machines come from the owner's machines file (2.5)
 run = "check"                          # the full `atelier check`
-# Before every run on any machine, full or narrow: the `check.prepare` hooks that apply to the platform, then its own `prepare` [REV4 7, round 2].
+# Before every run on any machine, full or narrow: the `check.prepare` hooks that apply to the platform, then its own `prepare`.
 [platforms.linux-x86_64]
 prepare = ["app/SiloUI/scripts/ci/linux-prepare.sh"]   # Node preflight, bundled Git staging; before every run here, full or narrow
 run = ["app/SiloUI/scripts/ci/linux.sh"]               # the tests CI's Linux job runs

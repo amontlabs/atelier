@@ -1,4 +1,4 @@
-//! Runs (r4 §3.1): every run has its own id and folder `<state>/runs/<run id>/`, with its logs,
+//! Runs: every run has its own id and folder `<state>/runs/<run id>/`, with its logs,
 //! `run.toml` written when it starts and one `result` written atomically when it ends, naming the
 //! exact tree it tested. A folder without `result` is a run that ended without a result. Both
 //! files are frozen formats (`docs/FROZEN-LAYER.md`): readers ignore fields they do not know.
@@ -14,7 +14,7 @@
 //! named, and is not signalled. A TERM, INT or HUP during a run stops the current group and the
 //! run ends with a result that says so.
 //!
-//! On macOS each step is a launchd job instead (DESIGN §8.4, [`crate::launchd`]): the job's
+//! On macOS each step is a launchd job instead ([`crate::launchd`]): the job's
 //! process is the group leader, started by atelier's shim with exactly the step's environment,
 //! and held until its group and coalition are recorded under the lock. When it ends, every
 //! process of its coalition still alive after [`crate::coalition::SETTLE`] (those that left the
@@ -719,7 +719,7 @@ impl Run {
         Ok(record)
     }
 
-    /// A step as a launchd job, released by atelier's shim (macOS, DESIGN §8.4).
+    /// A step as a launchd job, released by atelier's shim (macOS).
     #[cfg(target_os = "macos")]
     fn job_step(
         &mut self,

@@ -1,4 +1,4 @@
-//! `atelier status` and the conflict forecast (DESIGN §3 `status`, §8.1; module 3.8) on
+//! `atelier status` and the conflict forecast on
 //! throwaway repositories with the real binary. Runs of other times are fabricated as the run
 //! folders `check` and `test` leave (`result`, `tests.tsv`).
 
@@ -990,7 +990,7 @@ fn merge_is_silent_when_no_open_branch_conflicts() {
 }
 
 // ---------------------------------------------------------------------------------------------
-// The review round (finding numbers in the names)
+// Probes found in review
 
 use std::os::unix::process::CommandExt;
 use std::process::{Command, Stdio};

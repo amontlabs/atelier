@@ -1,4 +1,4 @@
-//! Red batch bisection (DESIGN §8.3). When a gate over more than one branch is RED, the RED
+//! Red batch bisection. When a gate over more than one branch is RED, the RED
 //! verdict stands: nothing is rerun on that tree. To decide what can still land, prefixes of the
 //! batch are merged in merge order, longest first, and on each only what failed is run: the
 //! failed tests by name (`atelier check --only`), a failed step whole, a platform whose failure
@@ -142,7 +142,7 @@ pub struct Search<'a> {
     pub ctx: &'a Context,
     pub items: &'a [Item],
     pub old: &'a str,
-    /// OLD's committed settings: which conflicts may be settled (HF1).
+    /// OLD's committed settings: which conflicts may be settled.
     pub old_settings: &'a Settings,
     /// The failed batch's merged commit.
     pub red_m: &'a str,

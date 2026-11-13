@@ -1,4 +1,4 @@
-//! Promotion in mode A (r4 §3.8 8A, B8) and `atelier promote [--discard]`.
+//! Promotion in mode A and `atelier promote [--discard]`.
 //!
 //! The integration branch is checked out in the main checkout and is moved by one local push
 //! into it, with `receive.denyCurrentBranch=updateInstead`, a lease on `OLD` and
@@ -16,7 +16,7 @@
 //! `promote` refuse (4) and print, path by path, which content the main checkout holds. They
 //! reset nothing.
 //!
-//! The three questions (r4 §3.8) settle a record found by a later command: `M` is in the
+//! The three questions settle a record found by a later command: `M` is in the
 //! integration branch (the promotion happened: record it), the branch is still at `OLD`
 //! (pending), or it moved elsewhere (the record is void: run the merge again).
 
@@ -106,7 +106,7 @@ const REDIRECTING_VARS: &[&str] = &[
     "GIT_ALTERNATE_OBJECT_DIRECTORIES",
 ];
 
-/// What git says about a promotion record (r4 §3.8, the three questions, in this order).
+/// What git says about a promotion record (the three questions, in this order).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Facts {
     /// `M` is the integration branch's commit or an ancestor of it: the promotion happened.
@@ -679,7 +679,7 @@ pub fn promote(
     }
 }
 
-/// An interrupted promotion (r4 §3.8 8A): a push started and did not end cleanly, the ref is
+/// An interrupted promotion: a push started and did not end cleanly, the ref is
 /// still at `OLD`, and check d or e fails.
 pub fn interrupted(root: &Path, rec: &Promotion) -> Result<bool> {
     // No recorded group: atelier ended before releasing the push, so git never ran.

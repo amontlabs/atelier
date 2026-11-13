@@ -1,4 +1,4 @@
-//! `atelier init`, `atelier task` and `atelier agents` (DESIGN §3, §2.6, §2.7).
+//! `atelier init`, `atelier task` and `atelier agents`.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
@@ -6,7 +6,7 @@ use std::path::{Path, PathBuf};
 
 use serde::Deserialize;
 
-use crate::agents::{self, AgentsFile, DESIGN_ROLES};
+use crate::agents::{self, AgentsFile, KNOWN_ROLES};
 use crate::exit::{Failure, IoContext, Result};
 use crate::fsutil;
 use crate::git::{self, Checkout};
@@ -21,7 +21,7 @@ use crate::template::{self, Template};
 /// Roles the generated rules name; `atelier agents` refuses an agents file that lacks one.
 pub const ROLES_NAMED_BY_RULES: &[&str] = &["build", "build-hard", "review"];
 
-/// The templates shipped with atelier (DESIGN §2.7).
+/// The templates shipped with atelier.
 const SHIPPED: &[(&str, &str)] = &[
     ("build", include_str!("../assets/tasks/build.md")),
     ("review", include_str!("../assets/tasks/review.md")),
@@ -86,7 +86,7 @@ fn load_agents(home: &Path) -> Result<AgentsFile> {
     let path = agents::path_in(home);
     if !path.is_file() {
         return Err(Failure::refused(format!(
-            "{} does not exist: it names the agent roles (DESIGN 2.6)",
+            "{} does not exist: it names the agent roles",
             path.display()
         )));
     }
@@ -96,13 +96,13 @@ fn load_agents(home: &Path) -> Result<AgentsFile> {
 /// The roles in design order, then any others by name.
 fn ordered_roles(file: &AgentsFile) -> Vec<&String> {
     let mut names: Vec<&String> = Vec::new();
-    for known in DESIGN_ROLES {
+    for known in KNOWN_ROLES {
         if let Some((k, _)) = file.roles.get_key_value(*known) {
             names.push(k);
         }
     }
     for k in file.roles.keys() {
-        if !DESIGN_ROLES.contains(&k.as_str()) {
+        if !KNOWN_ROLES.contains(&k.as_str()) {
             names.push(k);
         }
     }

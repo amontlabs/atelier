@@ -1,6 +1,6 @@
 # The stop hook
 
-`atelier hook stop` (DESIGN §8.5, experiment P23) is the `Stop` and `SubagentStop` hook of Claude
+`atelier hook stop` is the `Stop` and `SubagentStop` hook of Claude
 Code and Codex. It is a strong nudge, not a guarantee: atelier's own commands still refuse what
 matters.
 
@@ -30,7 +30,7 @@ Commit both files with the rules.
 
 **Codex runs a project's hooks only after the owner trusts them.** Run `/hooks` in Codex in the
 project once and trust the two entries; trust is tied to the hook's hash, so trust them again
-after they change. An untrusted hook is skipped silently (P23), so until then Codex workers get
+after they change. An untrusted hook is skipped silently, so until then Codex workers get
 no stop check. `atelier init` prints this reminder.
 
 ## What it does
@@ -47,7 +47,7 @@ merged branch) it lets the agent stop.
 | a task in `background_tasks` has status `running` (a shell command or a subagent; Claude Code only, Codex sends no such field) | blocks | not checked |
 | no line of the last message starts with `compile:` (leading blanks allowed) | blocks | blocks |
 
-A subagent's input carries the parent's folder and background tasks (P23), so only its message
+A subagent's input carries the parent's folder and background tasks, so only its message
 is checked. The message is `last_assistant_message`; when the input has none, the last report in
 the transcript the input names (`agent_transcript_path` for a subagent, `transcript_path`
 otherwise): the last assistant entry's text, or its `SubagentHandback` message. Claude Code
@@ -63,7 +63,7 @@ block. Outside a project the dispatcher runs `hook` in place instead of refusing
 ## Repeats
 
 A condition the agent cannot clear would block until the harness gives up (Claude Code after 8
-blocks, P23; Codex documents no cap). So the hook counts, per session, the blocks in a row for
+blocks, as observed; Codex documents no cap). So the hook counts, per session, the blocks in a row for
 each condition, in `.git/atelier/hooks/<session id>` (`docs/FROZEN-LAYER.md`):
 
 - the count starts again at each turn (`stop_hook_active` false), and for a condition that was
@@ -81,15 +81,15 @@ and records it (time, branch, condition, why: `repeated` or `unfixable`) in the 
 
 ## Limits
 
-- Claude Code honours at most 8 blocks in a row, then ends the turn (P23); the hook gives up after
+- Claude Code honours at most 8 blocks in a row, then ends the turn; the hook gives up after
   3 (above).
 - The worker rules must not contradict the hook, or the agent refuses until the cap. `WORKER.md`
   says the same four things.
-- Codex: not yet run against a model (P23, quota). The input fields are Codex's documented ones.
+- Codex: not yet run against a Codex model. The input fields are Codex's documented ones.
 
 ## Steps on macOS
 
-The checks the hook asks for (`atelier check`) run their steps as launchd jobs (DESIGN §8.4). A
+The checks the hook asks for (`atelier check`) run their steps as launchd jobs. A
 step there is not the child of the terminal atelier runs in:
 
 - **It has no controlling terminal.** Opening `/dev/tty` fails ("Device not configured"), so

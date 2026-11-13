@@ -65,7 +65,7 @@ state each run is in. A step cannot set any of the three variables (refused, 2).
 
 ## Coalitions (macOS)
 
-On macOS each step is a launchd job (DESIGN §8.4) with its own resource coalition, which every
+On macOS each step is a launchd job with its own resource coalition, which every
 process the step starts keeps (after `setsid`, a double fork or `env -i` too). There a process
 belongs to run `X` when its coalition is listed in `runs/X/coalitions`, and also, as everywhere,
 when it carries `X`'s marker: the end-of-run scan and the lock's next taker look for both, so
@@ -162,7 +162,7 @@ When nothing lives, the record is removed.
 | Field | Type | Meaning |
 |---|---|---|
 | `id` | string | the run id |
-| `kind` | string | `check`, `check-compile`, `check-only` (a red gate's failures re-run by name, DESIGN §8.3), `gate`, `test-full`, `test-narrow`, `follow`, `tmp`, or a later kind |
+| `kind` | string | `check`, `check-compile`, `check-only` (a red gate's failures re-run by name), `gate`, `test-full`, `test-narrow`, `follow`, `tmp`, or a later kind |
 | `command` | string | the command, for people |
 | `lock` | string | the lock's machine key: its path under `locks/` without the extension (`gate`, `branch/<key>`, `worktree/<key>`) |
 | `worktree` | path | the worktree the run started in |

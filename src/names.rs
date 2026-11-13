@@ -1,4 +1,4 @@
-//! Branch names and the file keys made from them (DESIGN §3 intro).
+//! Branch names and the file keys made from them.
 //!
 //! A branch name is any name `git check-ref-format --branch` accepts, `/` included. atelier never
 //! uses a name as a path: lock files, registry entries and temp folders are keyed by the name

@@ -493,7 +493,7 @@ fn task_values_from_files_and_project_overrides() {
     assert!(stderr(&out).contains("mystery"));
 }
 
-// ---------------------------------------------------------------------- review round 1
+// ---------------------------------------------------------------------- probes found in review
 
 fn assert_current(repo: &Repo, what: &str) {
     repo.write_agents_file(AGENTS);

@@ -2,7 +2,7 @@
 //! could redirect: every folder on the way is opened with `O_NOFOLLOW` relative to the one
 //! before it, and the file is read, checked and replaced (`openat`, `fstatat`, `renameat`)
 //! relative to the descriptor of its own folder. Used by `follow` for the files it hands to
-//! Mergiraf (3.3 review round 2, N4).
+//! Mergiraf.
 //!
 //! Also the walks `clean` uses on a folder it deletes: [`survey`] looks at every entry without
 //! following a link and reports what is on another device (a mount) and any nested `.git`;

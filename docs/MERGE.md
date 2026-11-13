@@ -1,8 +1,6 @@
-# approve, merge, promote (module 3.4)
+# approve, merge, promote
 
-The design is DESIGN.md §3 (`approve`, `merge`, `promote`), §2.4 (stacked branches), §8.3
-(bisection) and DESIGN-r4.md §3.8 (the gate, mode A, the failure table), with B8's measurements
-and HF1's regenerated paths. This file records what the code does and the formats it writes.
+This file records what the code does and the formats it writes.
 
 ## The versioned layer, format 1
 
@@ -180,7 +178,7 @@ merged (or kept active, above) and the approval removed. It prints the GREEN lin
 `merged <branch> <commit>` per branch and `rules changed`, and only then removes the promotion
 record, so a crash in between prints them again on the next `promote` or `merge`.
 
-## Bisection (§8.3)
+## Bisection
 
 After a RED gate of more than one branch, under the same gate lock, in a run of kind
 `gate-bisect`. A RED that is no platform's failure (the merged settings, the hooks, the tree
@@ -203,7 +201,7 @@ whole, on that machine first, then the platform's other machines in order. The g
 prefix then goes through one full gate and lands if green; the rest stay approved and are listed.
 `merge` still exits 1.
 
-## Platforms on machines (`gate_machines`, module 3.6)
+## Platforms on machines (`gate_machines`)
 
 Without a machines file (`~/.config/atelier/machines.toml`), the platform this computer runs
 runs here and every other platform has no machine. With one, each platform's machine is chosen
@@ -229,7 +227,7 @@ the priorities, offline, not ready, busy, the wait for a busy one):
   run) and the gate does not wait for them. Each is printed and recorded as `cancelled on
   <machine>, run <id>: the run on this computer failed` (`cancelled, no machine started` when
   none had taken it yet), and bisection searches only this computer's failures;
-- every machine runs M's own pinned atelier (DESIGN §3 step 5): `~/.local/share/atelier/<pin>/
+- every machine runs M's own pinned atelier: `~/.local/share/atelier/<pin>/
   bin/atelier` there. The probe asks the machine whether that version is installed (for this
   program's own version, also built from this program's source); otherwise the machine is not
   ready: `atelier <pin> is not installed there: run atelier machines init <name> with atelier

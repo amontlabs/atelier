@@ -1,4 +1,4 @@
-//! `atelier follow` (DESIGN §2.4, §8.2): rebases exactly this branch's own commits onto what it
+//! `atelier follow`: rebases exactly this branch's own commits onto what it
 //! is built on, when that moved.
 //!
 //! In order: refuse a rebase of the branch open in any worktree and settle an earlier pending
@@ -37,7 +37,7 @@ use crate::refs;
 use crate::runs::{Run, RunKind, StepStatus};
 use crate::stack::{FINISH_REBASE, Stack, Target, is_ancestor, short};
 
-/// The only files `mergiraf solve` is run on (DESIGN §8.2, P21).
+/// The only files `mergiraf solve` is run on.
 pub const MERGIRAF_EXTENSIONS: &[&str] = &["rs", "ts", "tsx", "toml", "json"];
 
 /// The resolver, found on `PATH`.
@@ -122,7 +122,7 @@ pub fn run(ctx: &Context) -> Result<Exit> {
     // Nothing to replay: the target moved forward from the base and is already below this
     // branch's own commits. A target that is not a descendant of the base (the lower branch was
     // reset or rewritten) always needs the rebase, even when the branch contains it: the
-    // commits between them are no longer the lower branch's (REVIEW-4 finding 1).
+    // commits between them are no longer the lower branch's.
     if is_ancestor(root, &rec.base, &target.commit)? && is_ancestor(root, &target.commit, &tip)? {
         let moved = rec.base != target.commit;
         if moved || target.repoint {

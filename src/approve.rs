@@ -1,9 +1,9 @@
-//! `atelier approve <branch> <commit>` (DESIGN §3): records that `<commit>` was reviewed (or
+//! `atelier approve <branch> <commit>`: records that `<commit>` was reviewed (or
 //! deliberately not reviewed) and may be merged.
 //!
 //! Under the branch's lock: the record as every reading command sees it (a pending follow
 //! settled, the base still in the branch); the commit is the branch's tip now; the branch holds
-//! no merge commit of its own and is current (DESIGN §2.4, transitively up to the integration
+//! no merge commit of its own and is current (transitively up to the integration
 //! branch); it is checked out in exactly one worktree, which is neither the main checkout nor the
 //! gate. That worktree's canonical path and file-system identity are recorded: it is the only
 //! worktree `clean` may later delete for this branch. Approving again replaces the record.

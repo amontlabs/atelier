@@ -1,4 +1,4 @@
-//! launchd resource coalitions (DESIGN §8.4, experiment P22): on macOS every step runs as a
+//! launchd resource coalitions: on macOS every step runs as a
 //! launchd job ([`crate::launchd`]), and every process the step starts keeps the job's resource
 //! coalition, even after `setsid`, a double fork, `env -i`, or as a system program. A survivor
 //! is a live process whose coalition is one of the run's steps'.

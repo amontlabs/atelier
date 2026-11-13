@@ -87,7 +87,7 @@ fn symbolic_refs_are_never_read_moved_or_deleted() {
 
 #[test]
 fn update_ref_uses_no_deref_even_if_a_ref_turns_symbolic_after_the_check() {
-    // The race of REV2 1: the check passed, then the ref became an alias. `--no-deref` with an
+    // The race: the check passed, then the ref became an alias. `--no-deref` with an
     // expected old value means git refuses rather than moving the ref the alias points to.
     let repo = Repo::new();
     let main = git(&repo.root, &["rev-parse", "HEAD"]);

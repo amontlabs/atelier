@@ -1,4 +1,4 @@
-//! The owner's machines file, `~/.config/atelier/machines.toml` (DESIGN §2.5), choosing a machine
+//! The owner's machines file, `~/.config/atelier/machines.toml`, choosing a machine
 //! for a platform, and the machine-wide run lock.
 //!
 //! **Choosing.** The candidates are the machines of the platform (with a GUI when the platform
@@ -196,7 +196,7 @@ impl MachinesFile {
         let path = path_in(home);
         if !path.is_file() {
             return Err(Failure::refused(format!(
-                "no machines file: {} names the machines that run each platform (DESIGN §2.5)",
+                "no machines file: {} names the machines that run each platform",
                 path.display()
             )));
         }
@@ -343,7 +343,7 @@ pub struct Selection<T> {
     pub skipped: Vec<(String, Skip)>,
 }
 
-/// Tries the candidates in order (DESIGN §2.5). When none takes the run and at least one was
+/// Tries the candidates in order. When none takes the run and at least one was
 /// only busy, waits for the first busy one that frees up, trying each again in turn; a busy
 /// machine that is then offline or not ready is dropped. Machines that cannot run the platform
 /// are named in their place.

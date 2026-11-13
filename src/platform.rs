@@ -1,5 +1,5 @@
 //! Platform names: `<os>-<arch>` with os `macos`, `linux` or `windows` and arch `aarch64` or
-//! `x86_64` (DESIGN §2.5). `windows` is accepted in files and refused when chosen.
+//! `x86_64`. `windows` is accepted in files and refused when chosen.
 
 use std::fmt;
 
