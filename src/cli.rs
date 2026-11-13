@@ -51,6 +51,9 @@ pub enum Cmd {
         /// Also create a worktree for it here.
         #[arg(long, value_name = "WORKTREE")]
         path: Option<PathBuf>,
+        /// Only undo an earlier start of this branch that did not finish.
+        #[arg(long, conflicts_with_all = ["on", "path"])]
+        abandon: bool,
     },
     /// Rebase this branch's own commits onto what it is built on.
     Follow,
@@ -281,9 +284,14 @@ pub fn run(cmd: Cmd, cwd: &Path) -> Result<Exit> {
             let context = preflight::run(cwd, cmd.name(), cmd.needs())?;
             return crate::check::run(&context, *compile_only);
         }
-        Cmd::Start { branch, on, path } => {
+        Cmd::Start {
+            branch,
+            on,
+            path,
+            abandon,
+        } => {
             let ctx = preflight::run(cwd, cmd.name(), cmd.needs())?;
-            return crate::start::run(&ctx, cwd, branch, on.as_deref(), path.as_deref());
+            return crate::start::run(&ctx, cwd, branch, on.as_deref(), path.as_deref(), *abandon);
         }
         Cmd::Follow => {
             let ctx = preflight::run(cwd, cmd.name(), cmd.needs())?;

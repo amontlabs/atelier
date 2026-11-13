@@ -290,6 +290,37 @@ impl<'s> Stack<'s> {
     /// `rebase-apply/head-name`. A hand rebase counts as much as one `follow` started.
     pub fn rebase_open(&self, branch: &str) -> Result<Option<PathBuf>> {
         let want = names::branch_ref(branch);
+        for gd in self.git_dirs()? {
+            for sub in ["rebase-merge", "rebase-apply"] {
+                if let Ok(name) = fs::read_to_string(gd.join(sub).join("head-name"))
+                    && name.trim_end() == want
+                {
+                    return Ok(Some(worktree_of(&gd)));
+                }
+            }
+        }
+        Ok(None)
+    }
+
+    /// The worktree folder in which a bisect started on `branch` is open, if any: the git folder
+    /// of some worktree of the clone names the branch in `BISECT_START` (as git counts a branch
+    /// in use by a bisect).
+    pub fn bisect_open(&self, branch: &str) -> Result<Option<PathBuf>> {
+        let full = names::branch_ref(branch);
+        for gd in self.git_dirs()? {
+            if let Ok(name) = fs::read_to_string(gd.join("BISECT_START")) {
+                let name = name.trim_end();
+                if name == branch || name == full {
+                    return Ok(Some(worktree_of(&gd)));
+                }
+            }
+        }
+        Ok(None)
+    }
+
+    /// The git folder of every worktree of the clone: the common folder (the main checkout's)
+    /// and each linked worktree's.
+    fn git_dirs(&self) -> Result<Vec<PathBuf>> {
         let mut git_dirs = vec![self.common_dir.clone()];
         match fs::read_dir(self.common_dir.join("worktrees")) {
             Ok(entries) => {
@@ -300,16 +331,7 @@ impl<'s> Stack<'s> {
             Err(e) if e.kind() == ErrorKind::NotFound => {}
             Err(e) => return Err(Failure::refused(format!("worktrees: {e}"))),
         }
-        for gd in git_dirs {
-            for sub in ["rebase-merge", "rebase-apply"] {
-                if let Ok(name) = fs::read_to_string(gd.join(sub).join("head-name"))
-                    && name.trim_end() == want
-                {
-                    return Ok(Some(worktree_of(&gd)));
-                }
-            }
-        }
-        Ok(None)
+        Ok(git_dirs)
     }
 
     /// Refuses (4) while a rebase of `branch` is open in any worktree of the clone.

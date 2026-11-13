@@ -1153,7 +1153,7 @@ fn start_refuses_a_detached_worktree_with_its_own_commits() {
     assert_eq!(code(&out), 4, "{}", stderr(&out));
     assert!(
         stderr(&out).contains(&format!(
-            "it has commits main does not contain ({})",
+            "it has commits no branch holds ({})",
             short(&wt, &own)
         )),
         "{}",
@@ -1532,4 +1532,259 @@ fn a_killed_follow_keeps_its_rebase_recorded_until_git_ends() {
     let rec = p.record("b");
     assert_eq!(rec.pending, None);
     assert_eq!(rec.base, m);
+}
+
+// ---------------------------------------------------------------------------------------------
+// The 3.3 review's round-2 probes.
+
+const CREATE_REF: &str = "update-ref --no-deref -m atelier start";
+
+/// Starts `branch` with `--path` and kills atelier just after `step` ran, leaving an unfinished
+/// start. Returns the worktree path.
+fn start_killed_after(p: &Proj, branch: &str, on: Option<&str>, step: &str) -> PathBuf {
+    let path = killing_git(p);
+    let wt = p.wt(branch);
+    let mut args = vec!["start", branch];
+    if let Some(l) = on {
+        args.extend(["--on", l]);
+    }
+    args.extend(["--path", wt.to_str().unwrap()]);
+    let out = p
+        .repo
+        .atelier_env(p.main(), &args, &[("PATH", &path), ("KILL_AFTER", step)]);
+    assert!(killed(&out), "{}", stderr(&out));
+    assert!(p.record(branch).starting.is_some());
+    wt
+}
+
+/// Round 2, N1: a worktree with a rebase or a bisect of an unfinished branch open is listed as
+/// detached, but the branch is in use: start again neither deletes its ref nor undoes it.
+#[test]
+fn an_unfinished_start_is_never_undone_while_a_rebase_or_bisect_of_it_is_open() {
+    let p = Proj::new();
+    commit(p.main(), "f", "1\n", "one");
+    commit(p.main(), "f", "2\n", "two");
+    let base = head(p.main());
+
+    // The review's probe: a rebase of b stopped in wt-b.
+    let wt_b = start_killed_after(&p, "b", None, "worktree add");
+    let out = git_cmd(&wt_b)
+        .args(["rebase", "--exec", "false", "HEAD~1"])
+        .output()
+        .unwrap();
+    assert!(!out.status.success());
+    assert!(rebase_open(&wt_b));
+    let other = p.base.join("wt-x");
+    let out = p.run(p.main(), &["start", "b", "--path", other.to_str().unwrap()]);
+    assert_eq!(code(&out), 4, "{}", stderr(&out));
+    assert!(
+        stderr(&out).contains(&format!("a rebase of b is open in {}", wt_b.display())),
+        "{}",
+        stderr(&out)
+    );
+    assert!(!stdout(&out).contains("undid"), "{}", stdout(&out));
+    assert_eq!(git(p.main(), &["rev-parse", "refs/heads/b"]), base);
+    assert!(p.record("b").starting.is_some());
+    assert!(!other.exists());
+    let out = p.run(p.main(), &["start", "b", "--abandon"]);
+    assert_eq!(code(&out), 4, "{}", stderr(&out));
+    assert!(
+        stderr(&out).contains("a rebase of b is open in"),
+        "{}",
+        stderr(&out)
+    );
+    assert_eq!(git(p.main(), &["rev-parse", "refs/heads/b"]), base);
+    // The worktree's rebase still finishes onto its branch.
+    git_edit(&wt_b, &["rebase", "--continue"]);
+    assert_eq!(git(&wt_b, &["symbolic-ref", "HEAD"]), "refs/heads/b");
+
+    // A bisect started on c, with a commit of the range checked out (detached).
+    let wt_c = start_killed_after(&p, "c", None, "worktree add");
+    git(&wt_c, &["bisect", "start", "HEAD", "HEAD~2"]);
+    let out = git_cmd(&wt_c)
+        .args(["symbolic-ref", "-q", "HEAD"])
+        .output()
+        .unwrap();
+    assert!(!out.status.success(), "the bisect detached HEAD");
+    let out = p.run(p.main(), &["start", "c", "--path", other.to_str().unwrap()]);
+    assert_eq!(code(&out), 4, "{}", stderr(&out));
+    assert!(
+        stderr(&out).contains(&format!("a bisect of c is open in {}", wt_c.display())),
+        "{}",
+        stderr(&out)
+    );
+    assert_eq!(git(p.main(), &["rev-parse", "refs/heads/c"]), base);
+    assert!(p.record("c").starting.is_some());
+    git(&wt_c, &["bisect", "reset"]);
+    assert_eq!(git(&wt_c, &["symbolic-ref", "HEAD"]), "refs/heads/c");
+}
+
+/// Round 2, N2: a fresh worktree detached at the integration branch's tip, which has commits
+/// the lower branch lacks, is fresh: those commits are main's, not the worktree's own.
+#[test]
+fn start_in_place_accepts_a_fresh_worktree_detached_at_a_newer_main() {
+    let p = Proj::new();
+    let wt_a = p.start("a", None);
+    let a_tip = commit(&wt_a, "a", "1\n", "A: own");
+    commit(p.main(), "m", "1\n", "main-moved");
+    let t3 = p.base.join("t3");
+    git(
+        p.main(),
+        &[
+            "worktree",
+            "add",
+            "-q",
+            "--detach",
+            t3.to_str().unwrap(),
+            "main",
+        ],
+    );
+    let out = p.run(&t3, &["start", "c", "--on", "a"]);
+    assert_eq!(code(&out), 0, "{}", stderr(&out));
+    assert_eq!(git(&t3, &["symbolic-ref", "HEAD"]), "refs/heads/c");
+    assert_eq!(head(&t3), a_tip);
+    assert_eq!(p.record("c").base, a_tip);
+}
+
+/// Round 2, N6: an in-place start whose checkout failed prints commands that parse: the finish
+/// command run from that worktree, and `git switch --detach` (never a worktree removal) to undo
+/// it, followed by `--abandon`.
+#[test]
+fn an_unfinished_in_place_start_prints_runnable_commands() {
+    let p = Proj::new();
+    let base = head(p.main());
+    let t3 = p.base.join("t3 b");
+    git(
+        p.main(),
+        &["worktree", "add", "-q", "--detach", t3.to_str().unwrap()],
+    );
+    hook(&p, "post-checkout", "exit 1");
+    let out = p.run(&t3, &["start", "b"]);
+    assert_eq!(code(&out), 4, "{}", stderr(&out));
+    let quoted = format!("'{}'", t3.display());
+    let err = stderr(&out);
+    assert!(
+        err.contains(&format!("run cd {quoted} && atelier start b;")),
+        "{err}"
+    );
+    assert!(
+        err.contains(&format!("git -C {quoted} switch --detach")),
+        "{err}"
+    );
+    assert!(!err.contains("worktree remove"), "{err}");
+    assert!(err.contains("atelier start b --abandon"), "{err}");
+    unhook(&p, "post-checkout");
+
+    // The undo: detach, then abandon.
+    git(&t3, &["switch", "-q", "--detach"]);
+    let out = p.run(p.main(), &["start", "b", "--abandon"]);
+    assert_eq!(code(&out), 0, "{}", stderr(&out));
+    assert!(
+        stdout(&out).contains("abandoned the unfinished start of b"),
+        "{}",
+        stdout(&out)
+    );
+    assert!(git(p.main(), &["branch", "--list", "b"]).is_empty());
+    assert!(BranchRecord::read(&p.state(), "b").unwrap().is_none());
+    assert_eq!(head(&t3), base);
+
+    // The finish: the printed command, run as printed.
+    hook(&p, "post-checkout", "exit 1");
+    assert_eq!(code(&p.run(&t3, &["start", "b"])), 4);
+    unhook(&p, "post-checkout");
+    let like = p.repo.atelier_cmd(p.main(), &[], &[]);
+    let mut sh = std::process::Command::new("sh");
+    for (k, v) in like.get_envs() {
+        match v {
+            Some(v) => sh.env(k, v),
+            None => sh.env_remove(k),
+        };
+    }
+    let finish = sh
+        .arg("-c")
+        .arg(format!("cd {quoted} && \"$ATELIER\" start b"))
+        .env("ATELIER", like.get_program())
+        .output()
+        .unwrap();
+    assert_eq!(code(&finish), 0, "{}", stderr(&finish));
+    assert!(
+        stdout(&finish).contains("finished the interrupted start of b"),
+        "{}",
+        stdout(&finish)
+    );
+    assert_eq!(p.record("b").starting, None);
+}
+
+/// Round 2, N6: an unfinished branch that holds work and is checked out nowhere: the message
+/// says how to keep the work and how to undo the start; `--abandon` refuses until the ref is
+/// gone, and never deletes work.
+#[test]
+fn an_unfinished_branch_with_work_says_how_to_keep_it_and_abandon_refuses_it() {
+    let p = Proj::new();
+    let wt = start_killed_after(&p, "b", None, "worktree add");
+    let own = commit(&wt, "own", "1\n", "own work");
+    git(p.main(), &["worktree", "remove", wt.to_str().unwrap()]);
+    let args = ["start", "b", "--path", wt.to_str().unwrap()];
+    let out = p.run(p.main(), &args);
+    assert_eq!(code(&out), 4, "{}", stderr(&out));
+    let err = stderr(&out);
+    for want in [
+        format!("git worktree add {} b", wt.display()),
+        format!("atelier start b --path {}", wt.display()),
+        "git branch <new-name> b".to_owned(),
+        "git branch -D b, then atelier start b --abandon".to_owned(),
+    ] {
+        assert!(err.contains(&want), "{want}: {err}");
+    }
+    let out = p.run(p.main(), &["start", "b", "--abandon"]);
+    assert_eq!(code(&out), 4, "{}", stderr(&out));
+    assert!(
+        stderr(&out).contains("git branch <new-name> b"),
+        "{}",
+        stderr(&out)
+    );
+    assert_eq!(git(p.main(), &["rev-parse", "refs/heads/b"]), own);
+
+    git(p.main(), &["branch", "keep", "b"]);
+    git(p.main(), &["branch", "-q", "-D", "b"]);
+    let out = p.run(p.main(), &["start", "b", "--abandon"]);
+    assert_eq!(code(&out), 0, "{}", stderr(&out));
+    assert!(BranchRecord::read(&p.state(), "b").unwrap().is_none());
+    assert_eq!(git(p.main(), &["rev-parse", "refs/heads/keep"]), own);
+
+    // Nothing to abandon now.
+    let out = p.run(p.main(), &["start", "b", "--abandon"]);
+    assert_eq!(code(&out), 4, "{}", stderr(&out));
+    assert!(
+        stderr(&out).contains("b has no unfinished start to abandon"),
+        "{}",
+        stderr(&out)
+    );
+}
+
+/// Round 2, N6: an unfinished start of C on a merged and cleaned A keeps A's name taken; the
+/// refusal names `--abandon`, which frees it without recreating C.
+#[test]
+fn abandon_frees_a_lower_name_held_by_an_unfinished_dependent() {
+    let p = Proj::new();
+    let wt_a = p.start("a", None);
+    commit(&wt_a, "a", "1\n", "A");
+    start_killed_after(&p, "c", Some("a"), CREATE_REF);
+    p.land("a");
+    p.clean("a");
+    let wt_a = p.wt("a");
+    let args = ["start", "a", "--path", wt_a.to_str().unwrap()];
+    let out = p.run(p.main(), &args);
+    assert_eq!(code(&out), 4, "{}", stderr(&out));
+    assert!(
+        stderr(&out).contains("the start of c did not finish: atelier start c --abandon undoes it"),
+        "{}",
+        stderr(&out)
+    );
+    let out = p.run(p.main(), &["start", "c", "--abandon"]);
+    assert_eq!(code(&out), 0, "{}", stderr(&out));
+    assert!(git(p.main(), &["branch", "--list", "c"]).is_empty());
+    assert!(BranchRecord::read(&p.state(), "c").unwrap().is_none());
+    let out = p.run(p.main(), &args);
+    assert_eq!(code(&out), 0, "{}", stderr(&out));
 }

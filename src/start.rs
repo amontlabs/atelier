@@ -1,18 +1,21 @@
 //! `atelier start <branch> [--on <lower>] [--path <worktree>]` (DESIGN §2.4): creates the branch
-//! at the tip of its lower branch and records what it is built on.
+//! at the tip of its lower branch and records what it is built on. `atelier start <branch>
+//! --abandon` only undoes an earlier start of that name that did not finish.
 //!
 //! Where the branch is checked out: in a new worktree at `--path`; otherwise in the worktree
-//! `start` runs in, which must be a fresh detached linked worktree (as T3 creates them) whose
-//! commits the lower branch contains. Refused (4): a branch that exists, a name whose old record
+//! `start` runs in, which must be a fresh detached linked worktree (as T3 creates them): no
+//! uncommitted change, and no commit that only its `HEAD` holds (one no branch, tag or remote
+//! branch reaches). Refused (4): a branch that exists, a name whose old record
 //! is kept for a dependent, a lower branch atelier did not start, that is merged, or that
 //! cannot be read (a rebase open, its base lost), and a `--on` that would make a cycle.
 //!
 //! The steps, each one undoable by a later `start` of the same name if atelier dies between
 //! them (`docs/FROZEN-LAYER.md`): write the record with `starting` set, create the branch ref,
-//! check the branch out, clear `starting`. A failed step is undone at once when nothing of it
-//! is checked out: the ref is deleted only while it still holds the base, and never while a
-//! registered worktree has the branch checked out. Otherwise the ref and the unfinished record
-//! stay, and the message says how to finish or undo the start.
+//! check the branch out, clear `starting`. A failed step is undone at once when the branch is
+//! not in use: the ref is deleted only while it still holds the base, and never while a
+//! registered worktree has the branch checked out or a rebase or bisect of it open (git's own
+//! sense of in use). Otherwise the ref and the unfinished record stay, and the message gives the
+//! commands that finish or undo the start.
 
 use std::fs;
 use std::io::ErrorKind;
@@ -25,7 +28,7 @@ use crate::names;
 use crate::preflight::Context;
 use crate::records::{self, BranchRecord, BranchState, Starting};
 use crate::refs::{self, Expected};
-use crate::stack::{self, Stack, is_ancestor};
+use crate::stack::{self, Stack};
 use crate::state::State;
 
 pub fn run(
@@ -34,6 +37,7 @@ pub fn run(
     branch: &str,
     on: Option<&str>,
     path: Option<&Path>,
+    abandon: bool,
 ) -> Result<Exit> {
     let root = &ctx.checkout.root;
     let branch = names::validate_branch(root, branch)?;
@@ -41,6 +45,17 @@ pub fn run(
     let lower = names::validate_branch(root, on.unwrap_or(&integration))?;
     let stack = Stack::new(&ctx.checkout, &ctx.state, &integration);
     let _lock = HeldLock::acquire(&ctx.state, LockKey::branch(&branch))?;
+    if abandon {
+        let start = Start {
+            root,
+            state: &ctx.state,
+            stack: &stack,
+            branch: &branch,
+            integration: &integration,
+        };
+        start.abandon(stack.record(&branch)?.as_ref())?;
+        return Ok(Exit::Ok);
+    }
 
     // Where the branch will be checked out.
     let place = match path {
@@ -69,11 +84,19 @@ pub fn run(
     if let Some(old) = &old {
         let deps = stack.dependents(&branch, &old.lifetime)?;
         if !deps.is_empty() {
-            return Err(Failure::refused(format!(
+            let mut msg = format!(
                 "the earlier {branch} is still the lower branch of {}: pick another name, or let {} follow first",
                 deps.join(", "),
                 if deps.len() == 1 { "it" } else { "them" }
-            )));
+            );
+            for d in &deps {
+                if stack.record(d)?.is_some_and(|r| r.starting.is_some()) {
+                    msg.push_str(&format!(
+                        "; the start of {d} did not finish: atelier start {d} --abandon undoes it"
+                    ));
+                }
+            }
+            return Err(Failure::refused(msg));
         }
     }
     stack.check_no_cycle(&branch, &lower)?;
@@ -104,7 +127,7 @@ pub fn run(
 
     // Where the branch will be checked out, checked before anything is written.
     if let Place::Here(_) = &place {
-        fresh_detached(ctx, &lower, &base)?;
+        fresh_detached(ctx, &[&base, &stack.integration_tip()?])?;
     }
     let worktree = place
         .path()
@@ -200,22 +223,24 @@ struct Start<'a> {
 impl Start<'_> {
     /// Finishes or undoes an earlier start of this name that did not finish. Returns true when
     /// it finished it (the branch is checked out in the recorded worktree and this start asks
-    /// for the same lower branch and place), false when it undid it (no worktree has the branch
-    /// checked out, and the branch is gone or still at the recorded base). Refuses (4) anything
-    /// else, leaving the ref and the record, and says what to do.
+    /// for the same lower branch and place), false when it undid it (the branch is not in use,
+    /// and it is gone or still at the recorded base). Refuses (4) anything else, leaving the ref
+    /// and the record, and gives the commands that finish or undo it.
     fn recover(&self, rec: &BranchRecord, lower: &str, place: &Place) -> Result<bool> {
         let branch = self.branch;
         let starting = rec.starting.as_ref().expect("an unfinished start");
-        let refname = names::branch_ref(branch);
-        let checked = worktrees_on(self.root, &refname)?;
+        let uses = self.uses()?;
         let tip = self.stack.tip(branch)?;
         let recorded = Path::new(&starting.worktree);
-        let again = self.command(rec);
-        if !checked.is_empty() {
+        if !uses.checked.is_empty() {
             let same_request = rec.lower == lower
                 && same_path(place.path(), recorded)
                 && starting.new_worktree == matches!(place, Place::NewWorktree(_));
-            if tip.is_some() && same_request && checked.iter().any(|p| same_path(p, recorded)) {
+            if tip.is_some()
+                && same_request
+                && uses.busy.is_empty()
+                && uses.checked.iter().any(|p| same_path(p, recorded))
+            {
                 let mut done = rec.clone();
                 done.starting = None;
                 done.write(self.state)?;
@@ -229,19 +254,20 @@ impl Start<'_> {
                 }
                 return Ok(true);
             }
+        }
+        if !uses.is_empty() {
             return Err(Failure::refused(format!(
-                "an earlier start of {branch} did not finish and {branch} is checked out in {}: to finish it, run {again}; to undo it, remove that worktree (git worktree remove --force <path>), then run atelier start {branch} again",
-                list_paths(&checked)
+                "an earlier start of {branch} did not finish and {}",
+                self.in_use_advice(rec, &uses)
             )));
         }
         match &tip {
             None => {}
-            Some(t) if *t == rec.base => refs::delete(self.root, &refname, &rec.base)?,
+            Some(t) if *t == rec.base => refs::delete(self.root, &refname(branch), &rec.base)?,
             Some(t) => {
                 return Err(Failure::refused(format!(
-                    "an earlier start of {branch} did not finish, and {branch} is at {}, not at the base {} it recorded: delete it (git branch -D {branch}) if nothing in it is needed, then run atelier start {branch} again",
-                    stack::short(self.root, t),
-                    stack::short(self.root, &rec.base)
+                    "an earlier start of {branch} did not finish, and {}",
+                    self.moved_advice(rec, t)
                 )));
             }
         }
@@ -250,10 +276,42 @@ impl Start<'_> {
         Ok(false)
     }
 
-    /// Undoes this start after a failed step, as far as it is safe: never while a registered
-    /// worktree has the branch checked out, and the ref only when this start created it and it
-    /// still holds the base. What cannot be undone stays with the unfinished record, and the
-    /// failure says what to do.
+    /// `start --abandon`: removes the unfinished start of this name, deleting its ref when it
+    /// still holds only the base. Refuses (4), changing nothing, when there is no unfinished
+    /// start, when the branch is in use, or when it holds commits after its base.
+    fn abandon(&self, rec: Option<&BranchRecord>) -> Result<()> {
+        let branch = self.branch;
+        let Some(rec) = rec.filter(|r| r.starting.is_some()) else {
+            return Err(Failure::refused(format!(
+                "{branch} has no unfinished start to abandon"
+            )));
+        };
+        let uses = self.uses()?;
+        if !uses.is_empty() {
+            return Err(Failure::refused(format!(
+                "cannot abandon the start of {branch}: {}",
+                self.in_use_advice(rec, &uses)
+            )));
+        }
+        match self.stack.tip(branch)? {
+            None => {}
+            Some(t) if t == rec.base => refs::delete(self.root, &refname(branch), &rec.base)?,
+            Some(t) => {
+                return Err(Failure::refused(format!(
+                    "cannot abandon the start of {branch}: {}",
+                    self.moved_advice(rec, &t)
+                )));
+            }
+        }
+        remove_record(self.state, branch)?;
+        println!("start: abandoned the unfinished start of {branch}");
+        Ok(())
+    }
+
+    /// Undoes this start after a failed step, as far as it is safe: never while the branch is
+    /// in use, and the ref only when this start created it and it still holds the base. What
+    /// cannot be undone stays with the unfinished record, and the failure gives the commands
+    /// that finish or undo it.
     fn undo(
         &self,
         record: &BranchRecord,
@@ -262,33 +320,31 @@ impl Start<'_> {
         e: Failure,
     ) -> Failure {
         let branch = self.branch;
-        let refname = names::branch_ref(branch);
-        let checked = match worktrees_on(self.root, &refname) {
-            Ok(c) => c,
+        let uses = match self.uses() {
+            Ok(u) => u,
             Err(f) => return e.context(format!("and undoing start failed ({})", f.message)),
         };
-        if !checked.is_empty() {
+        if !uses.is_empty() {
             return e.context(format!(
-                "{branch} is checked out in {} all the same; the start is kept unfinished. Check that worktree, then run {} to finish it; or remove it (git worktree remove --force <path>) and run atelier start {branch} again to undo it",
-                list_paths(&checked),
-                self.command(record)
+                "the start is kept unfinished: {}",
+                self.in_use_advice(record, &uses)
             ));
         }
         if created_ref {
             match self.stack.tip(branch) {
                 Ok(None) => {}
                 Ok(Some(t)) if t == record.base => {
-                    if let Err(f) = refs::delete(self.root, &refname, &record.base) {
+                    if let Err(f) = refs::delete(self.root, &refname(branch), &record.base) {
                         return e.context(format!(
-                            "and undoing start failed ({}); run atelier start {branch} again to undo it",
+                            "and undoing start failed ({}); run atelier start {branch} --abandon to undo it",
                             f.message
                         ));
                     }
                 }
                 Ok(Some(t)) => {
                     return e.context(format!(
-                        "{branch} moved to {} meanwhile and is kept, with its unfinished record: delete it (git branch -D {branch}) if nothing in it is needed, then run atelier start {branch} again",
-                        stack::short(self.root, &t)
+                        "the start is kept unfinished: {}",
+                        self.moved_advice(record, &t)
                     ));
                 }
                 Err(f) => {
@@ -303,31 +359,135 @@ impl Start<'_> {
         match restored {
             Ok(()) => e,
             Err(f) => e.context(format!(
-                "and undoing start failed ({}); run atelier start {branch} again to undo it",
+                "and undoing start failed ({}); run atelier start {branch} --abandon to undo it",
                 f.message
             )),
         }
     }
 
-    /// The `start` command that finishes `rec`'s start.
+    /// Where the branch is in use, in git's sense: checked out in a registered worktree, or a
+    /// rebase or a bisect of it open in one.
+    fn uses(&self) -> Result<Uses> {
+        let branch = self.branch;
+        let mut busy = Vec::new();
+        if let Some(wt) = self.stack.rebase_open(branch)? {
+            busy.push(format!("a rebase of {branch} is open in {}", wt.display()));
+        }
+        if let Some(wt) = self.stack.bisect_open(branch)? {
+            busy.push(format!("a bisect of {branch} is open in {}", wt.display()));
+        }
+        Ok(Uses {
+            checked: worktrees_on(self.root, &refname(branch))?,
+            busy,
+        })
+    }
+
+    /// What to do about an unfinished start whose branch is in use: the command that finishes
+    /// it, and the commands that free the branch so that `--abandon` can undo it.
+    fn in_use_advice(&self, rec: &BranchRecord, uses: &Uses) -> String {
+        let branch = self.branch;
+        let starting = rec.starting.as_ref().expect("an unfinished start");
+        let recorded = Path::new(&starting.worktree);
+        let mut what = Vec::new();
+        let mut free = Vec::new();
+        if !uses.checked.is_empty() {
+            what.push(format!(
+                "{branch} is checked out in {}",
+                list_paths(&uses.checked)
+            ));
+            for p in &uses.checked {
+                free.push(if starting.new_worktree && same_path(p, recorded) {
+                    format!("git worktree remove {}", quote(&p.to_string_lossy()))
+                } else {
+                    format!("git -C {} switch --detach", quote(&p.to_string_lossy()))
+                });
+            }
+        }
+        if !uses.busy.is_empty() {
+            what.extend(uses.busy.iter().cloned());
+            free.push("finish or abort it there (git rebase --abort, git bisect reset)".into());
+        }
+        format!(
+            "{}. To finish the start, run {}; to undo it, {}, then run atelier start {branch} --abandon",
+            what.join(", and "),
+            self.command(rec),
+            free.join(", ")
+        )
+    }
+
+    /// What to do about an unfinished start whose branch, in use nowhere, has moved from its
+    /// base to `tip`: how to keep that work, and how to undo the start.
+    fn moved_advice(&self, rec: &BranchRecord, tip: &str) -> String {
+        let branch = self.branch;
+        let starting = rec.starting.as_ref().expect("an unfinished start");
+        let path = quote(&starting.worktree);
+        let check_out = if starting.new_worktree {
+            format!("git worktree add {path} {branch}")
+        } else {
+            format!("git -C {path} switch {branch}")
+        };
+        format!(
+            "{branch} is at {}, not at the base {} it recorded. To keep that work in {branch}, check it out again ({check_out}) and run {} to finish the start; to keep it under another name, run git branch <new-name> {branch} first. To undo the start, run git branch -D {branch}, then atelier start {branch} --abandon",
+            stack::short(self.root, tip),
+            stack::short(self.root, &rec.base),
+            self.command(rec)
+        )
+    }
+
+    /// The `start` command that finishes `rec`'s start: with `--path` for a new worktree, run
+    /// from that worktree for a start in place.
     fn command(&self, rec: &BranchRecord) -> String {
         let mut c = format!("atelier start {}", self.branch);
         if rec.lower != self.integration {
             c.push_str(&format!(" --on {}", rec.lower));
         }
         match &rec.starting {
-            Some(s) if s.new_worktree => c.push_str(&format!(" --path {}", s.worktree)),
-            Some(s) => c.push_str(&format!(" in {}", s.worktree)),
-            None => {}
+            Some(s) if s.new_worktree => {
+                c.push_str(&format!(" --path {}", quote(&s.worktree)));
+                c
+            }
+            Some(s) => format!("cd {} && {c}", quote(&s.worktree)),
+            None => c,
         }
-        c
+    }
+}
+
+/// Where a branch is in use: the worktrees that have it checked out, and the rebases and
+/// bisects of it open (described).
+struct Uses {
+    checked: Vec<PathBuf>,
+    busy: Vec<String>,
+}
+
+impl Uses {
+    fn is_empty(&self) -> bool {
+        self.checked.is_empty() && self.busy.is_empty()
+    }
+}
+
+fn refname(branch: &str) -> String {
+    names::branch_ref(branch)
+}
+
+/// `s` as one shell word: as it is when it has no character the shell treats specially,
+/// otherwise in single quotes.
+fn quote(s: &str) -> String {
+    if !s.is_empty()
+        && s.chars()
+            .all(|c| c.is_ascii_alphanumeric() || "/._-+,:@%=".contains(c))
+    {
+        s.to_owned()
+    } else {
+        format!("'{}'", s.replace('\'', r"'\''"))
     }
 }
 
 /// Refuses (4) unless this is a linked worktree on a detached `HEAD`, with nothing uncommitted
-/// and no commit that the lower branch's tip (`base`) does not contain: a worktree detached at
-/// an older commit of the lower branch is fresh; one with its own commits is not.
-fn fresh_detached(ctx: &Context, lower: &str, base: &str) -> Result<()> {
+/// and no commit of its own: one reachable from `HEAD` and from no branch, tag, remote branch or
+/// commit in `held` (the lower branch's tip and the integration branch's tip). Only such commits
+/// would be lost when the branch is checked out here; a worktree detached at any commit some ref
+/// holds (an older or a newer integration commit) is fresh.
+fn fresh_detached(ctx: &Context, held: &[&str]) -> Result<()> {
     let root = &ctx.checkout.root;
     if ctx.checkout.is_main_worktree() {
         return Err(Failure::refused(
@@ -348,28 +508,31 @@ fn fresh_detached(ctx: &Context, lower: &str, base: &str) -> Result<()> {
             changes.join(", ")
         )));
     }
-    if let Some(head) = ctx.checkout.head_commit()?
-        && !is_ancestor(root, &head, base)?
-    {
+    if let Some(head) = ctx.checkout.head_commit()? {
         const MAX: usize = 10;
-        let own = git::run(
-            root,
-            [
-                "rev-list",
-                "--abbrev-commit",
-                &format!("--max-count={}", MAX + 1),
-                &head,
-                &format!("^{base}"),
-            ],
-        )?;
+        let max = format!("--max-count={}", MAX + 1);
+        let mut args = vec![
+            "rev-list",
+            "--abbrev-commit",
+            &max,
+            &head,
+            "--not",
+            "--branches",
+            "--tags",
+            "--remotes",
+        ];
+        args.extend(held);
+        let own = git::run(root, args)?;
         let own: Vec<&str> = own.lines().collect();
-        let mut named = own.iter().take(MAX).copied().collect::<Vec<_>>().join(", ");
-        if own.len() > MAX {
-            named.push_str(", …");
+        if !own.is_empty() {
+            let mut named = own.iter().take(MAX).copied().collect::<Vec<_>>().join(", ");
+            if own.len() > MAX {
+                named.push_str(", …");
+            }
+            return Err(Failure::refused(format!(
+                "this detached worktree is not fresh: it has commits no branch holds ({named}): put them on a branch (git switch -c <name>) or give --path <worktree>"
+            )));
         }
-        return Err(Failure::refused(format!(
-            "this detached worktree is not fresh: it has commits {lower} does not contain ({named}): put them on a branch (git switch -c <name>) or give --path <worktree>"
-        )));
     }
     Ok(())
 }

@@ -144,23 +144,35 @@ Lifecycle, the same for every version:
   with `starting` is not started: every command that reads records refuses it (`run atelier
   start <branch> again`), and it counts as a dependent of its lower branch.
 - A `start` of a name whose record has `starting` (atelier died between the steps, or a step
-  failed) first reconciles it, under the branch's lock:
-  - a registered worktree has the branch checked out (`git worktree list`, prunable ones
-    included): if it is the recorded worktree, the ref exists, and this start asks for the same
-    lower branch and place, `starting` is cleared and the start is finished; otherwise it
-    refuses (4), changing nothing, and says how to finish it or undo it (remove the worktree);
-  - no worktree has it, and the ref is absent: the record is removed;
-  - no worktree has it, and the ref holds the recorded base: the ref is deleted (expected value
-    the base), then the record is removed;
-  - no worktree has it, and the ref holds another commit: refused (4), ref and record kept; the
-    message says to delete the branch by hand if nothing in it is needed.
+  failed) first reconciles it, under the branch's lock. The branch is *in use* when a
+  registered worktree has it checked out (`git worktree list`, prunable ones included) or when
+  the git folder of any worktree names it in `rebase-merge/head-name`, `rebase-apply/head-name`
+  or `BISECT_START` (git's own sense: `git branch -D` refuses such a branch):
+  - a registered worktree has the branch checked out and nothing else uses it: if it is the
+    recorded worktree, the ref exists, and this start asks for the same lower branch and place,
+    `starting` is cleared and the start is finished;
+  - otherwise, while the branch is in use: refused (4), changing nothing; the message gives the
+    command that finishes the start (`atelier start <branch> --path <path>`, or `cd <path> &&
+    atelier start <branch>` for a start in place) and the ones that free the branch (`git
+    worktree remove <path>` for the worktree the start created, `git -C <path> switch
+    --detach` for any other, finishing or aborting the rebase or bisect);
+  - not in use, and the ref is absent: the record is removed;
+  - not in use, and the ref holds the recorded base: the ref is deleted (expected value the
+    base), then the record is removed;
+  - not in use, and the ref holds another commit: refused (4), ref and record kept; the message
+    says how to keep that work (check the branch out again where the start put it and finish
+    the start, or `git branch <new-name> <branch>` first) and how to undo the start (`git
+    branch -D <branch>`, then `atelier start <branch> --abandon`).
 
   After an undo the new start proceeds as if the name were free. The record a rolled-back start
   replaced is not restored: `start` replaces only a record that no active record names as its
   lower, so nothing depended on it. A step that fails while `start` is still running is undone
   the same way at once (the replaced record is then restored), except that a ref this `start`
-  did not create is never deleted. A branch ref that a registered worktree has checked out is
-  never deleted.
+  did not create is never deleted. A branch ref that is in use is never deleted.
+- `atelier start <branch> --abandon` only undoes an unfinished start: under the branch's lock,
+  when the record has `starting`, the branch is not in use and its ref is absent or holds the
+  recorded base, it deletes the ref (expected value the base) and removes the record. It
+  refuses (4), changing nothing, otherwise, saying why.
 - `follow` writes `pending` before its rebase and settles it from ancestry alone. The rebase
   is the one step of a `follow` run held under the branch's lock, so its process group is
   recorded (`locks/branch/<key>.procs`) before git starts, and the next command that takes the
