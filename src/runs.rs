@@ -4,14 +4,14 @@
 //!
 //! A run holds one lock for its whole life. Each step is started as the leader of its own
 //! process group, with `ATELIER_RUN=<run id>` in its environment; its group is recorded under the
-//! lock before atelier waits for it. When the leader ends, a group that still has members is
+//! lock before the step's program runs (a `/bin/sh` trampoline waits for atelier's release). When the leader ends, a group that still has members is
 //! stopped (TERM, wait, KILL) and the step fails with "left processes behind". When the run ends,
 //! the marker scan looks for processes that left the group; any found makes the run fail, is
 //! named, and is not signalled. A TERM, INT or HUP stops the current group and the run ends with
 //! a result that says so.
 
 use std::fs::{self, File};
-use std::io::ErrorKind;
+use std::io::{ErrorKind, Write};
 use std::os::unix::process::{CommandExt, ExitStatusExt};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -28,6 +28,10 @@ use crate::names;
 use crate::procs::{self, RUN_MARKER};
 use crate::signals;
 use crate::state::State;
+
+/// Waits for one line on stdin (atelier's release, sent once the group is recorded), then runs
+/// the step's program with stdin from /dev/null. EOF without a line: exit 125, nothing run.
+pub const STEP_TRAMPOLINE: &str = "read _ || exit 125; exec \"$@\" </dev/null";
 
 /// A new run id: UTC time to the minute plus random bytes, `20261113T1012Z-4f2a`.
 pub fn new_run_id() -> Result<String> {
@@ -270,10 +274,15 @@ impl Run {
             .open(&log_path)
             .ctx(log_path.display())?;
         let log_err = log.try_clone().ctx(log_path.display())?;
-        let mut cmd = Command::new(program);
-        cmd.args(args)
+        // The step starts as a shell that waits on a pipe until its group is recorded under the
+        // lock, then replaces itself with the program, stdin from /dev/null. If atelier dies
+        // before releasing it, the pipe closes and the program never runs.
+        let mut cmd = Command::new("/bin/sh");
+        cmd.args(["-c", STEP_TRAMPOLINE, "atelier-step"])
+            .arg(program)
+            .args(args)
             .current_dir(cwd)
-            .stdin(Stdio::null())
+            .stdin(Stdio::piped())
             .stdout(log)
             .stderr(log_err)
             .env_remove(DISPATCHED_VAR)
@@ -291,9 +300,15 @@ impl Run {
             }
         };
         let pgid = child.id() as i32;
+        let gate = child.stdin.take();
         if let Err(e) = self.lock.add_group(pgid, &self.id) {
+            drop(gate);
             procs::stop_group(pgid, Some(&mut child), self.grace);
             return Err(e);
+        }
+        if let Some(mut gate) = gate {
+            // A failed write means the shell is already gone; waiting below reports it.
+            let _ = gate.write_all(b"go\n");
         }
 
         let status = loop {

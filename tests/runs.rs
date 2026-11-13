@@ -15,7 +15,7 @@ use std::time::{Duration, Instant};
 
 use atelier::exit::Exit;
 use atelier::locks::LockKey;
-use atelier::runs::{Outcome, Run, RunResult, StepStatus};
+use atelier::runs::{Outcome, Run, RunResult, STEP_TRAMPOLINE, StepStatus};
 use atelier::state::State;
 use atelier::tree;
 use common::*;
@@ -242,16 +242,43 @@ fn a_failing_or_missing_program_fails_the_run() {
     let missing = run
         .step("missing", &["/nonexistent/program".into()], &repo.root, &[])
         .unwrap();
-    assert_eq!(missing.status, StepStatus::NotStarted);
+    // The shell that starts every step reports the missing program (126 on macOS, 127 with dash).
+    assert_eq!(missing.status, StepStatus::Failed);
+    assert!(matches!(missing.exit, Some(126 | 127)), "{missing:?}");
+    let log = fs::read_to_string(run.dir().join("missing.log")).unwrap();
+    assert!(log.contains("/nonexistent/program"), "{log}");
     let result = run.finish(true).unwrap();
     assert_eq!(result.outcome, Outcome::Failed);
     assert!(result.failures.iter().any(|f| f == "bad failed"));
-    assert!(
-        result
-            .failures
-            .iter()
-            .any(|f| f == "missing could not start")
-    );
+    assert!(result.failures.iter().any(|f| f == "missing failed"));
+}
+
+#[test]
+fn a_step_never_runs_unless_its_group_was_recorded() {
+    // The trampoline every step starts with, released by nothing: atelier died between
+    // starting the step and recording its group. The program must not run.
+    let dir = tempfile::tempdir().unwrap();
+    let marker = dir.path().join("ran");
+    let mut child = Command::new("/bin/sh")
+        .args(["-c", STEP_TRAMPOLINE, "atelier-step"])
+        .args(["/usr/bin/touch", marker.to_str().unwrap()])
+        .stdin(Stdio::piped())
+        .spawn()
+        .unwrap();
+    drop(child.stdin.take());
+    assert_eq!(wait_child(&mut child, Duration::from_secs(10)), 125);
+    assert!(!marker.exists());
+    // Released, it runs the program.
+    let mut child = Command::new("/bin/sh")
+        .args(["-c", STEP_TRAMPOLINE, "atelier-step"])
+        .args(["/usr/bin/touch", marker.to_str().unwrap()])
+        .stdin(Stdio::piped())
+        .spawn()
+        .unwrap();
+    std::io::Write::write_all(child.stdin.as_mut().unwrap(), b"go\n").unwrap();
+    drop(child.stdin.take());
+    assert_eq!(wait_child(&mut child, Duration::from_secs(10)), 0);
+    assert!(marker.exists());
 }
 
 #[test]
