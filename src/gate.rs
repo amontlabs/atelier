@@ -7,19 +7,21 @@
 //!    refused; mode A's checks a and b; each branch approved, still at its approved commit,
 //!    current, with no merge commit of its own; a lower branch lands only when it is in the
 //!    batch, earlier, approved at a commit that contains the upper branch's base (DESIGN §2.4);
-//!    a branch that changes `.atelier/` or the generated rules merges alone; every platform has
-//!    a machine or is waived.
+//!    a branch that changes `.atelier/` or the generated rules merges alone; every platform of
+//!    OLD's committed settings has a machine or is waived.
 //! 2. The gate worktree `<main checkout>.gate` must be clean; atelier deletes nothing there.
 //!    It is checked out at `OLD`, the integration branch's commit.
-//! 3. Each approved commit is merged with `--no-ff`, in order. A conflict only in paths a
-//!    `merge.after` hook regenerates is settled by taking the incoming branch's side for those
-//!    paths (HF1); any other conflict aborts, returns the gate to `OLD` and exits 5 naming what
-//!    the branch conflicts with.
+//! 3. Each approved commit is merged with `--no-ff`, in order, with no global or system
+//!    attributes; a merge driver other than git's own for a path both sides changed refuses.
+//!    A conflict only in paths a `merge.after` hook with `commit` regenerates, in OLD's committed
+//!    settings and in the merged ones, is settled by taking the incoming branch's side for those
+//!    paths (HF1), never for a rules item; any other conflict aborts, returns the gate to `OLD`
+//!    and exits 5 naming what the branch conflicts with.
 //! 4. The `merge.after` hooks; a hook with `commit` has its changes committed, any other change
-//!    is RED. The result is `M`.
-//! 5. Every platform's `run` for `M`: here, a platform this computer runs ([`LocalPlatforms`]);
-//!    a platform of another machine goes through [`remote_platform`], the seam module 3.6
-//!    fills. A `run = "check"` platform runs `atelier check` through `M`'s own pinned atelier.
+//!    is RED. A settled path must then hold what its hook produces. The result is `M`.
+//! 5. Every platform's `run` for `M`, from the merged settings, all at the same time, on the
+//!    machines [`crate::gate_machines`] chooses. A `run = "check"` platform here runs
+//!    `atelier check` through `M`'s own pinned atelier.
 //! 6. RED: exit 1, the integration branch unmoved, the gate kept for inspection; a batch of
 //!    more than one branch is then searched for the branch that breaks it (`bisect`).
 //! 7. Green: the promotion record, then the push (`promote`), then one `merges.tsv` line per

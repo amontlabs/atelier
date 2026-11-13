@@ -85,6 +85,7 @@ The other command (`status`) comes in a later module.
 | `tmp`, `clean` | the two commands (module 3.5); `clean` also holds the plan and every re-check |
 | `rules` | rules currency check (stub until module 3.7) |
 | `approve`, `gate`, `promote`, `bisect` | `approve`; `merge` (preconditions, gate worktree, merges, hooks, platforms); mode A promotion and `promote`; red batch bisection |
+| `gate_machines` | the gate's platforms on the owner's machines: availability first, every platform at once, remote runs bound to the merged commit |
 | `ledger` | the versioned layer's approvals, `merges.tsv` and promotion record |
 | `check`, `prereq`, `nextest` | the `check` command; tool and mbx prerequisites; nextest flags, file refusals and result parsing |
 | `testcmd` | `test`, `machines`, `machines init` |

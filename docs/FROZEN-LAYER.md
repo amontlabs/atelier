@@ -30,6 +30,7 @@ runs its pinned version beside the orchestrator's. These rules keep that safe.
 | `branches/<key>.toml` | one record per branch |
 | `tmp/<lifetime id>/<entry id>.toml` | one registered temp folder |
 | `versioned/` | the versioned layer, with its format number in `versioned/format`; only the version pinned on the integration branch uses it |
+| `empty-hooks/` | an empty folder, created when missing: the hooks folder of the receiving side of the promotion's push; anything in it makes the push refuse |
 
 `<key>` is a branch name encoded by `names::key`. A worktree key is `@main` for the main checkout,
 otherwise the encoded name of the worktree's git folder relative to the common git folder
@@ -47,6 +48,10 @@ Every process of a step carries, set last so that no step environment can replac
 - `ATELIER_RUN=<run id>`;
 - `ATELIER_RUNS=<id>:<id>:…`: the ids of the runs it is nested in, outermost first, then its own
   run's id. An atelier started inside a step appends its own id to the list it inherits.
+
+A step may also be given `ATELIER_RUN_ID=<run id>`: the id the `atelier check` it starts takes
+for its run when that id is free (the gate names its inner check's run this way). No other step
+sees it.
 
 A process belongs to run `X` when `ATELIER_RUN=X`, or when `X` is an element of `ATELIER_RUNS`.
 So an outer run, the gate for one, finds what an inner atelier left behind. A step cannot set
@@ -195,7 +200,9 @@ Lifecycle, the same for every version:
 
 The `merged` table of a branch record is written by `merge` in the same write that sets `state` to
 `merged` (`records::MergeFacts::record`), and removed by `clean` in the write that sets `cleaned`
-(`MergeFacts::retire`). A record in state `merged` without it grants `clean` nothing.
+(`MergeFacts::retire`). A record in state `merged` without it grants `clean` nothing. `merge`
+makes that write only while the branch is at the commit it merged and approved no other: a
+branch that moved or was approved again meanwhile keeps its record `active`, as it is.
 
 | Field | Type | Meaning |
 |---|---|---|
