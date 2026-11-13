@@ -107,6 +107,20 @@ impl MachinesFile {
     }
 
     fn validate(&self) -> Result<()> {
+        // A name is passed to the machine's atelier as an argument; one that starts with `-`
+        // would be read as an option there.
+        let dashed: Vec<&str> = self
+            .machines
+            .keys()
+            .filter(|n| n.starts_with('-'))
+            .map(String::as_str)
+            .collect();
+        if !dashed.is_empty() {
+            return Err(Failure::usage(format!(
+                "machines.toml is not valid: a machine name cannot start with '-': {}",
+                dashed.join(", ")
+            )));
+        }
         let mut problems = Vec::new();
         let mut locals = 0;
         for (name, m) in &self.machines {
@@ -150,10 +164,11 @@ impl MachinesFile {
                 ));
             }
             if let Some(c) = &m.checkouts
-                && (!(c.starts_with('/') || c.starts_with("~/")) || c.contains('\n'))
+                && (!(c.starts_with('/') || c.starts_with("~/"))
+                    || c.contains(['\n', '!', '\'', '\\']))
             {
                 problems.push(format!(
-                    "{at}.checkouts: an absolute folder or one that starts with ~/"
+                    "{at}.checkouts: an absolute folder or one that starts with ~/, without newlines, '!', quotes or backslashes"
                 ));
             }
             if m.connect_timeout_seconds == Some(0) {
@@ -304,6 +319,9 @@ pub enum Attempt<T> {
     Offline(String),
     NotReady(String),
     Busy(String),
+    /// The machine refuses the run for a reason its owner must fix (files atelier would have to
+    /// delete there): the selection stops and the command exits 4.
+    Refused(String),
 }
 
 /// How machines are tried; the real one connects, the tests' ones are scripted.
@@ -313,6 +331,10 @@ pub trait Prober {
     fn attempt(&mut self, c: &Candidate) -> Attempt<Self::Taken>;
     /// Pauses before the busy machines are tried again. False stops waiting (a stop signal).
     fn pause(&mut self, busy: &[&str]) -> bool;
+    /// True once a stop signal arrived: no further machine is tried.
+    fn stopped(&self) -> bool {
+        false
+    }
 }
 
 /// The outcome of choosing: the machine that took the run, if any, and every machine passed
@@ -321,6 +343,8 @@ pub trait Prober {
 pub struct Selection<T> {
     pub taken: Option<(Candidate, T)>,
     pub skipped: Vec<(String, Skip)>,
+    /// The machine that refused the run, and why.
+    pub refused: Option<(String, String)>,
 }
 
 /// Tries the candidates in order (DESIGN §2.5). When none takes the run and at least one was
@@ -331,27 +355,36 @@ pub fn select<P: Prober>(
     candidates: &[std::result::Result<Candidate, (String, Skip)>],
     prober: &mut P,
 ) -> Selection<P::Taken> {
-    let mut skipped = Vec::new();
+    let mut sel = Selection {
+        taken: None,
+        skipped: Vec::new(),
+        refused: None,
+    };
     let mut busy: Vec<&Candidate> = Vec::new();
     for c in candidates {
         let c = match c {
             Ok(c) => c,
             Err(skip) => {
-                skipped.push(skip.clone());
+                sel.skipped.push(skip.clone());
                 continue;
             }
         };
+        if prober.stopped() {
+            return sel;
+        }
         match prober.attempt(c) {
             Attempt::Taken(t) => {
-                return Selection {
-                    taken: Some((c.clone(), t)),
-                    skipped,
-                };
+                sel.taken = Some((c.clone(), t));
+                return sel;
             }
-            Attempt::Offline(d) => skipped.push((c.name.clone(), Skip::Offline(d))),
-            Attempt::NotReady(l) => skipped.push((c.name.clone(), Skip::NotReady(l))),
+            Attempt::Refused(why) => {
+                sel.refused = Some((c.name.clone(), why));
+                return sel;
+            }
+            Attempt::Offline(d) => sel.skipped.push((c.name.clone(), Skip::Offline(d))),
+            Attempt::NotReady(l) => sel.skipped.push((c.name.clone(), Skip::NotReady(l))),
             Attempt::Busy(d) => {
-                skipped.push((c.name.clone(), Skip::Busy(d)));
+                sel.skipped.push((c.name.clone(), Skip::Busy(d)));
                 busy.push(c);
             }
         }
@@ -363,13 +396,18 @@ pub fn select<P: Prober>(
         }
         let mut still = Vec::new();
         for c in busy {
+            if prober.stopped() {
+                return sel;
+            }
             let skip = match prober.attempt(c) {
                 Attempt::Taken(t) => {
-                    skipped.retain(|(n, _)| n != &c.name);
-                    return Selection {
-                        taken: Some((c.clone(), t)),
-                        skipped,
-                    };
+                    sel.skipped.retain(|(n, _)| n != &c.name);
+                    sel.taken = Some((c.clone(), t));
+                    return sel;
+                }
+                Attempt::Refused(why) => {
+                    sel.refused = Some((c.name.clone(), why));
+                    return sel;
                 }
                 Attempt::Busy(d) => {
                     still.push(c);
@@ -378,16 +416,13 @@ pub fn select<P: Prober>(
                 Attempt::Offline(d) => Skip::Offline(d),
                 Attempt::NotReady(l) => Skip::NotReady(l),
             };
-            if let Some(entry) = skipped.iter_mut().find(|(n, _)| n == &c.name) {
+            if let Some(entry) = sel.skipped.iter_mut().find(|(n, _)| n == &c.name) {
                 entry.1 = skip;
             }
         }
         busy = still;
     }
-    Selection {
-        taken: None,
-        skipped,
-    }
+    sel
 }
 
 /// How often busy machines are tried again while waiting.
@@ -442,22 +477,46 @@ impl MachineLock {
             }
         }
         let holder_path = dir.join("machine.holder");
-        let line = format!(
-            "pid {} since {}: {holder}\n",
-            std::process::id(),
-            fsutil::rfc3339(fsutil::now_secs())
+        let pid = std::process::id();
+        let text = format!(
+            "pid {pid} since {}: {holder}\nstart {}\n",
+            fsutil::rfc3339(fsutil::now_secs()),
+            crate::procs::start_time(pid as i32).unwrap_or_default()
         );
-        fsutil::write_atomic(&holder_path, line.as_bytes()).ctx(holder_path.display())?;
+        fsutil::write_atomic(&holder_path, text.as_bytes()).ctx(holder_path.display())?;
         Ok(Some(MachineLock {
             _file: file,
             holder: holder_path,
         }))
     }
 
+    /// Who holds the lock, read from the holder file without touching the lock, so that a
+    /// look (a probe, `atelier machines`) never makes a real run find the machine busy. `None`
+    /// when no holder file names a live process: the file's process is gone, or its pid now
+    /// belongs to another process (its start time differs). A holder that took the lock and has
+    /// not written its file yet reads as free; the run that follows then finds it busy.
+    pub fn held_by(home: &Path) -> Option<String> {
+        let text = fs::read_to_string(state_dir(home).join("machine.holder")).ok()?;
+        let mut lines = text.lines();
+        let first = lines.next()?.trim().to_owned();
+        let pid: i32 = first
+            .strip_prefix("pid ")?
+            .split(' ')
+            .next()?
+            .parse()
+            .ok()?;
+        let start = lines.find_map(|l| l.strip_prefix("start "))?.trim();
+        match crate::procs::start_time(pid) {
+            Some(now) if !start.is_empty() && now == start => Some(first),
+            _ => None,
+        }
+    }
+
     /// Who holds the lock, as written by the holder; empty when unknown.
     pub fn holder(home: &Path) -> String {
         fs::read_to_string(state_dir(home).join("machine.holder"))
-            .map(|s| s.trim().to_owned())
+            .ok()
+            .and_then(|s| s.lines().next().map(|l| l.trim().to_owned()))
             .unwrap_or_default()
     }
 }
@@ -578,6 +637,8 @@ priority = 1
         tried: Vec<String>,
         pauses: usize,
         max_pauses: usize,
+        /// A stop signal arrives after this many attempts.
+        stop_after: Option<usize>,
     }
 
     impl Fake {
@@ -607,12 +668,16 @@ priority = 1
                 "take" => Attempt::Taken(c.name.clone()),
                 "offline" => Attempt::Offline("timed out".into()),
                 "busy" => Attempt::Busy(String::new()),
+                "refuse" => Attempt::Refused("ignored files in the way".into()),
                 other => Attempt::NotReady(other.into()),
             }
         }
         fn pause(&mut self, _busy: &[&str]) -> bool {
             self.pauses += 1;
             self.pauses <= self.max_pauses
+        }
+        fn stopped(&self) -> bool {
+            self.stop_after.is_some_and(|n| self.tried.len() >= n)
         }
     }
 
@@ -742,6 +807,78 @@ priority = 1
     }
 
     #[test]
+    fn a_stop_during_an_attempt_tries_no_further_machine() {
+        let c = candidates(&file(LINUX), linux(), &platform(None, false));
+        let mut f = Fake::new(&[("b", &["offline"]), ("c", &["take"]), ("a", &["take"])]);
+        f.stop_after = Some(1);
+        let s = select(&c, &mut f);
+        assert!(s.taken.is_none());
+        assert_eq!(f.tried, ["b"]);
+        // While waiting for a busy machine, too.
+        let mut f = Fake::new(&[("b", &["busy"]), ("c", &["busy"]), ("a", &["busy", "take"])]);
+        f.stop_after = Some(3);
+        let s = select(&c, &mut f);
+        assert!(s.taken.is_none());
+        assert_eq!(f.tried, ["b", "c", "a"]);
+    }
+
+    #[test]
+    fn a_refusal_ends_the_selection() {
+        let c = candidates(&file(LINUX), linux(), &platform(None, false));
+        let mut f = Fake::new(&[("b", &["offline"]), ("c", &["refuse"]), ("a", &["take"])]);
+        let s = select(&c, &mut f);
+        assert!(s.taken.is_none());
+        assert_eq!(
+            s.refused,
+            Some(("c".to_owned(), "ignored files in the way".to_owned()))
+        );
+        assert_eq!(f.tried, ["b", "c"]);
+    }
+
+    #[test]
+    fn a_name_that_starts_with_a_dash_is_a_usage_error() {
+        let e = MachinesFile::parse(
+            "[machines.-box]\nssh = \"h\"\nplatform = \"linux-x86_64\"\npriority = 1\n",
+        )
+        .unwrap_err();
+        assert_eq!(e.exit, crate::exit::Exit::Usage);
+        assert!(e.message.contains("-box"), "{}", e.message);
+        assert!(
+            MachinesFile::parse(
+                "[machines.a-b]\nssh = \"h\"\nplatform = \"linux-x86_64\"\npriority = 1\n"
+            )
+            .is_ok()
+        );
+    }
+
+    #[test]
+    fn a_look_at_the_lock_reads_the_holder_and_leaves_the_lock_alone() {
+        let home = tempfile::tempdir().unwrap();
+        assert_eq!(MachineLock::held_by(home.path()), None);
+        let held = MachineLock::try_take(home.path(), "project p")
+            .unwrap()
+            .unwrap();
+        let by = MachineLock::held_by(home.path()).unwrap();
+        assert!(by.ends_with("project p"), "{by}");
+        drop(held);
+        assert_eq!(MachineLock::held_by(home.path()), None);
+        // A holder file left by a process that is gone (or whose pid was reused) is not a holder.
+        let dir = state_dir(home.path());
+        for text in [
+            "pid 999999 since x: gone\nstart 1.000000\n".to_owned(),
+            format!(
+                "pid {} since x: reused\nstart 1.000000\n",
+                std::process::id()
+            ),
+        ] {
+            fs::write(dir.join("machine.holder"), text).unwrap();
+            assert_eq!(MachineLock::held_by(home.path()), None);
+        }
+        // Reading takes no lock: a real taker is never refused by a look.
+        assert!(MachineLock::try_take(home.path(), "run").unwrap().is_some());
+    }
+
+    #[test]
     fn windows_is_refused_when_chosen() {
         assert!(refuse_windows(linux()).is_ok());
         let e = refuse_windows(Platform::parse("windows-x86_64").unwrap()).unwrap_err();
@@ -755,6 +892,7 @@ priority = 1
             "[machines.a]\nssh = \"h\"\nplatform = \"linux-x86_64\"\npriority = 1\npath = [\"bin\"]\n",
             "[machines.a]\nssh = \"h\"\nplatform = \"linux-x86_64\"\npriority = 1\npath = [\"/a:/b\"]\n",
             "[machines.a]\nssh = \"h\"\nplatform = \"linux-x86_64\"\npriority = 1\ncheckouts = \"rel\"\n",
+            "[machines.a]\nssh = \"h\"\nplatform = \"linux-x86_64\"\npriority = 1\ncheckouts = \"~/a!b\"\n",
         ] {
             assert!(MachinesFile::parse(bad).is_err(), "{bad}");
         }

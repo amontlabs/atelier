@@ -133,8 +133,14 @@ pub enum Cmd {
 
 #[derive(Debug, Subcommand)]
 pub enum MachinesCmd {
-    /// Create this project's checkout on a machine and install the pinned atelier there.
-    Init { name: String },
+    /// Create this project's checkout on a machine and install the pinned atelier there. Prints
+    /// the plan; replacing an installed atelier of other source needs --yes.
+    Init {
+        name: String,
+        /// Replace an installed atelier built from other source.
+        #[arg(long)]
+        yes: bool,
+    },
 }
 
 impl Cmd {
@@ -259,7 +265,7 @@ pub fn run(cmd: Cmd, cwd: &Path) -> Result<Exit> {
             let ctx = preflight::run(cwd, "machines", Cmd::Machines { action: None }.needs())?;
             return match action {
                 None => testcmd::list(&ctx),
-                Some(MachinesCmd::Init { name }) => testcmd::init(&ctx, &name),
+                Some(MachinesCmd::Init { name, yes }) => testcmd::init(&ctx, &name, yes),
             };
         }
         _ => {}

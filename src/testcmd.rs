@@ -2,12 +2,17 @@
 //! `atelier machines init <name>` (DESIGN §2.5, §3).
 //!
 //! `test` runs this worktree's committed `HEAD` and refuses (4) uncommitted changes, which a
-//! remote machine could not see; it has no commit argument, because a run on this computer
-//! happens in place. For each platform, one after the other, it takes this worktree's run lock,
-//! chooses a machine ([`crate::machines::select`]) and runs the platform's job there: on this
-//! computer in the worktree, under the machine lock; on another through `remote-run`. The final
-//! line says, per platform, where it ran and which machines were skipped and why. Exit 0 pass,
-//! 1 fail, 3 no machine available (or the connection lost), 4 refused.
+//! remote machine could not see, and a caller folder that is not in that commit; it has no
+//! commit argument, because a run on this computer happens in place. It takes the tree id at
+//! the start and checks it again before each platform, once a machine of this computer is
+//! taken, and after the last platform: a change of the files or of `HEAD` is RED, "the tree
+//! changed during the run". For each platform, one after the other, it takes this worktree's
+//! run lock, chooses a machine ([`crate::machines::select`]) and runs the platform's job there:
+//! on this computer in the worktree, under the machine lock; on another through `remote-run`,
+//! whose results must record this commit and its tree. The final line says, per platform,
+//! where it ran and which machines were skipped and why; it is printed even when a platform
+//! ends in an error. Exit 0 pass, 1 fail, 3 no machine available (or the connection lost), 4
+//! refused.
 
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
@@ -21,9 +26,8 @@ use crate::machines::{
 };
 use crate::platform::{Os, Platform};
 use crate::preflight::Context;
-use crate::remote::{self, Probe, Remote, Session, Verdict};
+use crate::remote::{self, Installed, Probe, Remote, Session, Verdict};
 use crate::runs::{Outcome, Run};
-use crate::settings::SETTINGS_PATH;
 use crate::signals;
 use crate::source;
 use crate::tree;
@@ -42,6 +46,10 @@ enum Ended {
     NoMachine,
     ConnectionLost,
     Interrupted,
+    /// A machine refused the run (files there the owner must move).
+    Refused,
+    /// The platform could not run; the error was printed, with its exit code.
+    Error(Exit),
 }
 
 struct PlatformReport {
@@ -70,6 +78,8 @@ impl PlatformReport {
             Ended::Interrupted => "INTERRUPTED",
             Ended::ConnectionLost => "connection lost",
             Ended::NoMachine => "no machine available",
+            Ended::Refused => "REFUSED",
+            Ended::Error(_) => "ERROR",
         };
         format!("{}: {word}{on}{skips}", self.platform)
     }
@@ -105,27 +115,31 @@ pub fn test(
     let commit = checkout.head_commit()?.ok_or_else(|| {
         Failure::refused("this worktree has no commit yet: atelier test runs the committed HEAD")
     })?;
-    let tree = tree::tree_id(checkout)?;
-    if tree::head_tree(checkout)?.as_deref() != Some(tree.as_str()) {
-        let status = git::run(
-            &checkout.root,
-            ["status", "--porcelain=v1", "--untracked-files=all"],
-        )
-        .unwrap_or_default();
+    let head_tree =
+        tree::head_tree(checkout)?.ok_or_else(|| Failure::refused("HEAD has no tree"))?;
+    if tree::tree_id(checkout)? != head_tree {
         return Err(Failure::refused(format!(
             "uncommitted changes: atelier test runs the committed HEAD, which another machine could see; commit first:\n  {}",
-            status.lines().take(20).collect::<Vec<_>>().join("\n  ")
+            status_lines(checkout).join("\n  ")
         )));
     }
     let rel = relative_folder(&checkout.root, cwd)?;
+    in_commit(checkout, &commit, &rel)?;
     let home = home()?;
     let file = MachinesFile::load_owner(&home)?;
-    let settings_text = std::fs::read_to_string(checkout.root.join(SETTINGS_PATH))
-        .map_err(|e| Failure::refused(format!("{SETTINGS_PATH}: {e}")))?;
+    let start = Start {
+        commit: commit.clone(),
+        tree: head_tree,
+    };
 
     let mut reports = Vec::new();
+    let mut changed = None;
     for p in platforms {
         if signals::received().is_some() {
+            break;
+        }
+        if let Some(why) = start.changed(checkout) {
+            changed = Some(why);
             break;
         }
         let job = Job {
@@ -133,29 +147,110 @@ pub fn test(
             command: (!command.is_empty()).then(|| command.clone()),
             rel: rel.clone(),
         };
-        reports.push(run_platform(
-            ctx,
-            &file,
-            &home,
-            &settings_text,
-            &commit,
-            &job,
-        )?);
+        match run_platform(ctx, &file, &home, &start, &job) {
+            Ok(r) => reports.push(r),
+            Err(f) => {
+                eprintln!("atelier: {p}: {}", f.message);
+                reports.push(PlatformReport {
+                    platform: p,
+                    ended: Ended::Error(f.exit),
+                    machine: None,
+                    skipped: Vec::new(),
+                });
+            }
+        }
     }
-    let line = reports
-        .iter()
-        .map(PlatformReport::line)
-        .collect::<Vec<_>>()
-        .join(" · ");
-    println!("{line}");
+    if changed.is_none() {
+        changed = start.changed(checkout);
+    }
+    let mut parts: Vec<String> = reports.iter().map(PlatformReport::line).collect();
+    if let Some(why) = &changed {
+        eprintln!("atelier: RED: the tree changed during the run: {why}");
+        parts.push("RED: the tree changed during the run".to_owned());
+    }
+    println!("{}", parts.join(" · "));
     let ended = |e: &[Ended]| reports.iter().any(|r| e.contains(&r.ended));
-    Ok(if ended(&[Ended::Fail, Ended::Interrupted]) {
-        Exit::Fail
-    } else if ended(&[Ended::NoMachine, Ended::ConnectionLost]) {
-        Exit::NoMachine
+    let error = reports.iter().find_map(|r| match r.ended {
+        Ended::Error(e) => Some(e),
+        _ => None,
+    });
+    Ok(
+        if changed.is_some() || ended(&[Ended::Fail, Ended::Interrupted]) {
+            Exit::Fail
+        } else if let Some(e) = error {
+            e
+        } else if ended(&[Ended::Refused]) {
+            Exit::Refused
+        } else if ended(&[Ended::NoMachine, Ended::ConnectionLost]) {
+            Exit::NoMachine
+        } else {
+            Exit::Ok
+        },
+    )
+}
+
+/// The commit and tree `test` started with.
+struct Start {
+    commit: String,
+    tree: String,
+}
+
+impl Start {
+    /// Why the worktree is no longer the commit `test` started with: `HEAD` moved, or the files
+    /// differ from it (uncommitted changes); `None` when it still is.
+    fn changed(&self, checkout: &git::Checkout) -> Option<String> {
+        match checkout.head_commit() {
+            Ok(Some(h)) if h == self.commit => {}
+            Ok(h) => {
+                return Some(format!(
+                    "HEAD moved from {} to {}",
+                    self.commit,
+                    h.as_deref().unwrap_or("nothing")
+                ));
+            }
+            Err(f) => return Some(f.message),
+        }
+        match tree::tree_id(checkout) {
+            Ok(t) if t == self.tree => None,
+            Ok(t) => Some(format!(
+                "tree {t}, not the commit's {}; uncommitted changes: {}",
+                self.tree,
+                status_lines(checkout).join("; ")
+            )),
+            Err(f) => Some(f.message),
+        }
+    }
+}
+
+/// Up to 20 lines of `git status --porcelain`, with untracked files.
+fn status_lines(checkout: &git::Checkout) -> Vec<String> {
+    git::run(
+        &checkout.root,
+        ["status", "--porcelain=v1", "--untracked-files=all"],
+    )
+    .unwrap_or_default()
+    .lines()
+    .take(20)
+    .map(str::to_owned)
+    .collect()
+}
+
+/// Refuses (4) a caller folder that is not a folder of `commit`: no other machine has it.
+fn in_commit(checkout: &git::Checkout, commit: &str, rel: &Path) -> Result<()> {
+    if rel.as_os_str().is_empty() {
+        return Ok(());
+    }
+    let spec = format!("{commit}:{}", rel.to_string_lossy());
+    let kind = git::output(&checkout.root, ["cat-file", "-t", &spec])?;
+    if kind.status.success() && String::from_utf8_lossy(&kind.stdout).trim() == "tree" {
+        Ok(())
     } else {
-        Exit::Ok
-    })
+        Err(Failure::refused(format!(
+            "{} is not a folder of the committed HEAD ({}): atelier test runs the commit, so run it from a folder the commit has",
+            rel.display(),
+            commit.get(..12).unwrap_or(commit)
+        )))
+    }
 }
 
 /// The caller's folder relative to the checkout root.
@@ -180,7 +275,6 @@ enum Taken {
 struct RealProber<'a> {
     ctx: &'a Context,
     home: &'a Path,
-    settings_text: &'a str,
     commit: &'a str,
     job: &'a Job,
     run_dir: PathBuf,
@@ -198,7 +292,6 @@ impl Prober for RealProber<'_> {
             match remote::attempt(
                 &r,
                 &self.ctx.checkout,
-                self.settings_text,
                 self.job,
                 self.commit,
                 &remote::log_path(&self.run_dir, &c.name),
@@ -207,8 +300,13 @@ impl Prober for RealProber<'_> {
                 Attempt::Offline(d) => Attempt::Offline(d),
                 Attempt::NotReady(l) => Attempt::NotReady(l),
                 Attempt::Busy(h) => Attempt::Busy(h),
+                Attempt::Refused(l) => Attempt::Refused(l),
             }
         }
+    }
+
+    fn stopped(&self) -> bool {
+        signals::received().is_some()
     }
 
     fn pause(&mut self, busy: &[&str]) -> bool {
@@ -232,7 +330,7 @@ impl Prober for RealProber<'_> {
 }
 
 fn local_attempt(ctx: &Context, home: &Path, m: &Machine, job: &Job) -> Attempt<Taken> {
-    if let Some(first) = jobs::machine_problems(&ctx.settings, m.platform(), &ctx.checkout.root)
+    if let Some(first) = jobs::machine_problems(&ctx.checkout, &ctx.settings, m.platform())
         .into_iter()
         .next()
     {
@@ -250,10 +348,10 @@ fn run_platform(
     ctx: &Context,
     file: &MachinesFile,
     home: &Path,
-    settings_text: &str,
-    commit: &str,
+    start: &Start,
     job: &Job,
 ) -> Result<PlatformReport> {
+    let commit = start.commit.as_str();
     let ps = jobs::platform_settings(&ctx.settings, job.platform)?;
     let cands = machines::candidates(file, job.platform, ps);
     let mut run = Run::start(
@@ -263,12 +361,10 @@ fn run_platform(
         &job.describe(),
         &ctx.checkout.root,
     )?;
-    let tree = tree::tree_id(&ctx.checkout)?;
-    run.set_tree(tree, Some(commit.to_owned()), false);
+    run.set_tree(start.tree.clone(), Some(commit.to_owned()), false);
     let mut prober = RealProber {
         ctx,
         home,
-        settings_text,
         commit,
         job,
         run_dir: run.dir().to_path_buf(),
@@ -279,6 +375,17 @@ fn run_platform(
     let run_dir = run.dir().to_path_buf();
     let id = run.id().to_owned();
 
+    if let Some((name, why)) = selection.refused {
+        run.fail(format!("{name}: {why}"));
+        run.finish(false)?;
+        eprintln!("{}: refused by {name}: {why}", job.platform);
+        return Ok(PlatformReport {
+            platform: job.platform,
+            ended: Ended::Refused,
+            machine: Some((name, false)),
+            skipped,
+        });
+    }
     let Some((chosen, taken)) = selection.taken else {
         let details = if skipped.is_empty() {
             format!("no machine of {} in machines.toml", job.platform)
@@ -314,7 +421,14 @@ fn run_platform(
     let ended = match taken {
         Taken::Local(lock) => {
             run.set_machine(None, Some(job.platform.to_string()));
-            let ending = jobs::run_steps(ctx, &mut run, job);
+            // A wait for the machine may have let the files change.
+            let ending = match start.changed(&ctx.checkout) {
+                Some(why) => {
+                    run.fail(format!("the tree changed during the run: {why}"));
+                    Ok(Ending::Done(false))
+                }
+                None => jobs::run_steps(ctx, &mut run, job),
+            };
             let ended = match ending {
                 Ok(Ending::Done(passed)) => outcome_of(&run.finish(passed)?.outcome),
                 Ok(Ending::ThenCheck) => {
@@ -343,14 +457,22 @@ fn run_platform(
         }
         Taken::Remote(session) => {
             run.set_machine(Some(chosen.name.clone()), Some(job.platform.to_string()));
-            let end = session.finish();
+            let end = session.finish(commit, &start.tree);
             for f in &end.failures {
                 run.fail(f.clone());
             }
-            if let Some(Some(last)) = end.runs.last().map(|(_, r)| r.as_ref())
-                && let Some(t) = last.tests
-            {
-                run.set_tests(t);
+            if let Some(Some(last)) = end.runs.last().map(|(_, r)| r.as_ref()) {
+                if let Some(t) = last.tests {
+                    run.set_tests(t);
+                }
+                // The tree the machine really tested.
+                if let Some(tree) = &last.tree {
+                    run.set_tree(
+                        tree.clone(),
+                        last.commit.clone(),
+                        last.uncommitted.unwrap_or(true) || *tree != start.tree,
+                    );
+                }
             }
             let remote_ids: Vec<String> = end.runs.iter().map(|(i, _)| i.clone()).collect();
             let _ = std::fs::write(
@@ -404,16 +526,14 @@ fn outcome_of(o: &Outcome) -> Ended {
 pub fn list(ctx: &Context) -> Result<Exit> {
     let home = home()?;
     let file = MachinesFile::load_owner(&home)?;
-    let settings_text = std::fs::read_to_string(ctx.checkout.root.join(SETTINGS_PATH))
-        .map_err(|e| Failure::refused(format!("{SETTINGS_PATH}: {e}")))?;
     let mut all: Vec<(&String, &Machine)> = file.machines.iter().collect();
     all.sort_by(|a, b| a.1.priority.cmp(&b.1.priority).then(a.0.cmp(b.0)));
     let states: Vec<String> = std::thread::scope(|s| {
         let handles: Vec<_> = all
             .iter()
             .map(|(name, m)| {
-                let (home, text) = (&home, &settings_text);
-                s.spawn(move || state_of(ctx, home, name, m, text))
+                let home = &home;
+                s.spawn(move || state_of(ctx, home, name, m))
             })
             .collect();
         handles
@@ -439,27 +559,26 @@ pub fn list(ctx: &Context) -> Result<Exit> {
     Ok(Exit::Ok)
 }
 
-fn state_of(ctx: &Context, home: &Path, name: &str, m: &Machine, settings_text: &str) -> String {
+fn state_of(ctx: &Context, home: &Path, name: &str, m: &Machine) -> String {
     if m.platform().os == Os::Windows {
         return "not supported (Windows)".to_owned();
     }
     if m.local {
-        let ready = match jobs::machine_problems(&ctx.settings, m.platform(), &ctx.checkout.root)
+        let ready = match jobs::machine_problems(&ctx.checkout, &ctx.settings, m.platform())
             .into_iter()
             .next()
         {
             None => "ready".to_owned(),
             Some(l) => format!("not ready: {l}"),
         };
-        let busy = match MachineLock::try_take(home, "atelier machines") {
-            Ok(Some(_)) => "free".to_owned(),
-            Ok(None) => format!("busy ({})", MachineLock::holder(home)),
-            Err(f) => format!("lock: {}", f.message),
+        let busy = match MachineLock::held_by(home) {
+            None => "free".to_owned(),
+            Some(h) => format!("busy ({h})"),
         };
         return format!("this computer, {ready}, {busy}");
     }
     let r = Remote::new(name, m, &ctx.checkout);
-    match r.probe(&m.platform, settings_text) {
+    match r.probe(&m.platform) {
         Probe::Ready => "reachable, ready, free".to_owned(),
         Probe::Busy(h) => format!("reachable, ready, busy ({h})"),
         Probe::NotReady(l) => format!("reachable, not ready: {l}"),
@@ -467,9 +586,12 @@ fn state_of(ctx: &Context, home: &Path, name: &str, m: &Machine, settings_text: 
     }
 }
 
-/// `atelier machines init <name>`: the project's checkout on that machine and the pinned
-/// atelier there, built from this binary's own source. Nothing else is installed.
-pub fn init(ctx: &Context, name: &str) -> Result<Exit> {
+/// `atelier machines init <name> [--yes]`: the project's checkout on that machine and the
+/// pinned atelier there, built from this binary's own source. Nothing else is installed. It
+/// prints its plan first; replacing an installed atelier of other source (which the machine's
+/// own projects may use) needs `--yes`. The new build goes into a new folder that the machine's
+/// atelier swaps in under the machine lock; the folder it replaces is kept.
+pub fn init(ctx: &Context, name: &str, yes: bool) -> Result<Exit> {
     let home = home()?;
     let file = MachinesFile::load_owner(&home)?;
     let m = file.get(name)?;
@@ -500,34 +622,85 @@ pub fn init(ctx: &Context, name: &str) -> Result<Exit> {
         }
         Err(Probe::Ready) => unreachable!(),
     }
-    let made = r
-        .create_checkout()
-        .map_err(|e| Failure::refused(format!("{name}: cannot create the checkout: {e}")))?;
-    println!("{name}: checkout {} ({made})", r.checkout);
+    let has_checkout = r
+        .has_checkout()
+        .map_err(|e| Failure::refused(format!("{name}: {e}")))?;
     let want = source::identity();
     let have = r
         .installed_identity()
         .map_err(|e| Failure::refused(format!("{name}: {e}")))?;
+    let place = format!("~/.local/share/atelier/{}/", crate::dispatch::VERSION);
+
+    println!("{name}: plan");
+    println!(
+        "  checkout {}: {}",
+        r.checkout,
+        if has_checkout {
+            "exists"
+        } else {
+            "create it (git init)"
+        }
+    );
+    match have.as_deref() {
+        Some(h) if h == want => println!("  atelier {want}: installed already at {place}"),
+        Some(h) => println!(
+            "  atelier: replace {h} at {place} with {want}, built there from this program's source (cargo install --locked), swapped in under the machine lock; the replaced folder is kept beside it"
+        ),
+        None => println!(
+            "  atelier {want}: build it there from this program's source (cargo install --locked) and install it at {place}"
+        ),
+    }
+    if let Some(h) = have.as_deref()
+        && h != want
+        && !yes
+    {
+        return Err(Failure::refused(format!(
+            "{name} has atelier {h} at {place}, which the machine's own projects may use: nothing was changed; run atelier machines init {name} --yes to replace it"
+        )));
+    }
+
+    if !has_checkout {
+        let made = r
+            .create_checkout()
+            .map_err(|e| Failure::refused(format!("{name}: cannot create the checkout: {e}")))?;
+        println!("{name}: checkout {} ({made})", r.checkout);
+    }
     if have.as_deref() == Some(want.as_str()) {
-        println!("{name}: atelier {want} already installed");
         return Ok(Exit::Ok);
     }
     eprintln!(
-        "{name}: building atelier {} from this program's source there (cargo install --locked){}",
-        crate::dispatch::VERSION,
-        have.map(|h| format!("; replaces {h}")).unwrap_or_default()
+        "{name}: building atelier {} from this program's source there",
+        crate::dispatch::VERSION
     );
-    r.install()
-        .map_err(|e| Failure::refused(format!("{name}: {e}")))?;
+    match r
+        .install(have.as_deref())
+        .map_err(|e| Failure::refused(format!("{name}: {e}")))?
+    {
+        Installed::Done(kept) => {
+            if let Some(k) = kept {
+                println!("{name}: the replaced install is kept at {k}");
+            }
+        }
+        Installed::Busy(h) => {
+            return Err(Failure::new(
+                Exit::NoMachine,
+                format!(
+                    "{name} is busy ({h}): the new build was not swapped in; run atelier machines init {name} again when it is free"
+                ),
+            ));
+        }
+        Installed::Changed(id) => {
+            return Err(Failure::refused(format!(
+                "{name}: the install there changed to {id} during the build: nothing was replaced; run atelier machines init {name} again"
+            )));
+        }
+    }
     match r
         .installed_identity()
         .map_err(|e| Failure::refused(format!("{name}: {e}")))?
     {
         Some(id) if id == want => {
-            println!(
-                "{name}: atelier {id} installed at ~/.local/share/atelier/{}/",
-                crate::dispatch::VERSION
-            );
+            println!("{name}: atelier {id} installed at {place}");
             Ok(Exit::Ok)
         }
         other => Err(Failure::refused(format!(

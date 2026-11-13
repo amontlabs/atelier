@@ -3,7 +3,8 @@
 #
 # The destination names a folder under $FAKE_SSH_ROOT, which is that "machine's" HOME; a missing
 # folder is a machine that does not answer (exit 255, as ssh). The command runs as ssh runs it,
-# `sh -c <command>` in HOME with a fresh environment. Its stdin is a pipe that only this process
+# `<login shell> -c <command>` in HOME with a fresh environment; the login shell is /bin/sh, or
+# $FAKE_SSH_SHELL (tcsh, fish, ...) to check that atelier's commands survive other shells' rules. Its stdin is a pipe that only this process
 # writes, relaying its own stdin: when this process ends (killed included), the remote side reads
 # end-of-input, as when a connection is cut. Its stdout is relayed the same way, so the caller's
 # stream ends with this process. Sessions started with -tt append this process's pid
@@ -49,7 +50,8 @@ if ($pid == 0) {
     my @env = ("HOME=$home", "PATH=/usr/bin:/bin:/usr/sbin:/sbin", "USER=" . ($ENV{USER} // ''),
                "LOGNAME=" . ($ENV{LOGNAME} // ''), "TMPDIR=" . ($ENV{TMPDIR} // '/tmp'),
                "GIT_CONFIG_NOSYSTEM=1");
-    exec('/usr/bin/env', '-i', @env, '/bin/sh', '-c', $command) or die "exec: $!";
+    my $shell = $ENV{FAKE_SSH_SHELL} || '/bin/sh';
+    exec('/usr/bin/env', '-i', @env, "SHELL=$shell", $shell, '-c', $command) or die "exec: $!";
 }
 close $r;
 close $ow;

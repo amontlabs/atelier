@@ -47,6 +47,7 @@ impl World {
         fs::create_dir_all(&machines).unwrap();
         let w = World { repo, machines };
         w.write_settings(extra);
+        w.repo.write_rules();
         w.repo.write(".gitignore", "out/\n");
         w.repo.write("sub/keep", "x\n");
         w.repo.commit_all("settings");
@@ -206,10 +207,15 @@ fn machines_init_creates_the_checkout_and_finds_the_pinned_atelier() {
         both(&out)
     );
     assert!(stdout(&out).contains("(created)"), "{}", both(&out));
-    assert!(stdout(&out).contains("already installed"), "{}", both(&out));
+    assert!(
+        stdout(&out).contains("create it (git init)"),
+        "{}",
+        both(&out)
+    );
+    assert!(stdout(&out).contains("installed already"), "{}", both(&out));
     assert!(w.box_checkout().join(".git").is_dir());
     let again = w.run(&["machines", "init", "box"]);
-    assert!(stdout(&again).contains("(exists)"), "{}", both(&again));
+    assert!(stdout(&again).contains(": exists"), "{}", both(&again));
 
     assert_eq!(code(&w.run(&["machines", "init", "down"])), 3);
     assert_eq!(code(&w.run(&["machines", "init", "nope"])), 4);
@@ -460,7 +466,6 @@ impl Drop for HeldLock {
 fn hold_machine_lock(home: &Path) -> HeldLock {
     let dir = home.join(".local/state/atelier");
     fs::create_dir_all(&dir).unwrap();
-    fs::write(dir.join("machine.holder"), "pid 1 since then: the test\n").unwrap();
     // `flock` is not on macOS by default; perl's is.
     let mut child = Command::new("/usr/bin/perl")
         .arg("-e")
@@ -477,6 +482,15 @@ fn hold_machine_lock(home: &Path) -> HeldLock {
     )
     .unwrap();
     assert_eq!(line.trim(), "held");
+    let pid = child.id() as i32;
+    fs::write(
+        dir.join("machine.holder"),
+        format!(
+            "pid {pid} since then: the test\nstart {}\n",
+            atelier::procs::start_time(pid).unwrap()
+        ),
+    )
+    .unwrap();
     HeldLock(child)
 }
 

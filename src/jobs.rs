@@ -12,23 +12,24 @@
 //! `check.prepare` hooks itself: the job's own run then holds only the platform's `prepare`, and
 //! the caller runs the check after finishing it ([`Ending::ThenCheck`]).
 //!
-//! The machine preflight ([`machine_problems`]) is the part of the prerequisites a machine must
-//! meet before it takes a run: its platform, the declared tools, and the mbx rules (r4 §4.4, §6).
+//! The machine preflight ([`machine_problems`]) is what a machine must meet before it takes a
+//! run: its platform, then `atelier check`'s own prerequisites ([`crate::prereq::verify`]) for the
+//! files of the commit it runs (r4 §4.4, §6).
 
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
+use crate::check;
 use crate::exit::{Exit, Failure, Result};
+use crate::git::Checkout;
 use crate::platform::Platform;
 use crate::preflight::Context;
-use crate::runs::{Run, RunKind, StepStatus};
+use crate::prereq;
+use crate::runs::{self, Run, RunKind, StepStatus};
 use crate::settings::{PlatformRun, PlatformSettings, Settings};
 use crate::tree;
 
 /// The environment every step of a platform job gets (r4 §3.7).
 pub const STEP_ENV: &[(&str, &str)] = &[("NEXTEST_RETRIES", "0"), ("NEXTEST_FLAKY_RESULT", "fail")];
-
-/// Variables that make cargo bypass mbx (r4 §6).
-pub const MBX_BYPASS_VARS: &[&str] = &["MBX_DISABLE", "CARGO_TARGET_DIR", "RUSTC_WRAPPER"];
 
 /// What one platform job runs.
 #[derive(Debug, Clone)]
@@ -181,11 +182,10 @@ pub fn run_steps(ctx: &Context, run: &mut Run, job: &Job) -> Result<Ending> {
     Ok(Ending::Done(passed))
 }
 
-/// The full `atelier check` of the checkout (module 3.2); its own run, its own lock.
-pub fn full_check(_ctx: &Context) -> Result<Exit> {
-    Err(Failure::usage(
-        "the platform's run is \"check\": check: not built yet (module 3.2)",
-    ))
+/// The full `atelier check` of the checkout (module 3.2): its own run (kind `check`), its own
+/// lock, its own report.
+pub fn full_check(ctx: &Context) -> Result<Exit> {
+    check::run(ctx, false)
 }
 
 /// `<os>-<arch>` of the machine this program runs on, from `uname`.
@@ -219,144 +219,44 @@ pub fn uname_platform() -> std::result::Result<String, String> {
 }
 
 /// The machine preflight, one line per problem (the first is the `not ready` line): the
-/// platform from `uname` is the declared one; each declared tool that applies to the platform
-/// answers as expected; with `[prerequisites.mbx]`, nothing makes cargo bypass mbx, the first
-/// `cargo` on `PATH` is one of the listed files, no `PATH` entry is relative, mbx is the pinned
-/// version, and each workspace's `target` is absent or a link into mbx's storage.
-pub fn machine_problems(settings: &Settings, declared: Platform, root: &Path) -> Vec<String> {
-    let mut problems = Vec::new();
+/// platform from `uname` is the declared one, then the prerequisites of `atelier check`
+/// ([`prereq::verify`]: toolchains, nextest, declared tools, nextest files, mbx) for the files
+/// of `checkout` as they are.
+pub fn machine_problems(
+    checkout: &Checkout,
+    settings: &Settings,
+    declared: Platform,
+) -> Vec<String> {
     match uname_platform() {
         Ok(p) if p == declared.to_string() => {}
-        Ok(p) => problems.push(format!(
-            "uname says {p}; the machine is declared {declared}"
-        )),
-        Err(e) => problems.push(e),
-    }
-    for tool in &settings.prerequisites.tools {
-        let applies = tool
-            .platforms
-            .as_ref()
-            .is_none_or(|ps| ps.iter().any(|p| *p == declared.to_string()));
-        if !applies {
-            continue;
+        Ok(p) => {
+            return vec![format!(
+                "uname says {p}; the machine is declared {declared}"
+            )];
         }
-        match first_line(root, &tool.run) {
-            Ok(line) if line.starts_with(&tool.expect) => {}
-            Ok(line) => problems.push(format!(
-                "{}: `{}` printed {line:?}; expected it to start with {:?}",
-                tool.name,
-                tool.run.join(" "),
-                tool.expect
-            )),
-            Err(e) => problems.push(format!("{}: `{}` {e}", tool.name, tool.run.join(" "))),
-        }
+        Err(e) => return vec![e],
     }
-    if let Some(mbx) = &settings.prerequisites.mbx {
-        for var in MBX_BYPASS_VARS {
-            if std::env::var_os(var).is_some() {
-                problems.push(format!("{var} is set: it makes cargo bypass mbx; unset it"));
-            }
-        }
-        let path = std::env::var("PATH").unwrap_or_default();
-        if let Some(rel) = path.split(':').find(|p| !p.starts_with('/')) {
-            problems.push(format!("PATH has a relative entry {rel:?}"));
-        }
-        let listed: Vec<PathBuf> = mbx.cargo.iter().map(|c| expand_home(c)).collect();
-        match first_on_path(&path, "cargo") {
-            Some(found) if listed.contains(&found) => {}
-            Some(found) => problems.push(format!(
-                "the first cargo on PATH is {}; mbx needs one of: {}",
-                found.display(),
-                mbx.cargo.join(", ")
-            )),
-            None => problems.push("no cargo on PATH".to_owned()),
-        }
-        match first_line(root, &["mbx".to_owned(), "--version".to_owned()]) {
-            Ok(line) if line.split_whitespace().any(|w| w == mbx.version) => {}
-            Ok(line) => problems.push(format!(
-                "mbx --version printed {line:?}; the settings pin {}",
-                mbx.version
-            )),
-            Err(e) => problems.push(format!("mbx --version {e}")),
-        }
-        for ws in &settings.workspaces {
-            if let Some(p) = target_problem(root, ws) {
-                problems.push(p);
-            }
-        }
-    }
-    problems
-}
-
-/// A workspace's `target` must be absent or a link into mbx's storage: a real folder is plain
-/// cargo's, and mixing the two fails on Linux (r4 §6, E7).
-fn target_problem(root: &Path, ws: &str) -> Option<String> {
-    let target = root.join(ws).join("target");
-    let shown = Path::new(ws).join("target");
-    let meta = std::fs::symlink_metadata(&target).ok()?;
-    if !meta.file_type().is_symlink() {
-        return Some(format!(
-            "{} is a real folder that plain cargo made; mbx needs it absent or a link into its storage: rm -rf {}",
-            shown.display(),
-            target.display()
-        ));
-    }
-    let to = std::fs::read_link(&target).ok()?;
-    if to.components().any(|c| c.as_os_str() == "mbx") {
-        None
-    } else {
-        Some(format!(
-            "{} links to {}, which is not mbx's storage",
-            shown.display(),
-            to.display()
-        ))
-    }
-}
-
-/// `~/x` → `$HOME/x`.
-pub fn expand_home(p: &str) -> PathBuf {
-    match (p.strip_prefix("~/"), std::env::var_os("HOME")) {
-        (Some(rest), Some(home)) => PathBuf::from(home).join(rest),
-        _ => PathBuf::from(p),
-    }
-}
-
-/// The first executable file `name` in a `PATH` value.
-pub fn first_on_path(path: &str, name: &str) -> Option<PathBuf> {
-    use std::os::unix::fs::PermissionsExt;
-    path.split(':')
-        .filter(|d| !d.is_empty())
-        .map(|d| Path::new(d).join(name))
-        .find(|p| {
-            std::fs::metadata(p).is_ok_and(|m| m.is_file() && m.permissions().mode() & 0o111 != 0)
-        })
-}
-
-/// Runs a prerequisite command in `root` and returns the first line of its output (stdout, or
-/// stderr when stdout is empty).
-fn first_line(root: &Path, argv: &[String]) -> std::result::Result<String, String> {
-    let (program, args) = argv.split_first().ok_or("is empty")?;
-    let out = std::process::Command::new(program)
-        .args(args)
-        .current_dir(root)
-        .stdin(std::process::Stdio::null())
-        .output()
-        .map_err(|e| format!("cannot run: {e}"))?;
-    if !out.status.success() {
-        return Err(format!("failed ({})", out.status));
-    }
-    let text = if out.stdout.iter().all(u8::is_ascii_whitespace) {
-        out.stderr
-    } else {
-        out.stdout
+    let marker = match runs::new_run_id() {
+        Ok(m) => m,
+        Err(f) => return vec![f.message],
     };
-    Ok(String::from_utf8_lossy(&text)
-        .lines()
-        .next()
-        .unwrap_or("")
-        .trim()
-        .to_owned())
+    let workspaces = prereq::workspaces(checkout, settings, &marker);
+    match prereq::verify(checkout, settings, &workspaces, Some(declared), &marker) {
+        Ok(_) => Vec::new(),
+        Err(f) => {
+            let mut lines = f.message.lines();
+            let first = lines.next().unwrap_or_default();
+            if first == PREREQ_HEAD {
+                lines.map(|l| l.trim().to_owned()).collect()
+            } else {
+                vec![f.message.clone()]
+            }
+        }
+    }
 }
+
+/// The first line of [`prereq::verify`]'s refusal; the problems follow, one per line.
+const PREREQ_HEAD: &str = "prerequisites not met:";
 
 #[cfg(test)]
 mod tests {
@@ -371,66 +271,41 @@ mod tests {
     }
 
     #[test]
-    fn the_preflight_names_a_wrong_platform_and_a_wrong_tool() {
+    fn the_preflight_names_a_wrong_platform_and_each_prerequisite_problem() {
         let here = Platform::current().unwrap();
         let other = if here.to_string() == "linux-x86_64" {
             "macos-aarch64"
         } else {
             "linux-x86_64"
         };
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let g = |args: &[&str]| {
+            assert!(
+                std::process::Command::new("git")
+                    .args(args)
+                    .current_dir(root)
+                    .env("GIT_CONFIG_GLOBAL", "/dev/null")
+                    .status()
+                    .unwrap()
+                    .success()
+            )
+        };
+        g(&["init", "-q"]);
+        let checkout = Checkout::find(root).unwrap().unwrap();
         let settings = Settings::parse(&format!(
             "atelier = \"0.1.0\"\n[platforms.{here}]\nrun = \"check\"\n[platforms.{other}]\nrun = \"check\"\n\
              [[prerequisites.tools]]\nname = \"sh\"\nrun = [\"sh\", \"-c\", \"echo v1.2\"]\nexpect = \"v2.\"\n\
+             [[prerequisites.tools]]\nname = \"also\"\nrun = [\"sh\", \"-c\", \"echo v0\"]\nexpect = \"v1\"\n\
              [[prerequisites.tools]]\nname = \"elsewhere\"\nrun = [\"false\"]\nexpect = \"x\"\nplatforms = [\"{other}\"]\n"
         ))
         .unwrap();
-        let root = std::env::temp_dir();
-        let p = machine_problems(&settings, here, &root);
+        let p = machine_problems(&checkout, &settings, here);
+        assert_eq!(p.len(), 2, "{p:?}");
+        assert!(p[0].starts_with("tool sh: "), "{p:?}");
+        assert!(p[1].starts_with("tool also: "), "{p:?}");
+        let p = machine_problems(&checkout, &settings, Platform::parse(other).unwrap());
         assert_eq!(p.len(), 1, "{p:?}");
-        assert!(
-            p[0].starts_with("sh: `sh -c echo v1.2` printed \"v1.2\""),
-            "{p:?}"
-        );
-        let p = machine_problems(&settings, Platform::parse(other).unwrap(), &root);
         assert!(p[0].starts_with("uname says "), "{p:?}");
-        assert!(p.iter().any(|l| l.starts_with("elsewhere: ")), "{p:?}");
-    }
-
-    #[test]
-    fn a_real_target_folder_is_refused_and_an_mbx_link_is_not() {
-        let dir = tempfile::tempdir().unwrap();
-        let ws = dir.path().join("ws");
-        std::fs::create_dir_all(ws.join("target")).unwrap();
-        assert!(
-            target_problem(dir.path(), "ws")
-                .unwrap()
-                .contains("real folder")
-        );
-        std::fs::remove_dir(ws.join("target")).unwrap();
-        assert!(target_problem(dir.path(), "ws").is_none());
-        std::os::unix::fs::symlink("/home/u/.cache/mbx/targets/x", ws.join("target")).unwrap();
-        assert!(target_problem(dir.path(), "ws").is_none());
-        std::fs::remove_file(ws.join("target")).unwrap();
-        std::os::unix::fs::symlink("/elsewhere/x", ws.join("target")).unwrap();
-        assert!(
-            target_problem(dir.path(), "ws")
-                .unwrap()
-                .contains("not mbx's storage")
-        );
-    }
-
-    #[test]
-    fn first_on_path_skips_folders_without_the_program() {
-        let dir = tempfile::tempdir().unwrap();
-        let a = dir.path().join("a");
-        let b = dir.path().join("b");
-        std::fs::create_dir_all(&a).unwrap();
-        std::fs::create_dir_all(&b).unwrap();
-        let tool = b.join("cargo");
-        std::fs::write(&tool, "#!/bin/sh\n").unwrap();
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(&tool, std::fs::Permissions::from_mode(0o755)).unwrap();
-        let path = format!("{}:{}", a.display(), b.display());
-        assert_eq!(first_on_path(&path, "cargo"), Some(tool));
     }
 }

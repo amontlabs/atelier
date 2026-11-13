@@ -27,7 +27,44 @@ pub const FILES: &[(&str, &[u8])] = &[
         "rust-toolchain.toml",
         include_bytes!("../rust-toolchain.toml"),
     ),
+    (
+        "assets/rules/ORCHESTRATOR.md",
+        include_bytes!("../assets/rules/ORCHESTRATOR.md"),
+    ),
+    (
+        "assets/rules/WORKER.md",
+        include_bytes!("../assets/rules/WORKER.md"),
+    ),
+    (
+        "assets/rules/agents-block.md",
+        include_bytes!("../assets/rules/agents-block.md"),
+    ),
+    (
+        "assets/tasks/build.md",
+        include_bytes!("../assets/tasks/build.md"),
+    ),
+    (
+        "assets/tasks/gui.md",
+        include_bytes!("../assets/tasks/gui.md"),
+    ),
+    (
+        "assets/tasks/judge.md",
+        include_bytes!("../assets/tasks/judge.md"),
+    ),
+    (
+        "assets/tasks/review-fixes.md",
+        include_bytes!("../assets/tasks/review-fixes.md"),
+    ),
+    (
+        "assets/tasks/review.md",
+        include_bytes!("../assets/tasks/review.md"),
+    ),
+    (
+        "assets/tasks/scout.md",
+        include_bytes!("../assets/tasks/scout.md"),
+    ),
     src_file!("src/agents.rs", "agents.rs"),
+    src_file!("src/check.rs", "check.rs"),
     src_file!("src/cli.rs", "cli.rs"),
     src_file!("src/dispatch.rs", "dispatch.rs"),
     src_file!("src/exit.rs", "exit.rs"),
@@ -39,8 +76,10 @@ pub const FILES: &[(&str, &[u8])] = &[
     src_file!("src/machines.rs", "machines.rs"),
     src_file!("src/main.rs", "main.rs"),
     src_file!("src/names.rs", "names.rs"),
+    src_file!("src/nextest.rs", "nextest.rs"),
     src_file!("src/platform.rs", "platform.rs"),
     src_file!("src/preflight.rs", "preflight.rs"),
+    src_file!("src/prereq.rs", "prereq.rs"),
     src_file!("src/procs.rs", "procs.rs"),
     src_file!("src/records.rs", "records.rs"),
     src_file!("src/refs.rs", "refs.rs"),
@@ -52,6 +91,8 @@ pub const FILES: &[(&str, &[u8])] = &[
     src_file!("src/signals.rs", "signals.rs"),
     src_file!("src/source.rs", "source.rs"),
     src_file!("src/state.rs", "state.rs"),
+    src_file!("src/task.rs", "task.rs"),
+    src_file!("src/template.rs", "template.rs"),
     src_file!("src/testcmd.rs", "testcmd.rs"),
     src_file!("src/tree.rs", "tree.rs"),
 ];
@@ -126,6 +167,7 @@ mod tests {
                 "ls-files",
                 "--",
                 "src",
+                "assets",
                 "Cargo.toml",
                 "Cargo.lock",
                 "rust-toolchain.toml",

@@ -4,23 +4,29 @@
 //!
 //! 1. **Probe** (plain ssh, `ConnectTimeout`): no answer is `offline`. The pinned atelier must be
 //!    installed there, built from this binary's own source ([`crate::source::identity`]); its
-//!    `remote-run probe` checks the platform from `uname`, the project's checkout, the machine
-//!    preflight with this checkout's settings (sent on stdin), and the machine lock (`busy`).
+//!    `remote-run probe` checks the platform from `uname`, the project's checkout, and whether
+//!    the machine lock is held (`busy`, read from the holder file without taking the lock).
 //! 2. **Push** the commit over ssh into the machine's checkout for the project, to
 //!    `refs/atelier/test`. Nothing goes to GitHub.
 //! 3. **Session**: `ssh -tt` runs `remote-run run`, with `PATH` set to exactly the machine's
-//!    `path`. It preflights again from the pushed commit's settings, takes the machine lock,
-//!    requires a clean checkout (unknown files are listed, never deleted), checks the commit
-//!    out, and runs the job. Its input is the terminal: when the connection goes, the session
+//!    `path`. It takes the machine lock, requires a clean checkout (unknown files are listed,
+//!    never deleted) and no git-ignored file in the checkout's way, checks the commit out,
+//!    requires the files to be exactly the commit's tree, runs the machine preflight (the
+//!    prerequisites of `check`) on them, and runs the job. Its input is the terminal: when the connection goes, the session
 //!    gets a hang-up and the remote atelier also sees end-of-input; either way it stops its
 //!    group and writes `connection lost`. ssh runs with `ServerAliveInterval=5` and
 //!    `ServerAliveCountMax=3`, so a connection that dies silently is noticed here in about 15 s.
 //!    The terminal carries the logs and the protocol lines, each marked with a per-session
 //!    nonce so that a step's output cannot forge one.
 //! 4. **Verdict**: each run's `result` file, read with a second ssh. A session that ended
-//!    without its `done` line is `connection lost` (exit 3), never a pass.
+//!    without its `done` line is `connection lost` (exit 3), never a pass. A pass needs at least
+//!    one run, and every run's result must name the commit and its tree, with no uncommitted
+//!    change: anything else is FAIL, "tested a different tree".
 //!
-//! Remote commands are run as `exec /bin/sh -c '<script>'`, so any login shell works.
+//! Every remote command is [`remote_command`]: `exec /bin/sh -c '<decoder>'`, where the script
+//! travels as octal escapes that `printf %b` turns back into text. The line has no newline, `!`,
+//! `'` in the quoted part or `\\` pair, so sh, bash, zsh, csh, tcsh and fish all pass it unchanged to
+//! `/bin/sh`; the probe checks that it did.
 //! `ATELIER_SSH` replaces the `ssh` program (the tests use a stand-in that runs the command on
 //! this computer).
 
@@ -62,6 +68,30 @@ pub fn tag(nonce: &str) -> String {
 /// A shell word that is exactly `s`.
 pub fn sq(s: &str) -> String {
     format!("'{}'", s.replace('\'', "'\\''"))
+}
+
+/// The command line ssh hands to the login shell for `script`: `exec /bin/sh -c '<decoder>'`.
+///
+/// Inside the single quotes there is no `'`, `!`, newline or `\\` pair, so every common login
+/// shell passes the text to `/bin/sh` unchanged: csh and tcsh expand `!` and reject newlines
+/// even inside single quotes, and fish reads `\\` and `\'` there as escapes. `/bin/sh` then
+/// rebuilds the script with `printf %b` (letters, digits and `_./,:=+@-` and spaces as they
+/// are; every other byte as `\0ooo`) and evaluates it.
+pub fn remote_command(script: &str) -> String {
+    let mut enc = String::with_capacity(script.len() * 2);
+    for b in script.bytes() {
+        if b.is_ascii_alphanumeric()
+            || matches!(
+                b,
+                b' ' | b'_' | b'.' | b'/' | b',' | b':' | b'=' | b'+' | b'@' | b'-'
+            )
+        {
+            enc.push(char::from(b));
+        } else {
+            enc.push_str(&format!("\\0{b:03o}"));
+        }
+    }
+    format!("exec /bin/sh -c 'eval \"$(printf \"%b\" \"{enc}\")\"'")
 }
 
 /// A shell word for a path that may start with `~/`, expanded with the machine's `$HOME`.
@@ -132,6 +162,17 @@ pub enum Probe {
     Busy(String),
 }
 
+/// What `machines init` found installed there and did.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Installed {
+    /// Swapped in; the folder it replaced, kept, if any.
+    Done(Option<String>),
+    /// The machine lock is held.
+    Busy(String),
+    /// Another install replaced the one this computer saw before the build.
+    Changed(String),
+}
+
 /// How a session ended, seen from here.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Verdict {
@@ -184,7 +225,7 @@ impl Remote {
         .collect()
     }
 
-    /// `ssh [-tt] <options> <destination> exec /bin/sh -c '<script>'`.
+    /// `ssh [-tt] <options> <destination> <remote_command(script)>`.
     fn ssh(&self, tty: bool, script: &str) -> Command {
         let mut cmd = Command::new(Self::ssh_program());
         if tty {
@@ -193,7 +234,7 @@ impl Remote {
         cmd.args(self.options())
             .arg("--")
             .arg(self.dest())
-            .arg(format!("exec /bin/sh -c {}", sq(script)));
+            .arg(remote_command(script));
         cmd
     }
 
@@ -233,24 +274,28 @@ impl Remote {
         )
     }
 
-    /// Connects, checks what can be checked without the commit, and the machine lock.
-    pub fn probe(&self, platform: &str, settings_text: &str) -> Probe {
+    /// Connects, checks what can be checked without the commit, and whether the machine lock is
+    /// held. The tool prerequisites depend on the commit's files and are checked when a run
+    /// starts there.
+    pub fn probe(&self, platform: &str) -> Probe {
         let nonce = new_nonce();
-        let script = self.atelier_script(
-            &nonce,
-            &[
-                "probe".into(),
-                "--name".into(),
-                self.name.clone(),
-                "--platform".into(),
-                platform.into(),
-                "--checkout".into(),
-                self.checkout.clone(),
-                "--nonce".into(),
-                nonce.clone(),
-            ],
-        );
-        let out = match run_with_input(self.ssh(false, &script), settings_text.as_bytes()) {
+        let shell_ok = format!("printf '%s\\n' {}; ", sq(&format!("{}sh", tag(&nonce))));
+        let script = shell_ok
+            + &self.atelier_script(
+                &nonce,
+                &[
+                    "probe".into(),
+                    "--name".into(),
+                    self.name.clone(),
+                    "--platform".into(),
+                    platform.into(),
+                    "--checkout".into(),
+                    self.checkout.clone(),
+                    "--nonce".into(),
+                    nonce.clone(),
+                ],
+            );
+        let out = match self.ssh(false, &script).stdin(Stdio::null()).output() {
             Ok(o) => o,
             Err(e) => return Probe::Offline(format!("cannot run ssh: {e}")),
         };
@@ -258,6 +303,15 @@ impl Remote {
             return Probe::Offline(last_line(&out.stderr));
         }
         let lines = protocol_lines(&out.stdout, &nonce);
+        if !lines.iter().any(|l| l == "sh") {
+            return Probe::NotReady(format!(
+                "its login shell did not run atelier's command (exec /bin/sh -c '…'){}: atelier needs a login shell that does (sh, bash, zsh, csh, tcsh, fish)",
+                match last_line(&out.stderr) {
+                    s if s.is_empty() => String::new(),
+                    s => format!(": {s}"),
+                }
+            ));
+        }
         let mut identity = None;
         for l in &lines {
             if let Some(id) = l.strip_prefix("identity ") {
@@ -333,14 +387,16 @@ impl Remote {
             nonce.clone(),
             "--commit".into(),
             commit.into(),
-            "--dir".into(),
-            if job.rel.as_os_str().is_empty() {
-                ".".into()
-            } else {
-                job.rel.to_string_lossy().into_owned()
-            },
         ];
         if let Some(c) = &job.command {
+            args.push(format!(
+                "--dir={}",
+                if job.rel.as_os_str().is_empty() {
+                    ".".into()
+                } else {
+                    job.rel.to_string_lossy()
+                }
+            ));
             args.push("--".into());
             args.extend(c.iter().cloned());
         }
@@ -481,6 +537,23 @@ impl Remote {
         Ok(format!("{os}-{arch}"))
     }
 
+    /// Whether the project's checkout exists there.
+    pub fn has_checkout(&self) -> std::result::Result<bool, String> {
+        let script = format!(
+            "if [ -d {d}/.git ]; then echo exists; else echo missing; fi",
+            d = shell_path(&self.checkout)
+        );
+        let out = self
+            .ssh(false, &script)
+            .stdin(Stdio::null())
+            .output()
+            .map_err(|e| format!("cannot run ssh: {e}"))?;
+        if !out.status.success() {
+            return Err(last_line(&out.stderr));
+        }
+        Ok(String::from_utf8_lossy(&out.stdout).trim() == "exists")
+    }
+
     /// Creates the project's checkout there if missing: `created` or `exists`.
     pub fn create_checkout(&self) -> std::result::Result<String, String> {
         let script = format!(
@@ -516,34 +589,39 @@ impl Remote {
         Ok((!text.is_empty()).then_some(text))
     }
 
-    /// Builds this binary's own source there with cargo and installs it at
-    /// `~/.local/share/atelier/<version>/`, replacing an install of other source. cargo's output
-    /// goes to this program's stderr.
-    pub fn install(&self) -> std::result::Result<(), String> {
+    /// Builds this binary's own source there with cargo into a new folder, then has the new
+    /// program swap it in at `~/.local/share/atelier/<version>/` under the machine lock
+    /// (`remote-run install`), provided the install there is still `expect` (`None`: none). A
+    /// replaced folder is kept beside it, never deleted. cargo's output goes to this program's
+    /// stderr.
+    pub fn install(&self, expect: Option<&str>) -> std::result::Result<Installed, String> {
+        let nonce = new_nonce();
         let script = format!(
             "set -e\n\
              root=\"$HOME/.local/share/atelier\"\n\
              v={v}\n\
              mkdir -p \"$root\"\n\
              src=$(mktemp -d \"${{TMPDIR:-/tmp}}/atelier-src.XXXXXX\")\n\
-             trap 'rm -rf \"$src\"' EXIT\n\
-             tar -xf - -C \"$src\"\n\
              new=\"$root/.$v.new.$$\"\n\
-             rm -rf \"$new\"\n\
+             trap 'rm -rf \"$src\" \"$new\"' EXIT\n\
+             tar -xf - -C \"$src\"\n\
              cd \"$src\"\n\
              {path}export PATH\n\
-             MBX_DISABLE=1 CARGO_TARGET_DIR=\"$src/target\" cargo install --locked --quiet --path . --root \"$new\"\n\
+             MBX_DISABLE=1 CARGO_TARGET_DIR=\"$src/target\" cargo install --locked --quiet --path . --root \"$new\" >&2\n\
              rm -f \"$new/.crates.toml\" \"$new/.crates2.json\"\n\
-             if [ -e \"$root/$v\" ]; then old=\"$root/.$v.old.$$\"; mv \"$root/$v\" \"$old\"; mv \"$new\" \"$root/$v\"; rm -rf \"$old\"; else mv \"$new\" \"$root/$v\"; fi\n",
+             trap 'rm -rf \"$src\"' EXIT\n\
+             ATELIER_DISPATCHED=1 \"$new/bin/atelier\" remote-run install --from \"$new\" --expect {expect} --nonce {nonce}\n",
             v = sq(VERSION),
             path = match self.path_assignment() {
                 p if p.is_empty() => String::new(),
                 p => format!("{}\n", p.trim_end()),
             },
+            expect = sq(expect.unwrap_or("none")),
+            nonce = sq(&nonce),
         );
         let mut cmd = self.ssh(false, &script);
         cmd.stdin(Stdio::piped())
-            .stdout(Stdio::inherit())
+            .stdout(Stdio::piped())
             .stderr(Stdio::inherit());
         let mut child = cmd.spawn().map_err(|e| format!("cannot run ssh: {e}"))?;
         let archive = source::tar();
@@ -551,13 +629,35 @@ impl Remote {
         let writer = std::thread::spawn(move || {
             let _ = stdin.write_all(&archive);
         });
-        let status = child.wait().map_err(|e| e.to_string())?;
+        let out = child.wait_with_output().map_err(|e| e.to_string())?;
         let _ = writer.join();
-        if status.success() {
-            Ok(())
-        } else {
-            Err(format!("the build there failed (ssh exit {status})"))
+        let t = tag(&nonce);
+        let text = String::from_utf8_lossy(&out.stdout);
+        for line in text.lines() {
+            if !line.starts_with(&t) {
+                eprintln!("{line}");
+            }
         }
+        for l in protocol_lines(&out.stdout, &nonce) {
+            if let Some(kept) = l.strip_prefix("installed") {
+                let kept = kept.trim();
+                return Ok(Installed::Done((!kept.is_empty()).then(|| kept.to_owned())));
+            } else if let Some(h) = l.strip_prefix("busy") {
+                return Ok(Installed::Busy(h.trim().to_owned()));
+            } else if let Some(id) = l.strip_prefix("changed ") {
+                return Ok(Installed::Changed(id.to_owned()));
+            } else if let Some(e) = l.strip_prefix("error ") {
+                return Err(format!("the install there failed: {e}"));
+            }
+        }
+        Err(format!(
+            "the build there failed (ssh exit {}{})",
+            out.status,
+            match last_line(&out.stderr) {
+                s if s.is_empty() => String::new(),
+                s => format!(": {s}"),
+            }
+        ))
     }
 }
 
@@ -587,6 +687,7 @@ enum Event {
 #[derive(Debug)]
 pub enum Start {
     Taken,
+    Refused(String),
     NotReady(String),
     Busy(String),
     Offline(String),
@@ -602,6 +703,8 @@ impl Session {
             Event::Status(s) => {
                 if s == "taken" {
                     Some(Start::Taken)
+                } else if let Some(r) = s.strip_prefix("refused ") {
+                    Some(Start::Refused(r.to_owned()))
                 } else if let Some(r) = s.strip_prefix("not-ready ") {
                     Some(Start::NotReady(r.to_owned()))
                 } else if let Some(h) = s.strip_prefix("busy") {
@@ -672,8 +775,9 @@ impl Session {
     }
 
     /// Waits for the session to end and reads the verdict. A stop signal here closes the
-    /// connection, which stops the remote run.
-    pub fn finish(mut self) -> SessionEnd {
+    /// connection, which stops the remote run. A pass needs at least one run, each recording
+    /// `commit`, its `tree` and no uncommitted change.
+    pub fn finish(mut self, commit: &str, tree: &str) -> SessionEnd {
         let mut stopped = false;
         let ssh_status = loop {
             while let Ok(ev) = self.events.try_recv() {
@@ -760,6 +864,16 @@ impl Session {
                 });
             }
             Verdict::ConnectionLost
+        } else if ids.is_empty() {
+            failures.push(format!("{name}: the session reported no run"));
+            Verdict::Failed
+        } else if let Some(line) = ids
+            .iter()
+            .zip(&results)
+            .find_map(|(id, r)| different_tree(id, r.as_ref()?, commit, tree))
+        {
+            failures.push(format!("{name}: {line}"));
+            Verdict::Failed
         } else if results.iter().all(|r| {
             r.as_ref()
                 .is_some_and(|r| r.outcome == crate::runs::Outcome::Passed)
@@ -774,6 +888,22 @@ impl Session {
             failures,
         }
     }
+}
+
+/// `tested a different tree: …` when a remote result does not record `commit`, `tree` and no
+/// uncommitted change.
+pub fn different_tree(id: &str, r: &RunResult, commit: &str, tree: &str) -> Option<String> {
+    let same = r.commit.as_deref() == Some(commit)
+        && r.tree.as_deref() == Some(tree)
+        && r.uncommitted == Some(false);
+    (!same).then(|| {
+        format!(
+            "tested a different tree: run {id} recorded commit {}, tree {}, uncommitted {}; this computer's HEAD is {commit}, tree {tree}",
+            r.commit.as_deref().unwrap_or("none"),
+            r.tree.as_deref().unwrap_or("none"),
+            r.uncommitted.map_or("unknown".to_owned(), |u| u.to_string()),
+        )
+    })
 }
 
 /// The connection was lost when the session ended without `done`, when ssh itself failed (exit
@@ -796,12 +926,11 @@ fn connection_lost(
 pub fn attempt(
     remote: &Remote,
     checkout: &Checkout,
-    settings_text: &str,
     job: &Job,
     commit: &str,
     log: &Path,
 ) -> Attempt<Session> {
-    match remote.probe(&job.platform.to_string(), settings_text) {
+    match remote.probe(&job.platform.to_string()) {
         Probe::Ready => {}
         Probe::Offline(d) => return Attempt::Offline(d),
         Probe::NotReady(l) => return Attempt::NotReady(l),
@@ -816,6 +945,7 @@ pub fn attempt(
     };
     match session.wait_start() {
         Start::Taken => Attempt::Taken(session),
+        Start::Refused(l) => Attempt::Refused(l),
         Start::NotReady(l) => Attempt::NotReady(l),
         Start::Busy(h) => Attempt::Busy(h),
         Start::Offline(d) => Attempt::Offline(d),
@@ -842,22 +972,6 @@ fn last_line(bytes: &[u8]) -> String {
         .rfind(|l| !l.is_empty())
         .unwrap_or("")
         .to_owned()
-}
-
-/// Runs `cmd` with `input` on its stdin and collects its output.
-fn run_with_input(mut cmd: Command, input: &[u8]) -> std::io::Result<std::process::Output> {
-    cmd.stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
-    let mut child = cmd.spawn()?;
-    let mut stdin = child.stdin.take().expect("piped");
-    let data = input.to_vec();
-    let writer = std::thread::spawn(move || {
-        let _ = stdin.write_all(&data);
-    });
-    let out = child.wait_with_output();
-    let _ = writer.join();
-    out
 }
 
 /// The folder a remote run's stream is kept in, inside this computer's run folder.
