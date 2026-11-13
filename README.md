@@ -70,6 +70,7 @@ The other commands (`merge`, `tmp`/`clean`, `status`) come in later modules.
 | `jobs` | a platform's job (preparation, command or run) and the machine preflight |
 | `remote`, `remote_run` | this computer's side of a remote run over ssh, and the machine's side (`remote-run`) |
 | `source` | the program's own source, embedded, for `machines init` to build on another machine |
+| `exchange` | exchanging two folders in one step (the install swap), also compiled on its own as `machines init`'s probe |
 
 ## Dependencies
 

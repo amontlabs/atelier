@@ -21,7 +21,9 @@ the platform, and a machine without the GUI the platform needs, is named in its 
 preflight, machine lock; skips are `offline`, `not ready: <line>`, `busy`. If none takes the run
 and at least one was only busy, atelier waits, retrying the busy ones in order every 5 s, and
 takes the first that frees; one that turns offline or not ready is dropped. Otherwise exit 3,
-each machine listed with its reason.
+each machine listed with its reason. A remote machine can also turn out not ready after its
+session started (a missing prerequisite, files in the way of its checkout): it is passed over
+like a probe failure, and the next machine is tried, also after a wait.
 
 The machine lock is `~/.local/state/atelier/machine.lock` (`flock`), with `machine.holder`
 naming the holder for messages. It is held by the atelier that runs the steps: `test` on this
@@ -50,15 +52,20 @@ then the command (in the caller's folder relative to the checkout root) or the p
 each preparation step and at the end; a change fails the run. When the platform's `run` is
 `"check"`, the job's run holds only the platform's `prepare` and then the full `atelier check`
 runs as its own run (kind `check`, `check::run`), on this computer or on the machine; its
-`check.prepare` hooks run inside the check.
+`check.prepare` hooks run inside the check. The job's run is the platform's record: it is
+finished with the check as its follow-up (`Run::finish_after`), so its `result` is written only
+after the check, with the check's outcome (`failed`, "atelier check failed (run <id>)", when the
+check is RED), and its folder names the check's run in `check-run`. Until then the run has no
+result, so no reader takes it for a pass. The same holds on a remote machine.
 
 Final line: `linux-x86_64: PASS on linux-box (mac-mini offline) · macos-aarch64: PASS on mac (local)`;
-otherwise `FAIL`, `connection lost`, `no machine available`, `INTERRUPTED`, `REFUSED` (a machine
-refused the run: files in its checkout the owner must move) or `ERROR` (the platform could not
-run; the error is printed). The line is always printed, also after an error in one platform of
-`--all`. Exit: 1 if the tree changed or any platform failed or was interrupted, else an
-error's own code, else 4 if a machine refused, else 3 if any had no machine or lost its
-connection, else 0.
+otherwise `FAIL`, `connection lost`, `no machine available`, `INTERRUPTED` or `ERROR` (the
+platform could not run; the error is printed). The line is always printed, also after an error
+in one platform of `--all`. Exit: 1 if the tree changed or any platform failed or was
+interrupted, else an error's own code, else 3 if any had no machine or lost its connection,
+else 0. Exit 4 is for the caller's own tree (uncommitted changes, a folder not in the commit),
+before any machine is tried; a problem of one machine's checkout makes that machine `not
+ready`, and the next one runs.
 
 A stop signal (Ctrl-C) while machines are tried ends the choice: no further machine is
 probed, pushed to or started.
@@ -72,31 +79,39 @@ probed, pushed to or started.
    init`), checks the platform from `uname` and the checkout, and whether the machine lock is
    held: it reads `machine.holder` (a live process with the recorded start time) and never
    takes the lock, so a look never makes a real run elsewhere find the machine busy. The tool
-   prerequisites depend on the commit's files, so they are checked when the run starts.
+   prerequisites depend on the commit's files, so they are checked when the run starts; for
+   that reason `atelier machines` says `ready (prerequisites checked at run time)` for a remote
+   machine. Each machine that turns out not ready then also cost a push and a session.
 2. **Push**: `git push --no-verify --receive-pack='git receive-pack' <host>:<checkout>
    +<commit>:refs/atelier/test`, through the same ssh options. Nothing goes to GitHub.
 3. **Session**: `ssh -tt` with `ServerAliveInterval=5`, `ServerAliveCountMax=3`, running
    `env PATH=<exactly the machine's path> ATELIER_DISPATCHED=1 <pinned atelier> remote-run run`.
    `--dir=<folder>` is passed for narrow runs only. On the machine: platform; checkout; the
    commit arrived; machine lock (`busy`); the checkout clean (`git status`; changes and unknown
-   files are listed, never deleted: `not ready`); no git-ignored file in the checkout's way
-   (below; `refused`); `git checkout --detach <commit>`; the files are exactly the commit's tree
-   (the tree id of every non-ignored file equals `<commit>^{tree}`; otherwise `refused`, listing
-   the files: an ignored file the commit no longer ignores); the command preflight; the machine
-   preflight on the commit's files; the checkout's run lock (an earlier run's processes make it
-   not ready); then `taken` and the job.
+   files are listed, never deleted: `not ready`); `git checkout --no-overwrite-ignore --detach
+   <commit>` (below); the files are exactly the commit's tree (the tree id of every
+   non-ignored file equals `<commit>^{tree}`; otherwise the checkout goes back to where it was
+   and the machine is `not ready`, listing the files: an ignored file the commit no longer
+   ignores); the command preflight; the machine preflight on the commit's files; the checkout's
+   run lock (an earlier run's processes make it not ready); then `taken` and the job. Every
+   failure before `taken` is `not ready`, and the caller tries its next machine.
 
-   **Ignored files in the way.** Git overwrites or removes ignored files when a checkout needs
-   their place. Before checking out, for every path the commit adds or changes against the
-   checkout's `HEAD` (every path when there is none): an untracked file or link at that path,
-   an untracked file or link where one of its parent folders would go, and the ignored files
-   inside a folder at that path (the checkout would replace the folder by a file) are listed,
-   and the run is refused (exit 4). Nothing is deleted; the owner moves them.
+   **Files in the way.** A plain `git checkout` overwrites or removes ignored files when it
+   needs their place. With `--no-overwrite-ignore` git refuses instead, before it changes
+   anything, and names each path ("untracked working tree files would be overwritten", or
+   "Updating the following directories would lose untracked files in them"); atelier lists
+   them in the `not ready` line and deletes nothing. git decides what is in the way, with its own
+   rules for folders that a file replaces, ignored folders inside ignored folders, nested
+   repositories, links, and volumes that ignore case (`core.ignorecase`: a tracked `Build` is in
+   the way of an ignored `build/`, and a rename of `Foo` to `foo` is an ordinary checkout).
+   Checked with git 2.50.1 (macOS, APFS) and 2.53.0 (the Linux test machine, an ext4-family filesystem). A refused
+   checkout, and one sent back after the tree check, leaves `HEAD`, the index and every file as
+   they were, so the same machine gives the same answer until its owner moves the files.
 4. **Watcher**: the remote atelier reads its terminal, which this computer never writes. On
    end-of-input or a read error it sends itself `SIGHUP`, so the run stops its group (TERM,
    grace, KILL) as for the terminal's own hang-up, and the result says `connection lost`.
 5. **Stream**: the terminal carries the step logs and protocol lines marked with a per-session
-   nonce (`taken`, `run <id>`, `done`, `not-ready`, `refused`, `busy`, `error`). The runs
+   nonce (`taken`, `run <id>`, `done`, `not-ready`, `busy`, `error`). The runs
    announced are the one `remote-run` started (by its id) and the `check` run it started (same
    pid and the same process start time), never a run folder that only shares the pid.
 6. **Verdict**: each run's `result`, read with a second ssh. No `done`, an ssh that died (exit
@@ -116,6 +131,17 @@ first prints a marker; a login shell that does not run it makes the machine `not
 `checkouts` may not contain `!`, quotes or backslashes (git's own push command passes it
 through the login shell). `ATELIER_SSH` replaces the `ssh` program (used by the tests).
 
+**How long a narrow command can be.** The encoding writes each byte other than letters, digits
+and `_./,:=+@-` and spaces as 5 characters, and ssh passes the whole line to the login shell as
+one argument. Linux limits one argument to 128 KiB (`MAX_ARG_STRLEN`), so a narrow `--
+<command>` of about 26 KB of quotes and brackets (about 128 KB of plain words) is too long: the
+login shell cannot start, and each remote machine is `not ready: remote-run ended without a
+status: … Argument list too long`. This limit is kept, not worked around. The session's input
+cannot carry the command: it is a terminal (`ssh -tt`, line-length limits and echo in its
+line discipline) and the watcher reads it to notice a lost connection. A file pushed with the
+commit would change the tested tree, and a separate upload would add a fourth connection and a
+cleanup. A narrow command is a test filter or a short script, far below the limit.
+
 ## Machine preflight
 
 `jobs::machine_problems`: the platform from `uname`, then `atelier check`'s own prerequisites
@@ -133,16 +159,35 @@ Creates the project's checkout there (`git init`) and installs the pinned atelie
 `~/.local/share/atelier/<version>/`, nothing else. A local machine needs nothing. It prints its
 plan first (the checkout: exists or created; atelier: installed already, installed, or which
 install it replaces). That folder is also the one the machine's own projects run through the
-dispatcher, so replacing an install of other source needs `--yes` (exit 4 without it, nothing
-changed).
+dispatcher, so replacing what is there needs `--yes` (exit 4 without it, nothing changed).
+
+**What counts as an install.** One rule, applied by this computer for the plan (in shell) and by
+the new program before it swaps (`remote_run::install_state`): nothing at the version's path is
+`none`; else the identity its `bin/atelier remote-run identity` prints; else, when that program
+is missing, not executable, a broken link, fails or prints nothing, `broken`. A broken install
+(an interrupted install leaves one) is named in the plan as such and replaced with `--yes`, like
+an install of other source.
 
 The build goes into a new folder beside it. The newly built program then swaps it in with
 `remote-run install`: it takes the machine lock (a run in progress makes `init` exit 3, busy,
-nothing replaced), checks that the installed program is still the one the plan named, and
-exchanges the two folders in one atomic step (`renamex_np(RENAME_SWAP)` on macOS,
-`renameat2(RENAME_EXCHANGE)` on Linux), so there is no moment without an install. The replaced
-folder is kept as `.<version>.replaced-<time>-<pid>` beside it, never deleted, since a program
-may still run from it; the owner removes it.
+nothing replaced), checks that the install is still what the plan saw, and exchanges the two
+folders in one atomic step (`src/exchange.rs`: `renamex_np(RENAME_SWAP)` on macOS,
+`renameat2(RENAME_EXCHANGE)` on Linux), so there is no moment without an install. On Linux the
+`renameat2` call needs **glibc 2.28 or newer** (2018); an older glibc cannot link the program.
+The replaced folder is kept as `.<version>.replaced-<time>-<pid>` beside it, since a program may
+still run from it; older replaced folders of the same version are removed then, under the
+machine lock, so at most one is kept. If the kept folder cannot be renamed after the exchange,
+the old install stays under the new folder's name, and `init` prints where: after the exchange
+nothing is removed.
+
+**No exchange, no replacement.** Some filesystems cannot exchange two folders (NFS, SMB, exFAT,
+some older Linux filesystems). There is no fallback: two plain renames would leave a moment
+without an install, or a half-done state if the second fails. When an install is to be
+replaced, the install script first compiles `src/exchange.rs` on its own (`rustc`, which every
+Rust install has; the file needs no crate) and runs it on `~/.local/share/atelier`: it exchanges
+two empty folders it creates there and removes them. If that fails, `init` exits 4 before the
+build, naming the error, and nothing is built or changed; the owner moves the old folder away
+(then it is a fresh install, a plain rename) or keeps the install folder on a local filesystem.
 
 The install builds there from **this binary's own source**, embedded in it (`source.rs`: every
 file `cargo install --path` needs, kept equal to the tracked source by a test), sent as a tar
@@ -168,26 +213,50 @@ project's code should not be in `machines.toml`. Likewise `rust-toolchain.toml` 
 compiler only where rustup reads it; without rustup the build uses whatever `rustc` is on the
 machine's `path`, and the identity is still equal.
 
+## Known limits
+
+- **A file changed and changed back during a local run passes.** On this computer the job runs
+  in the worktree itself. The tree is compared after the machine is taken, at the start and end
+  of the steps, and at the end of `test`; a file changed after one comparison and restored before
+  the next is not seen, and the run can pass although the commit's files would fail. Every
+  result is written before the last comparison, which can only turn the exit RED. A detached
+  `git worktree` at the commit would close this gap; it is not built. On a remote machine the
+  checkout is atelier's own; a local edit during a remote run makes the whole result RED, which
+  errs on the safe side.
+- **A narrow command's length**: see "The command line".
+
 ## Tests
 
 - Unit (`machines.rs`): candidates by priority, by project order, the GUI filter, skips named,
   the busy-only wait, the first busy machine that frees, a waited machine going offline, a stop
-  while waiting or during an attempt, a refusal ending the choice, a leading `-` in a name, the
-  machine lock and reading its holder without it. `remote.rs`: the command line through every
-  login shell found here, the tree check of a result. `remote_run.rs`: ignored files in the
-  checkout's way (added, replaced folder, link parent, no `HEAD`), the install swap under the
-  lock, run ids in the stream. `jobs.rs`, `source.rs` helpers.
+  while waiting or during an attempt, a machine whose checkout is in the way passed over, a
+  leading `-` in a name, the machine lock and reading its holder without it. `remote.rs`: the
+  command line through every login shell found here, the tree check of a result.
+  `remote_run.rs`: the checkout refusing every layout of the 3.6 review (an ignored file, an
+  ignored folder that becomes a file, a folder inside an ignored folder, an ignored nested
+  repository, a link to a folder outside, an ignored file in a tracked folder, no `HEAD`) with
+  everything unchanged and the same answer twice, case-only differences on the volume at hand,
+  files no longer ignored sending the checkout back (also without a commit), the install rule
+  (none, identity, broken), the swap under the lock with one replaced folder kept, the old
+  install kept when its rename fails, the exchange probe compiled on its own, run ids in the
+  stream. `jobs.rs`, `source.rs` helpers.
 - Integration (`tests/machines.rs`): this computer has no ssh server, so remote machines are
   played by `tests/fixtures/fake-ssh`, which runs the command here in the machine's own HOME
   with a fresh environment and relays stdin and stdout, so killing it ends the remote side's
   input as a cut connection does. It covers `machines`, `machines init` (with the binary under
   test pre-installed; its plan and the `--yes` refusal), pass, fail, the caller's folder, the
   order of preparation, tree changes (by a step, while waiting, during a remote run, a moved
-  `HEAD`), an unclean remote checkout, ignored files in the way, a remote tree that is not the
-  commit's, a result for another tree, a session without runs, refusals, a folder not in the
-  commit, exit 3, busy, waiting, a stale remote atelier, a killed connection, a tcsh login
-  shell and one that cannot run the command, a leading `-` in a machine name, `--all` after an
-  error, and `run = "check"` here and on a machine.
+  `HEAD`), an unclean remote checkout, files in the way (not ready, the next machine runs, the
+  same answer twice), a remote tree that is not the commit's (sent back, the same answer
+  twice), a result for another tree, a session without runs, a missing prerequisite found when
+  the run starts (also after a wait), a folder not in the commit, exit 3, busy, waiting, a stale
+  remote atelier, a killed connection, a tcsh login shell and one that cannot run the command, a
+  leading `-` in a machine name, `--all` after an error, `run = "check"` here and on a machine
+  with the check's outcome in the platform's run, and `machines init` with stand-ins for
+  `cargo` and `rustc` (a broken install, a filesystem that cannot exchange, one replaced folder
+  kept).
 - Real machine (`tests/remote_e2e.rs`, opt-in with `ATELIER_E2E_SSH=<host>`): `machines init`
-  building from source, `machines`, full, narrow and failing runs, and a killed `ssh -tt`
-  client (`connection lost`, exit 3, the remote step stopped).
+  building from source (replacing another install and a broken one, the exchange probe built
+  there, one replaced folder kept), `machines`, full, narrow and failing runs, a killed `ssh -tt`
+  client (`connection lost`, exit 3, the remote step stopped), and an ignored file in the way of
+  the checkout (not ready, unchanged, the same answer twice).

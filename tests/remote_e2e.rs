@@ -8,10 +8,12 @@
 //! checkout), `~/.local/share/atelier/<version>/` (the pinned atelier, built there by
 //! `machines init`) and `~/.local/state/atelier/` (the machine lock). It removes none of them:
 //! whoever runs it cleans the machine afterwards. Covered: `machines init` building from source
-//! (its plan; replacing an install of other source only with `--yes`, swapped in with
-//! `renameat2(RENAME_EXCHANGE)` and the old folder kept), `machines`, a passing and a failing
-//! `test`, the remote tree recorded, and a connection killed mid-run (`ssh -tt`, the terminal
-//! hang-up and the watcher): `connection lost`, exit 3, the remote group stopped.
+//! (its plan; replacing an install of other source, or a broken one, only with `--yes`, after
+//! the exchange probe compiled there with `rustc`, swapped in with `renameat2(RENAME_EXCHANGE)`
+//! and one replaced folder kept), `machines`, a passing and a failing `test`, the remote tree
+//! recorded, a connection killed mid-run (`ssh -tt`, the terminal hang-up and the watcher):
+//! `connection lost`, exit 3, the remote group stopped; and an ignored file in the way of the
+//! checkout: not ready, the file and the checkout unchanged.
 
 mod common;
 
@@ -121,6 +123,32 @@ checkouts = "~/atelier-exp/checkouts"
         &format!("cat ~/.local/share/atelier/.{VERSION}.replaced-*/bin/atelier"),
     );
     assert!(stdout(&o).contains("0000000000000000"), "{}", both(&o));
+
+    // A broken install (the version folder without bin/atelier): named in the plan, replaced
+    // only with --yes, after the exchange probe compiled there; one replaced folder is left.
+    let o = ssh(&host, &format!("rm {bin}"));
+    assert!(o.status.success(), "{}", both(&o));
+    let out = atelier(&["machines", "init", "linux-box"])
+        .output()
+        .unwrap();
+    eprintln!("machines init over a broken install:\n{}", both(&out));
+    assert_eq!(code(&out), 4);
+    assert!(stdout(&out).contains("replace a broken install"));
+    let t = Instant::now();
+    let out = atelier(&["machines", "init", "linux-box", "--yes"])
+        .output()
+        .unwrap();
+    eprintln!(
+        "machines init --yes over a broken install ({:?}):\n{}",
+        t.elapsed(),
+        both(&out)
+    );
+    assert_eq!(code(&out), 0);
+    let o = ssh(
+        &host,
+        &format!("ls -d ~/.local/share/atelier/.{VERSION}.replaced-* | wc -l"),
+    );
+    assert_eq!(stdout(&o).trim(), "1", "{}", both(&o));
 
     let out = atelier(&["machines"]).output().unwrap();
     eprintln!("machines:\n{}", both(&out));
@@ -236,4 +264,44 @@ checkouts = "~/atelier-exp/checkouts"
     );
     eprintln!("remote results:\n{}", stdout(&o));
     assert!(stdout(&o).contains("failures = [\"connection lost\"]"));
+
+    // An ignored file on the machine where the next commit tracks one: not ready, the file and
+    // the checkout left as they were, the same answer twice.
+    repo.write(".gitignore", ".env\n");
+    repo.commit_all("ignore .env");
+    let out = atelier(&["test", "linux-x86_64"]).output().unwrap();
+    assert_eq!(code(&out), 0, "{}", both(&out));
+    let o = ssh(
+        &host,
+        "cd ~/atelier-exp/checkouts/* && echo 'machine secret' > .env && git rev-parse HEAD",
+    );
+    let head = stdout(&o).trim().to_owned();
+    repo.write(".env", "from the commit\n");
+    let g = Command::new("git")
+        .args(["add", "-f", ".env"])
+        .current_dir(&repo.root)
+        .output()
+        .unwrap();
+    assert!(g.status.success());
+    repo.commit_all("track .env");
+    let mut lines = Vec::new();
+    for _ in 0..2 {
+        let out = atelier(&["test", "linux-x86_64"]).output().unwrap();
+        eprintln!("ignored file in the way:\n{}", both(&out));
+        assert_eq!(code(&out), 3);
+        let line = stdout(&out).trim().to_owned();
+        assert!(
+            line.starts_with(
+                "linux-x86_64: no machine available (linux-box not ready: checking out "
+            ) && line.ends_with("move them away: .env)"),
+            "{line}"
+        );
+        lines.push(line);
+        let o = ssh(
+            &host,
+            "cd ~/atelier-exp/checkouts/* && cat .env && git rev-parse HEAD",
+        );
+        assert_eq!(stdout(&o), format!("machine secret\n{head}\n"));
+    }
+    assert_eq!(lines[0], lines[1]);
 }
