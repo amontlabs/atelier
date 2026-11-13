@@ -1,6 +1,8 @@
 [package]
 name = "atelier"
 version = "0.1.0"
+license = "MIT"
+repository = "https://github.com/amontlabs/atelier"
 edition = "2024"
 rust-version = "1.100"
 description = "Gate, records and guards for agents building one project in parallel git worktrees"
