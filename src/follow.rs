@@ -10,17 +10,22 @@
 //! `follow` run under the branch's lock, so its process group is recorded and a later command
 //! refuses while it lives. A conflict leaves the rebase open and exits 5 with the files. With
 //! `[merge] resolver = "mergiraf"`, an ordinary three-way content conflict on a regular `.rs`,
-//! `.ts`, `.tsx`, `.toml` or `.json` file is first given to `mergiraf solve`; a file it resolves
-//! completely is staged in the open rebase and printed, any other conflict is left as git's.
+//! `.ts`, `.tsx`, `.toml` or `.json` file, whose three stages are that path's file in the
+//! commits being merged (no rename), is first given to `mergiraf solve --stdout`; atelier
+//! writes a result with no conflict left itself, through the folder's descriptor, stages it
+//! in the open rebase and prints it. Any other conflict is left as git's.
+//!
+//! The outcome is the settled record's: a rebase that finished is exit 0 even when a hook left
+//! processes behind, which are stopped and named in a warning.
 
 use std::collections::BTreeMap;
 use std::ffi::OsStr;
 use std::fs;
-use std::os::unix::fs::MetadataExt;
-use std::path::{Component, Path, PathBuf};
+use std::path::Path;
 use std::process::{Command, Stdio};
 
-use crate::exit::{Exit, Failure, IoContext, Result};
+use crate::dirfd::Parent;
+use crate::exit::{Exit, Failure, Result};
 use crate::git::{self, Checkout};
 use crate::locks::{HeldLock, LockKey};
 use crate::preflight::Context;
@@ -147,7 +152,7 @@ pub fn run(ctx: &Context) -> Result<Exit> {
     for step in &result.steps {
         if !step.left.is_empty() {
             eprintln!(
-                "follow: the rebase left processes behind, stopped: {}",
+                "follow: warning: the rebase (its hooks) left processes behind, which atelier stopped: {}",
                 step.left.join("; ")
             );
         }
@@ -224,10 +229,17 @@ fn rebase(
     let new_tip = stack
         .tip(branch)?
         .ok_or_else(|| Failure::refused(format!("{branch} disappeared during the rebase")))?;
+    // Judged by the settled record, not by the step's status: a rebase that finished is
+    // finished even when a hook left a process behind (`LeftProcesses`).
     let rec = stack.settle(rec, &new_tip)?;
-    if step.status != StepStatus::Passed {
+    if rec.base != target.commit {
         return Err(Failure::refused(format!(
-            "git rebase did not start: {}",
+            "git rebase {}: {}",
+            if step.status == StepStatus::NotStarted {
+                "did not start"
+            } else {
+                "did not finish"
+            },
             log.trim()
         )));
     }
@@ -280,7 +292,12 @@ fn conflict(
     let files = conflicted(root)?;
     let mut left = Vec::new();
     for (f, stages) in &files {
-        if resolver && mergiraf_applies(f) && content_conflict(stages) && mergiraf_solve(root, f)? {
+        if resolver
+            && mergiraf_applies(f)
+            && content_conflict(stages)
+            && same_path_in_each_side(root, f, stages)?
+            && mergiraf_solve(root, f)?
+        {
             println!("resolved by mergiraf: {f}");
         } else {
             left.push(f.clone());
@@ -319,12 +336,36 @@ fn mergiraf_applies(path: &str) -> bool {
 /// both sides (2, 3) are present and each is a regular file (mode 100644 or 100755). A
 /// modify/delete, an add/add without base, a rename that left a side missing, a symbolic link
 /// or a submodule stays git's conflict (3.3 review 1, 4).
-fn content_conflict(stages: &BTreeMap<u8, String>) -> bool {
+fn content_conflict(stages: &BTreeMap<u8, Stage>) -> bool {
     [1, 2, 3].iter().all(|n| {
         stages
             .get(n)
-            .is_some_and(|mode| mode == "100644" || mode == "100755")
+            .is_some_and(|s| s.mode == "100644" || s.mode == "100755")
     }) && stages.len() == 3
+}
+
+/// True when each stage of `rel` is the file at that same path in the commit it comes from:
+/// stage 1 in the parent of the commit being replayed (`REBASE_HEAD^`, the merge base), 2 in
+/// `HEAD`, 3 in `REBASE_HEAD`. False when a side renamed the file (the path is missing from the
+/// merge base, or holds another file there), or when the commits cannot be read: Mergiraf's
+/// last resort reads `<commit>:<path>` for each side, which then names the wrong file.
+fn same_path_in_each_side(root: &Path, rel: &str, stages: &BTreeMap<u8, Stage>) -> Result<bool> {
+    let revs = ["REBASE_HEAD^1", "HEAD", "REBASE_HEAD"].map(|c| format!("{c}:{rel}"));
+    let out = git::output(
+        root,
+        ["rev-parse"]
+            .into_iter()
+            .chain(revs.iter().map(String::as_str)),
+    )?;
+    if !out.status.success() {
+        return Ok(false);
+    }
+    let text = String::from_utf8_lossy(&out.stdout);
+    let found: Vec<&str> = text.lines().collect();
+    Ok(found.len() == 3
+        && (1..=3u8)
+            .zip(&found)
+            .all(|(n, oid)| stages.get(&n).is_some_and(|s| s.object == *oid)))
 }
 
 /// Refuses (4) when the configured resolver cannot run.
@@ -345,106 +386,64 @@ fn check_mergiraf() -> Result<()> {
     }
 }
 
-/// The file-system identity of a regular file at `rel` under `root`, reached without
-/// following any symbolic link: every folder on the way is a real folder and the file itself
-/// is a regular file. `None` otherwise.
-fn regular_file(root: &Path, rel: &str) -> Option<(u64, u64)> {
-    let parent = real_parent(root, rel)?;
-    let meta = fs::symlink_metadata(parent.join(Path::new(rel).file_name()?)).ok()?;
-    meta.is_file().then(|| (meta.dev(), meta.ino()))
-}
-
-/// The folder holding `rel` under `root`, when every folder on the way is a real folder (no
-/// symbolic link) and `rel` is a plain relative path.
-fn real_parent(root: &Path, rel: &str) -> Option<PathBuf> {
-    let comps: Vec<_> = Path::new(rel).components().collect();
-    let (_, folders) = comps.split_last()?;
-    let mut path = root.to_path_buf();
-    for c in comps.iter() {
-        if !matches!(c, Component::Normal(_)) {
-            return None;
-        }
-    }
-    for c in folders {
-        path.push(c);
-        if !fs::symlink_metadata(&path).is_ok_and(|m| m.is_dir()) {
-            return None;
-        }
-    }
-    Some(path)
-}
-
-/// Runs `mergiraf solve` on one conflicted regular file. When it ends well, the same regular
-/// file is still at the path and has no conflict marker left, stages it and returns true;
-/// otherwise puts git's conflict back. The path is checked to be a regular file reached
-/// without a symbolic link before it is read, after the resolver ran, and before it is
-/// restored; the restore replaces the path itself (a new file renamed over it), so it never
-/// writes through a link.
+/// Runs `mergiraf solve --stdout` on one conflicted regular file, so Mergiraf never writes.
+/// When it solves every conflict (exit 0) and its output has no conflict marker, atelier
+/// replaces the file by that output with the file's own permission bits, through the
+/// descriptor of the file's folder (no link followed on the way, the folders checked to still
+/// be the same before and after), stages it and returns true. Otherwise the file is left as
+/// git wrote it, or put back if it was replaced and staging failed.
 fn mergiraf_solve(root: &Path, rel: &str) -> Result<bool> {
-    let path = root.join(rel);
-    let Some(identity) = regular_file(root, rel) else {
+    let Some(parent) = Parent::open(root, rel) else {
         return Ok(false);
     };
-    let original = fs::read(&path).ctx(path.display())?;
-    if regular_file(root, rel) != Some(identity) {
+    let Some(original) = parent.read() else {
+        return Ok(false);
+    };
+    if !parent.still_there() {
         return Ok(false);
     }
-    let ok = Command::new(MERGIRAF)
-        .args(["solve", "--keep-backup=false", "--"])
+    let out = Command::new(MERGIRAF)
+        .args(["solve", "--stdout", "--"])
         .arg(rel)
         .current_dir(root)
         .stdin(Stdio::null())
-        .stdout(Stdio::null())
         .stderr(Stdio::null())
-        .status()
-        .is_ok_and(|s| s.success());
-    let same = regular_file(root, rel) == Some(identity);
-    let now = if same { fs::read(&path).ok() } else { None };
-    if ok
-        && let Some(text) = &now
-        && !has_markers(text)
-        && regular_file(root, rel) == Some(identity)
-    {
-        let out = git::output(root, ["--literal-pathspecs", "add", "--", rel])?;
-        if out.status.success() {
+        .output();
+    let Ok(out) = out else {
+        return Ok(false);
+    };
+    // The file Mergiraf read must still be git's, unchanged, at the same place.
+    let unchanged = parent
+        .read()
+        .is_some_and(|now| now.identity == original.identity && now.contents == original.contents);
+    if !out.status.success() || has_markers(&out.stdout) || !unchanged || !parent.still_there() {
+        return Ok(false);
+    }
+    parent
+        .replace(&out.stdout, original.mode)
+        .map_err(|e| Failure::refused(format!("{rel}: {e}")))?;
+    if parent.still_there() {
+        let added = git::output(root, ["--literal-pathspecs", "add", "--", rel])?;
+        if added.status.success() {
             return Ok(true);
         }
     }
-    if now.as_deref() != Some(original.as_slice()) {
-        restore(root, rel, &original)?;
-    }
+    restore(&parent, rel, &original)?;
     Ok(false)
 }
 
-/// Puts `contents` back at `rel` as a new regular file renamed over whatever is there, so
-/// nothing is written through a link. Refuses (4) when a folder on the way is no longer a real
-/// folder.
-fn restore(root: &Path, rel: &str, contents: &[u8]) -> Result<()> {
-    use std::io::Write;
-    use std::os::unix::fs::OpenOptionsExt;
-    let (Some(parent), Some(name)) = (real_parent(root, rel), Path::new(rel).file_name()) else {
+/// Puts git's conflicted file back, with its own permission bits, as a new regular file renamed
+/// over the name in its folder, so nothing is written through a link. Refuses (4) when a folder
+/// on the way is no longer the same real folder.
+fn restore(parent: &Parent, rel: &str, original: &crate::dirfd::Snapshot) -> Result<()> {
+    if !parent.still_there() {
         return Err(Failure::refused(format!(
-            "cannot put git's conflict back in {rel}: a folder on its path is no longer a real folder"
+            "cannot put git's conflict back in {rel}: a folder on its path is no longer the same real folder"
         )));
-    };
-    let executable = git::run(root, ["ls-files", "-u", "-z", "--", rel])
-        .is_ok_and(|t| t.split('\0').any(|e| e.starts_with("100755 ")));
-    let tmp = parent.join(format!(
-        ".atelier-restore-{}",
-        crate::fsutil::random_hex(8)?
-    ));
-    let written = fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .mode(if executable { 0o755 } else { 0o644 })
-        .open(&tmp)
-        .and_then(|mut f| f.write_all(contents).and_then(|()| f.sync_all()))
-        .and_then(|()| fs::rename(&tmp, parent.join(name)));
-    if let Err(e) = written {
-        let _ = fs::remove_file(&tmp);
-        return Err(Failure::refused(format!("{rel}: {e}")));
     }
-    Ok(())
+    parent
+        .replace(&original.contents, original.mode)
+        .map_err(|e| Failure::refused(format!("{rel}: {e}")))
 }
 
 /// True when the text has a line that is a conflict marker.
@@ -458,9 +457,15 @@ fn has_markers(text: &[u8]) -> bool {
     })
 }
 
-/// The unmerged paths, relative to the worktree root, each with the index mode of every stage
-/// present (1 base, 2 ours, 3 theirs), from `git ls-files -u`.
-fn conflicted(root: &Path) -> Result<Vec<(String, BTreeMap<u8, String>)>> {
+/// One unmerged stage of a path: its index mode and object.
+struct Stage {
+    mode: String,
+    object: String,
+}
+
+/// The unmerged paths, relative to the worktree root, each with every stage present (1 base,
+/// 2 ours, 3 theirs), from `git ls-files -u`.
+fn conflicted(root: &Path) -> Result<Vec<(String, BTreeMap<u8, Stage>)>> {
     let out = git::output(root, ["ls-files", "-u", "-z", "--full-name"])?;
     if !out.status.success() {
         return Err(Failure::refused(format!(
@@ -468,7 +473,7 @@ fn conflicted(root: &Path) -> Result<Vec<(String, BTreeMap<u8, String>)>> {
             String::from_utf8_lossy(&out.stderr).trim()
         )));
     }
-    let mut by_path: BTreeMap<String, BTreeMap<u8, String>> = BTreeMap::new();
+    let mut by_path: BTreeMap<String, BTreeMap<u8, Stage>> = BTreeMap::new();
     for entry in out.stdout.split(|&b| b == 0).filter(|e| !e.is_empty()) {
         // `<mode> <object> <stage>\t<path>`
         let Some(tab) = entry.iter().position(|&b| b == b'\t') else {
@@ -477,17 +482,20 @@ fn conflicted(root: &Path) -> Result<Vec<(String, BTreeMap<u8, String>)>> {
         let meta = String::from_utf8_lossy(&entry[..tab]);
         let path = String::from_utf8_lossy(&entry[tab + 1..]).into_owned();
         let mut fields = meta.split(' ');
-        let (Some(mode), Some(_), Some(stage)) = (fields.next(), fields.next(), fields.next())
+        let (Some(mode), Some(object), Some(stage)) = (fields.next(), fields.next(), fields.next())
         else {
             continue;
         };
         let Ok(stage) = stage.parse::<u8>() else {
             continue;
         };
-        by_path
-            .entry(path)
-            .or_default()
-            .insert(stage, mode.to_owned());
+        by_path.entry(path).or_default().insert(
+            stage,
+            Stage {
+                mode: mode.to_owned(),
+                object: object.to_owned(),
+            },
+        );
     }
     Ok(by_path.into_iter().collect())
 }

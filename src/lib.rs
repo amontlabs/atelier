@@ -8,6 +8,7 @@
 pub mod agents;
 pub mod check;
 pub mod cli;
+pub mod dirfd;
 pub mod dispatch;
 pub mod exit;
 pub mod follow;

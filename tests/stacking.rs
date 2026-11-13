@@ -905,9 +905,13 @@ fn an_upper_branch_names_its_unmerged_lower_branches() {
 // ---------------------------------------------------------------------------------------------
 // Mergiraf (DESIGN §8.2).
 
-/// A stand-in for mergiraf on `PATH`: `--version` works; `solve` drops the marker lines and
-/// keeps both sides, writing the file in place as mergiraf does, except in a file containing
-/// UNSOLVABLE, which it garbles and fails. It follows a symbolic link, as mergiraf does.
+/// A stand-in for mergiraf 0.20 on `PATH`: `--version` works; `solve --stdout` prints the file
+/// without its marker lines (both sides kept) and exits 0, except for a file containing
+/// UNSOLVABLE, for which it prints garbage and exits 1. Without `--stdout` it fails (atelier
+/// never lets mergiraf write). It reads through a symbolic link, as mergiraf does. With
+/// `SWAP_FILE` set it first replaces the file by a link to that path; with `SWAP_FOLDER` set it
+/// first moves the file's folder aside and puts a link to that path in its place (a process
+/// racing in the worktree).
 fn fake_mergiraf(dir: &Path) -> String {
     let bin = dir.join("fake-bin");
     fs::create_dir_all(&bin).unwrap();
@@ -916,12 +920,16 @@ fn fake_mergiraf(dir: &Path) -> String {
         &script,
         r#"#!/bin/sh
 [ "$1" = "--version" ] && { echo "mergiraf 0.0.0-fake"; exit 0; }
-[ "$1" = "solve" ] || exit 2
+[ "$1" = "solve" ] && [ "$2" = "--stdout" ] || exit 3
 for f; do :; done
 echo "$f" >> "$(dirname "$0")/calls"
-if grep -q UNSOLVABLE "$f"; then echo partial > "$f"; exit 1; fi
-grep -v -e '^<<<<<<<' -e '^|||||||' -e '^=======$' -e '^>>>>>>>' "$f" > "$f.tmp"
-cat "$f.tmp" > "$f" && rm "$f.tmp"
+if [ -n "$SWAP_FILE" ]; then rm "$f"; ln -s "$SWAP_FILE" "$f"; fi
+if [ -n "$SWAP_FOLDER" ]; then
+  d=$(dirname "$f"); mv "$d" "$d-moved"; ln -s "$SWAP_FOLDER" "$d"; f="$d-moved/$(basename "$f")"
+fi
+if grep -q UNSOLVABLE "$f"; then echo partial; exit 1; fi
+grep -v -e '^<<<<<<<' -e '^|||||||' -e '^=======$' -e '^>>>>>>>' "$f"
+exit 0
 "#,
     )
     .unwrap();
@@ -1787,4 +1795,152 @@ fn abandon_frees_a_lower_name_held_by_an_unfinished_dependent() {
     assert!(BranchRecord::read(&p.state(), "c").unwrap().is_none());
     let out = p.run(p.main(), &args);
     assert_eq!(code(&out), 0, "{}", stderr(&out));
+}
+
+/// Round 2, N3: a rebase that finished is reported from the settled record (exit 0) even when
+/// a hook left a background process, which is stopped and named in a warning.
+#[test]
+fn a_finished_rebase_whose_hook_left_a_process_is_reported_finished() {
+    let p = Proj::new();
+    let wt = p.start("b", None);
+    commit(&wt, "b", "1\n", "B1");
+    let m = commit(p.main(), "m", "1\n", "main moves");
+    hook(&p, "post-rewrite", "(sleep 30 >/dev/null 2>&1 &)");
+    let out = p.follow(&wt);
+    unhook(&p, "post-rewrite");
+    assert_eq!(code(&out), 0, "{}", stderr(&out));
+    assert_eq!(
+        stdout(&out),
+        format!("follow: b now on {} (1 commit)\n", short(p.main(), &m))
+    );
+    assert!(
+        stderr(&out).contains("follow: warning: the rebase (its hooks) left processes behind")
+            && stderr(&out).contains("sleep 30"),
+        "{}",
+        stderr(&out)
+    );
+    assert!(!stderr(&out).contains("did not"), "{}", stderr(&out));
+    let rec = p.record("b");
+    assert_eq!((rec.base, rec.pending), (m, None));
+}
+
+/// Round 2, N4: the conflicted file, or a folder on its path, swapped for a link while
+/// mergiraf runs: atelier writes nothing, through the link or anywhere else, and leaves the
+/// conflict as git's.
+#[test]
+fn a_file_or_folder_swapped_during_mergiraf_is_never_written_through() {
+    for swap in ["SWAP_FILE", "SWAP_FOLDER"] {
+        let p = Proj::with_settings("\n[merge]\nresolver = \"mergiraf\"\n");
+        let path = fake_mergiraf(&p.base);
+        let wt = conflicting_pair(&p);
+        let outside = p.base.join("outside");
+        fs::create_dir_all(&outside).unwrap();
+        fs::write(outside.join("x.rs"), "outside\n").unwrap();
+        let target = if swap == "SWAP_FILE" {
+            outside.join("x.rs")
+        } else {
+            outside.clone()
+        };
+        let out = p.repo.atelier_env(
+            &wt,
+            &["follow"],
+            &[("PATH", &path), (swap, target.to_str().unwrap())],
+        );
+        assert_eq!(code(&out), 5, "{swap}: {}", stderr(&out));
+        assert_eq!(stdout(&out), "", "{swap}");
+        assert!(
+            stderr(&out).contains("\n  src/x.rs\n"),
+            "{swap}: {}",
+            stderr(&out)
+        );
+        assert_eq!(fs::read_dir(&outside).unwrap().count(), 1, "{swap}");
+        assert_eq!(
+            read(&outside, "x.rs").as_deref(),
+            Some("outside\n"),
+            "{swap}"
+        );
+        let calls = fs::read_to_string(p.base.join("fake-bin/calls")).unwrap();
+        assert_eq!(calls, "src/x.rs\n", "{swap}");
+        if swap == "SWAP_FOLDER" {
+            let moved = read(&wt, "src-moved/x.rs").unwrap();
+            assert!(moved.contains("<<<<<<<"), "{moved}");
+            assert_eq!(fs::read_dir(wt.join("src-moved")).unwrap().count(), 1);
+        }
+        let stages = git(&wt, &["ls-files", "-u", "--", "src/x.rs"]);
+        assert_eq!(stages.lines().count(), 3, "{swap}: {stages}");
+    }
+}
+
+/// Round 2, N5: the file keeps the permission bits git wrote (the merged mode: b removed the
+/// executable bit), whether mergiraf resolves it or not.
+#[test]
+fn mergiraf_keeps_the_merged_permission_bits() {
+    use std::os::unix::fs::PermissionsExt;
+    for (contents, resolved) in [("fn x() {}", true), ("UNSOLVABLE", false)] {
+        let p = Proj::with_settings("\n[merge]\nresolver = \"mergiraf\"\n");
+        let path = fake_mergiraf(&p.base);
+        commit(p.main(), "x.rs", &format!("{contents} base\n"), "base: x");
+        fs::set_permissions(p.main().join("x.rs"), fs::Permissions::from_mode(0o755)).unwrap();
+        git(p.main(), &["commit", "-q", "-am", "x executable"]);
+        let wt = p.start("b", None);
+        fs::set_permissions(wt.join("x.rs"), fs::Permissions::from_mode(0o644)).unwrap();
+        commit(
+            &wt,
+            "x.rs",
+            &format!("{contents} b\n"),
+            "b: x not executable",
+        );
+        commit(p.main(), "x.rs", &format!("{contents} main\n"), "main: x");
+        let out = p.repo.atelier_env(&wt, &["follow"], &[("PATH", &path)]);
+        assert_eq!(code(&out), 5, "{}", stderr(&out));
+        assert_eq!(
+            stdout(&out) == "resolved by mergiraf: x.rs\n",
+            resolved,
+            "{}",
+            stdout(&out)
+        );
+        let mode = fs::metadata(wt.join("x.rs")).unwrap().permissions().mode();
+        assert_eq!(mode & 0o111, 0, "{contents}: {mode:o}");
+        if resolved {
+            assert!(git(&wt, &["ls-files", "-s", "x.rs"]).starts_with("100644 "));
+        } else {
+            assert!(read(&wt, "x.rs").unwrap().contains("<<<<<<<"));
+        }
+    }
+}
+
+/// Round 2, N7: main renamed the file while b changed it: git puts the conflict at the new
+/// path, which the merge base does not have. Mergiraf is not run on it; it stays git's.
+#[test]
+fn mergiraf_is_not_run_on_a_renamed_file() {
+    let p = Proj::with_settings("\n[merge]\nresolver = \"mergiraf\"\n");
+    let path = fake_mergiraf(&p.base);
+    let lines = |five: &str| {
+        (1..=10)
+            .map(|n| {
+                if n == 5 {
+                    format!("fn f5() {{ {five} }}\n")
+                } else {
+                    format!("fn f{n}() {{}}\n")
+                }
+            })
+            .collect::<String>()
+    };
+    commit(p.main(), "old.rs", &lines("0"), "base: old");
+    let wt = p.start("b", None);
+    commit(&wt, "old.rs", &lines("2"), "b: old");
+    git(p.main(), &["mv", "old.rs", "new.rs"]);
+    commit(p.main(), "new.rs", &lines("1"), "main: rename to new");
+    let out = p.repo.atelier_env(&wt, &["follow"], &[("PATH", &path)]);
+    assert_eq!(code(&out), 5, "{}", stderr(&out));
+    assert_eq!(stdout(&out), "");
+    assert!(stderr(&out).contains("\n  new.rs\n"), "{}", stderr(&out));
+    assert_eq!(
+        git(&wt, &["ls-files", "-u", "--", "new.rs"])
+            .lines()
+            .count(),
+        3
+    );
+    assert!(read(&wt, "new.rs").unwrap().contains("<<<<<<<"));
+    assert!(!p.base.join("fake-bin/calls").exists());
 }
