@@ -78,6 +78,7 @@ pub const FILES: &[(&str, &[u8])] = &[
     src_file!("src/follow.rs", "follow.rs"),
     src_file!("src/fsutil.rs", "fsutil.rs"),
     src_file!("src/gate.rs", "gate.rs"),
+    src_file!("src/gate_machines.rs", "gate_machines.rs"),
     src_file!("src/git.rs", "git.rs"),
     src_file!("src/jobs.rs", "jobs.rs"),
     src_file!("src/ledger.rs", "ledger.rs"),

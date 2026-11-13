@@ -43,6 +43,10 @@ pub const STEP_TRAMPOLINE: &str = "read _ || exit 125; exec \"$@\" </dev/null";
 /// the marker scan covers the whole machine.
 const RUN_ID_RANDOM_BYTES: usize = 8;
 
+/// The id the next `atelier check` takes for its run, when free: how the gate knows its inner
+/// check's run exactly. Only a step given it explicitly sees it.
+pub const RUN_ID_VAR: &str = "ATELIER_RUN_ID";
+
 /// A new run id: UTC time to the minute plus 8 random bytes, `20261113T1012Z-4f2a09c1d3e5b7a8`.
 pub fn new_run_id() -> Result<String> {
     let (y, mo, d, h, mi, _) = fsutil::utc_parts(fsutil::now_secs());
@@ -429,6 +433,11 @@ impl Run {
         &self.steps
     }
 
+    /// The failure lines recorded so far.
+    pub fn failures(&self) -> &[String] {
+        &self.failures
+    }
+
     /// The stop signal received during this run, if any.
     pub fn interrupted(&self) -> Option<i32> {
         self.interrupted.or_else(signals::received)
@@ -555,6 +564,7 @@ impl Run {
             .stdout(stdout)
             .stderr(log_err)
             .env_remove(DISPATCHED_VAR)
+            .env_remove(RUN_ID_VAR)
             .process_group(0);
         for (k, v) in env {
             cmd.env(k, v);

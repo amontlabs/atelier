@@ -101,97 +101,97 @@ pub enum PlatformOutcome {
     NoMachine(String),
 }
 
-/// Where a platform runs: this computer, or another machine (module 3.6).
+/// Where a platform can run, as checked before anything runs.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Availability {
+    /// This computer, in the gate worktree.
     Local,
+    /// The named machine answered: ready, or busy and waited for.
+    Machine(String),
     /// No machine is available; the reason.
     None(String),
 }
 
-/// Runs platforms for the gate. [`LocalPlatforms`] is the only one until module 3.6, whose
-/// machines file and remote runs replace it: its `availability` chooses among the owner's
-/// machines (offline, not ready, busy) and its `run` starts every remote platform at the same
-/// time as the local one.
+/// Runs platforms for the gate: [`crate::gate_machines::Machines`], the owner's machines file
+/// and remote runs (module 3.6).
 pub trait Platforms {
-    /// Checked before the gate starts, in seconds (step 1).
-    fn availability(&self, platform: &str) -> Availability;
-    /// Runs `platform`'s `run` for the merged commit checked out in the gate (step 5).
-    fn run(&mut self, gate: &mut GateRun<'_>, platform: &str) -> Result<PlatformOutcome>;
-}
-
-/// The platforms this computer runs, in the gate worktree; every other platform goes to
-/// [`remote_platform`].
-pub struct LocalPlatforms {
-    pub home: PathBuf,
-}
-
-impl Platforms for LocalPlatforms {
-    fn availability(&self, platform: &str) -> Availability {
-        if is_local(platform) {
-            Availability::Local
-        } else {
-            remote_availability(platform)
-        }
-    }
-
-    fn run(&mut self, gate: &mut GateRun<'_>, platform: &str) -> Result<PlatformOutcome> {
-        if is_local(platform) {
-            run_local(gate, &self.home, platform)
-        } else {
-            remote_platform(gate, platform)
-        }
-    }
+    /// Whether some machine can take `platform` of `settings`, in seconds (step 1, and again
+    /// for a platform the merged settings add or change).
+    fn availability(
+        &self,
+        checkout: &Checkout,
+        settings: &Settings,
+        platform: &str,
+    ) -> Availability;
+    /// Runs each of `platforms`' `run` for the merged commit checked out in the gate, all at the
+    /// same time (step 5). One outcome per platform, in the order given.
+    fn run_all(
+        &mut self,
+        g: &mut GateRun<'_>,
+        platforms: &[String],
+    ) -> Result<Vec<(String, PlatformOutcome)>>;
+    /// Bisection: re-runs one platform's failures for the prefix checked out in the gate, on
+    /// the machine they failed on first.
+    fn rerun(
+        &mut self,
+        g: &mut GateRun<'_>,
+        failures: &bisect::Failures,
+    ) -> Result<PlatformOutcome>;
 }
 
 pub(crate) fn is_local(platform: &str) -> bool {
     Platform::parse(platform).is_some() && Platform::current() == Platform::parse(platform)
 }
 
-/// SEAM for module 3.6: whether a machine of another platform can take the run. Until the
-/// machines module is merged, none can.
-pub fn remote_availability(platform: &str) -> Availability {
-    Availability::None(format!(
-        "{platform}: no machine (remote machines come with module 3.6)"
-    ))
-}
-
-/// SEAM for module 3.6: runs `platform`'s `run` for `M` on the machine chosen for it, through
-/// `M`'s own pinned atelier there. Until the machines module is merged, no machine is
-/// available.
-pub fn remote_platform(_gate: &mut GateRun<'_>, platform: &str) -> Result<PlatformOutcome> {
-    match remote_availability(platform) {
-        Availability::None(why) => Ok(PlatformOutcome::NoMachine(why)),
-        Availability::Local => unreachable!("remote_availability never answers Local"),
-    }
-}
-
 /// The gate's run and what platform runs need from it.
 pub struct GateRun<'a> {
     pub ctx: &'a Context,
-    pub run: Run,
+    pub run: &'a mut Run,
     /// The gate worktree.
-    pub gate: Checkout,
+    pub gate: &'a Checkout,
     /// The merged commit's settings.
-    pub settings: Settings,
+    pub settings: &'a Settings,
     /// The merged commit.
-    pub m: String,
+    pub m: &'a str,
+}
+
+/// `$HOME`, where the pinned ateliers and the machines file are.
+pub fn home() -> Result<PathBuf> {
+    std::env::var_os("HOME")
+        .map(PathBuf::from)
+        .ok_or_else(|| Failure::refused("HOME is not set"))
+}
+
+/// The settings committed at `spec` (`<commit>:<path>`, or `:<path>` for the index), parsed;
+/// `None` when there is no such file. Never the main checkout's working file.
+pub fn settings_at(dir: &Path, commit: &str) -> Result<Option<Settings>> {
+    let spec = format!("{commit}:{}", crate::settings::SETTINGS_PATH);
+    let out = git::output(dir, ["show", &spec])?;
+    if !out.status.success() {
+        return Ok(None);
+    }
+    let text = String::from_utf8_lossy(&out.stdout);
+    Settings::parse(&text)
+        .map(Some)
+        .map_err(|e| Failure::refused(format!("{spec}: {}", e.message)))
+}
+
+/// The waiver of `platform`, if the owner gave one.
+pub fn waived<'w>(waivers: &'w [Waiver], platform: &str) -> Option<&'w Waiver> {
+    waivers.iter().find(|w| w.platform == platform)
 }
 
 /// `atelier merge`.
-pub fn run(ctx: &Context, branches: &[String], waiver: Option<Waiver>) -> Result<Exit> {
-    let home = std::env::var_os("HOME")
-        .map(PathBuf::from)
-        .ok_or_else(|| Failure::refused("HOME is not set"))?;
-    let mut platforms = LocalPlatforms { home };
-    run_with(ctx, branches, waiver, &mut platforms)
+pub fn run(ctx: &Context, branches: &[String], waivers: &[Waiver]) -> Result<Exit> {
+    let mut platforms = crate::gate_machines::Machines::load(&home()?)?;
+    run_with(ctx, branches, waivers, &mut platforms)
 }
 
 /// `atelier merge` with the given platform runner.
 pub fn run_with(
     ctx: &Context,
     branches: &[String],
-    waiver: Option<Waiver>,
+    waivers: &[Waiver],
     platforms: &mut dyn Platforms,
 ) -> Result<Exit> {
     let started = Instant::now();
@@ -209,12 +209,12 @@ pub fn run_with(
             )));
         }
     }
-    if let Some(w) = &waiver {
-        if !ctx.settings.platforms.contains_key(&w.platform) {
-            return Err(Failure::refused(format!(
-                "--waive {}: not a platform of this project (it has: {})",
-                w.platform,
-                platform_names(&ctx.settings).join(", ")
+    let mut waived_seen = BTreeSet::new();
+    for w in waivers {
+        if !waived_seen.insert(w.platform.as_str()) {
+            return Err(Failure::usage(format!(
+                "--waive {}: named twice",
+                w.platform
             )));
         }
         if w.reason.trim().is_empty() {
@@ -233,25 +233,39 @@ pub fn run_with(
     let stack = Stack::new(&ctx.checkout, &ctx.state, &integration);
     let old = stack.integration_tip()?;
     let items = preconditions(ctx, &v, &stack, branches)?;
+    let old_settings = settings_at(&root, &old)?.ok_or_else(|| {
+        Failure::refused(format!(
+            "{integration} ({}) has no {}",
+            short(&root, &old),
+            crate::settings::SETTINGS_PATH
+        ))
+    })?;
+
+    // A waiver names a platform of OLD's settings, or, for an item that changes the settings,
+    // possibly one the merged settings add: that one is checked after the merge.
+    let rules_item = items.iter().any(|i| i.rules);
+    for w in waivers {
+        if !rules_item && !old_settings.platforms.contains_key(&w.platform) {
+            return Err(Failure::refused(format!(
+                "--waive {}: not a platform of this project (it has: {})",
+                w.platform,
+                platform_names(&old_settings).join(", ")
+            )));
+        }
+    }
 
     // Machines first, so an unavailable platform costs seconds, not a whole run.
     let mut missing = Vec::new();
-    for p in platform_names(&ctx.settings) {
-        if waiver.as_ref().is_some_and(|w| w.platform == p) {
+    for p in platform_names(&old_settings) {
+        if waived(waivers, &p).is_some() {
             continue;
         }
-        if let Availability::None(why) = platforms.availability(&p) {
+        if let Availability::None(why) = platforms.availability(&ctx.checkout, &old_settings, &p) {
             missing.push(why);
         }
     }
     if !missing.is_empty() {
-        return Err(Failure::new(
-            Exit::NoMachine,
-            format!(
-                "no machine for every platform; nothing ran and {integration} has not moved:\n  {}\nwaive a platform with --waive <platform> --reason \"<the owner's words>\"",
-                missing.join("\n  ")
-            ),
-        ));
+        return Err(no_machine(&integration, &missing));
     }
 
     let end = gate(
@@ -260,7 +274,8 @@ pub fn run_with(
         lock,
         &items,
         &old,
-        waiver.as_ref(),
+        &old_settings,
+        waivers,
         platforms,
         started,
     )?;
@@ -285,6 +300,7 @@ pub fn run_with(
             failures,
             run_id,
             m,
+            cause,
         } => {
             if items.len() < 2 {
                 return Ok(Exit::Fail);
@@ -293,11 +309,13 @@ pub fn run_with(
                 ctx,
                 items: &items,
                 old: &old,
+                old_settings: &old_settings,
                 red_m: &m,
                 red_run: &run_id,
                 failures: &failures,
+                cause: &cause,
             };
-            let (lock, green) = search.run(lock)?;
+            let (lock, green) = search.run(lock, platforms)?;
             if green == 0 {
                 return Ok(Exit::Fail);
             }
@@ -316,7 +334,8 @@ pub fn run_with(
                 lock,
                 prefix,
                 &old,
-                waiver.as_ref(),
+                &old_settings,
+                waivers,
                 platforms,
                 Instant::now(),
             )? {
@@ -346,6 +365,17 @@ pub fn run_with(
     }
 }
 
+/// Exit 3: the platforms without a machine.
+fn no_machine(integration: &str, missing: &[String]) -> Failure {
+    Failure::new(
+        Exit::NoMachine,
+        format!(
+            "no machine for every platform; nothing ran and {integration} has not moved:\n  {}\nwaive a platform with --waive <platform> --reason \"<the owner's words>\"",
+            missing.join("\n  ")
+        ),
+    )
+}
+
 /// How one gate over a batch ended.
 pub enum GateEnd {
     /// Green: the promotion record is written; the gate lock is held for the promotion.
@@ -357,12 +387,35 @@ pub enum GateEnd {
     /// RED: the verdict is printed; the gate lock is held for bisection.
     Red {
         lock: HeldLock,
+        /// What failed per platform; empty when the RED is no platform's (the merged settings,
+        /// the hooks, the tree).
         failures: Vec<bisect::Failures>,
         run_id: String,
         m: String,
+        /// The run's failure lines: what made it RED.
+        cause: String,
     },
     /// Ended otherwise (interrupted); the lock is released.
     Done(Exit),
+}
+
+/// The paths OLD's committed settings name in `regenerates` of a hook with `commit`: the only
+/// conflicts the gate may settle (HF1), and only when the merged settings name them too.
+pub fn regenerated_paths(settings: &Settings) -> BTreeSet<String> {
+    settings
+        .merge
+        .after
+        .iter()
+        .filter(|h| h.commit.is_some())
+        .flat_map(|h| h.regenerates.iter().cloned())
+        .collect()
+}
+
+/// Ends the gate's run as failed and returns `e`.
+fn refuse_in(mut run: Run, e: Failure) -> Result<GateEnd> {
+    run.fail(e.message.clone());
+    let _ = run.finish(false);
+    Err(e)
 }
 
 /// Steps 2–6 for a batch whose preconditions passed, under the gate lock. A conflict (5), a
@@ -374,7 +427,8 @@ pub fn gate(
     lock: HeldLock,
     items: &[Item],
     old: &str,
-    waiver: Option<&Waiver>,
+    old_settings: &Settings,
+    waivers: &[Waiver],
     platforms: &mut dyn Platforms,
     started: Instant,
 ) -> Result<GateEnd> {
@@ -404,9 +458,10 @@ pub fn gate(
     );
 
     // Step 3.
-    let regen = regenerated_paths(&ctx.settings);
+    let old_regen = regenerated_paths(old_settings);
+    let mut settled = BTreeSet::new();
     for (i, item) in items.iter().enumerate() {
-        match merge_one(&gate.root, item, &regen) {
+        match merge_one(&gate.root, item, &old_regen) {
             Ok(Merged::Clean) => {
                 println!(
                     "  in the gate: {} {}",
@@ -425,11 +480,13 @@ pub fn gate(
                         "    conflict in {p} settled with {}'s side: a merge.after hook regenerates it",
                         item.name
                     );
+                    settled.insert(p);
                 }
             }
             Ok(Merged::Conflict(files)) => {
                 let back = checkout_detached(&gate.root, old);
-                let with = conflict_with(&gate.root, old, &items[..i], item, &integration, &regen);
+                let with =
+                    conflict_with(&gate.root, old, &items[..i], item, &integration, &old_regen);
                 let mut msg = format!("conflict: {} with {with}", item.name);
                 for f in &files {
                     msg.push_str(&format!("\n  {f}"));
@@ -451,9 +508,7 @@ pub fn gate(
             }
             Err(e) => {
                 let _ = checkout_detached(&gate.root, old);
-                run.fail(e.message.clone());
-                let _ = run.finish(false);
-                return Err(e);
+                return refuse_in(run, e);
             }
         }
         if run.interrupted().is_some() {
@@ -479,13 +534,20 @@ pub fn gate(
             );
         }
     };
-    let mut ok = after_hooks(&mut run, &gate.root, &settings)?;
+    let hooks = after_hooks(&mut run, &gate.root, &settings)?;
     if run.interrupted().is_some() {
         return interrupted(run);
     }
     let m = git::run(&gate.root, ["rev-parse", "HEAD"])?;
+    let mut ok = hooks.ok;
     if ok {
         ok = tree_is(&mut run, &gate, &m, "after the merge.after hooks")?;
+    }
+    if ok {
+        ok = verify_settled(&mut run, &gate, &settings, &m, &settled, &hooks.touched)?;
+    }
+    if run.interrupted().is_some() {
+        return interrupted(run);
     }
     if !ok {
         return red(
@@ -502,20 +564,70 @@ pub fn gate(
     let head = git::run(&gate.root, ["rev-parse", "HEAD^{tree}"])?;
     run.set_tree(head, Some(m.clone()), false);
 
+    // The merged settings decide the platforms and the waivers (a rules item may change them);
+    // a platform they add or change is checked for a machine before anything runs.
+    for w in waivers {
+        if !settings.platforms.contains_key(&w.platform) {
+            return refuse_in(
+                run,
+                Failure::refused(format!(
+                    "--waive {}: not a platform of the merged commit's settings (they have: {}); {integration} has not moved",
+                    w.platform,
+                    platform_names(&settings).join(", ")
+                )),
+            );
+        }
+    }
+    let names: Vec<String> = platform_names(&settings)
+        .into_iter()
+        .filter(|p| waived(waivers, p).is_none())
+        .collect();
+    let mut missing = Vec::new();
+    for p in &names {
+        if old_settings.platforms.get(p) == settings.platforms.get(p) {
+            continue;
+        }
+        if let Availability::None(why) = platforms.availability(&ctx.checkout, &settings, p) {
+            missing.push(why);
+        }
+    }
+    if !missing.is_empty() {
+        run.fail(format!("no machine: {}", missing.join("; ")));
+        let _ = run.finish(false);
+        return Err(no_machine(&integration, &missing));
+    }
+    if let Err(e) = pinned_installed(&settings, &names, &m, &root) {
+        return refuse_in(run, e);
+    }
+
     // Steps 5 and 6.
-    let mut g = GateRun {
-        ctx,
-        run,
-        gate: gate.clone(),
-        settings,
-        m: m.clone(),
-    };
     let mut records = Vec::new();
-    let mut failed: Vec<(String, String, bisect::Failures)> = Vec::new();
-    let mut no_machine = Vec::new();
-    for p in platform_names(&g.settings) {
-        if let Some(w) = waiver.filter(|w| w.platform == p) {
+    for p in platform_names(&settings) {
+        if let Some(w) = waived(waivers, &p) {
             println!("  {p}: WAIVED ({})", w.reason);
+        }
+    }
+    let outcomes = {
+        let mut g = GateRun {
+            ctx,
+            run: &mut run,
+            gate: &gate,
+            settings: &settings,
+            m: &m,
+        };
+        platforms.run_all(&mut g, &names)
+    };
+    let outcomes = match outcomes {
+        Ok(o) => o,
+        Err(e) => return refuse_in(run, e),
+    };
+    if run.interrupted().is_some() {
+        return interrupted(run);
+    }
+    let mut failed: Vec<(String, String, bisect::Failures)> = Vec::new();
+    let mut no_machines = Vec::new();
+    for p in platform_names(&settings) {
+        if let Some(w) = waived(waivers, &p) {
             records.push(PlatformRecord {
                 platform: p.clone(),
                 result: "waived".to_owned(),
@@ -525,8 +637,12 @@ pub fn gate(
             });
             continue;
         }
-        match platforms.run(&mut g, &p)? {
-            PlatformOutcome::Passed { machine, run } => {
+        match outcomes
+            .iter()
+            .find(|(n, _)| *n == p)
+            .map(|(_, o)| o.clone())
+        {
+            Some(PlatformOutcome::Passed { machine, run }) => {
                 records.push(PlatformRecord {
                     platform: p.clone(),
                     result: "pass".to_owned(),
@@ -535,16 +651,13 @@ pub fn gate(
                     run,
                 });
             }
-            PlatformOutcome::Failed { what, failures, .. } => {
+            Some(PlatformOutcome::Failed { what, failures, .. }) => {
                 failed.push((p.clone(), what, failures))
             }
-            PlatformOutcome::NoMachine(why) => no_machine.push(why),
-        }
-        if g.run.interrupted().is_some() {
-            return interrupted(g.run);
+            Some(PlatformOutcome::NoMachine(why)) => no_machines.push(why),
+            None => no_machines.push(format!("{p}: not run")),
         }
     }
-    let GateRun { mut run, .. } = g;
     if !failed.is_empty() {
         for (p, what, _) in &failed {
             run.fail(format!("{p}: {what}"));
@@ -565,14 +678,14 @@ pub fn gate(
             m,
         );
     }
-    if !no_machine.is_empty() {
-        run.fail(format!("no machine: {}", no_machine.join("; ")));
+    if !no_machines.is_empty() {
+        run.fail(format!("no machine: {}", no_machines.join("; ")));
         let _ = run.finish(false);
         return Err(Failure::new(
             Exit::NoMachine,
             format!(
                 "merge: no machine for every platform; {integration} has not moved (run {run_id}):\n  {}",
-                no_machine.join("\n  ")
+                no_machines.join("\n  ")
             ),
         ));
     }
@@ -642,6 +755,30 @@ pub fn gate(
         lock,
         run_dir,
     })
+}
+
+/// Refuses (4) when a platform this computer runs with `run = "check"` needs the atelier `M`
+/// pins and it is not installed: the check runs through `M`'s own pinned atelier.
+pub fn pinned_installed(settings: &Settings, names: &[String], m: &str, root: &Path) -> Result<()> {
+    let needs = names.iter().any(|p| {
+        is_local(p)
+            && settings
+                .platforms
+                .get(p)
+                .is_some_and(|ps| matches!(ps.run, PlatformRun::Named(_)))
+    });
+    if !needs {
+        return Ok(());
+    }
+    let pin = &settings.atelier;
+    if dispatch::binary_for(&home()?, pin).is_file() {
+        return Ok(());
+    }
+    Err(Failure::refused(format!(
+        "atelier {pin}, pinned by the merged commit {}, is not installed, so its check cannot run: {}",
+        short(root, m),
+        dispatch::install_command(pin)
+    )))
 }
 
 /// Step 1's per-branch preconditions, in batch order. Refuses (4), changing nothing.
@@ -758,16 +895,6 @@ pub(crate) fn split_z(bytes: &[u8]) -> Vec<String> {
         .split(|&b| b == 0)
         .filter(|f| !f.is_empty())
         .map(|f| String::from_utf8_lossy(f).into_owned())
-        .collect()
-}
-
-/// Every path some `merge.after` hook regenerates.
-pub fn regenerated_paths(settings: &Settings) -> BTreeSet<String> {
-    settings
-        .merge
-        .after
-        .iter()
-        .flat_map(|h| h.regenerates.iter().cloned())
         .collect()
 }
 
@@ -964,12 +1091,38 @@ pub enum Merged {
     Conflict(Vec<String>),
 }
 
+/// The configuration every git command of the gate's merges carries: no global attributes
+/// file (with `GIT_ATTR_NOSYSTEM=1`, no system one either), no reused resolutions, no
+/// renormalization, renames found.
+const GATE_CONFIG: &[&str] = &[
+    "-c",
+    "core.attributesFile=/dev/null",
+    "-c",
+    "rerere.enabled=false",
+    "-c",
+    "merge.renormalize=false",
+    "-c",
+    "merge.renames=true",
+];
+
+/// git for the gate's merges: [`GATE_CONFIG`] and `GIT_ATTR_NOSYSTEM=1`.
+pub fn gate_git<I, S>(dir: &Path, args: I) -> Result<std::process::Output>
+where
+    I: IntoIterator<Item = S>,
+    S: AsRef<std::ffi::OsStr>,
+{
+    git::command(dir)
+        .args(GATE_CONFIG)
+        .args(args)
+        .env("GIT_ATTR_NOSYSTEM", "1")
+        .output()
+        .map_err(|e| Failure::refused(format!("cannot run git: {e}")))
+}
+
 /// The options every gate merge carries: no fast-forward, no hooks, no signing, no autostash,
-/// no reused resolutions, and never an ignored file overwritten.
+/// and never an ignored file overwritten.
 fn merge_args<'a>(commit: &'a str, message: &'a str) -> Vec<&'a str> {
     vec![
-        "-c",
-        "rerere.enabled=false",
         "merge",
         "-q",
         "--no-ff",
@@ -985,20 +1138,149 @@ fn merge_args<'a>(commit: &'a str, message: &'a str) -> Vec<&'a str> {
     ]
 }
 
-/// Merges one approved commit into the gate's `HEAD` (step 3).
-pub fn merge_one(gate: &Path, item: &Item, regen: &BTreeSet<String>) -> Result<Merged> {
+/// git's own merge drivers; any other runs a command from the git configuration.
+const BUILT_IN_DRIVERS: &[&str] = &["text", "binary", "union"];
+
+/// A value of the effective git configuration in `dir`, if set.
+fn config_value(dir: &Path, key: &str) -> Result<Option<String>> {
+    let out = git::output(dir, ["config", "--get", key])?;
+    Ok(out
+        .status
+        .success()
+        .then(|| String::from_utf8_lossy(&out.stdout).trim().to_owned()))
+}
+
+/// The paths changed on both sides of merging `commit` into `head`.
+fn changed_on_both_sides(dir: &Path, head: &str, commit: &str) -> Result<Vec<String>> {
+    let base = git::output(dir, ["merge-base", head, commit])?;
+    if !base.status.success() {
+        return Ok(Vec::new());
+    }
+    let base = String::from_utf8_lossy(&base.stdout).trim().to_owned();
+    let changed = |to: &str| -> Result<BTreeSet<String>> {
+        let out = git::output(
+            dir,
+            ["diff", "--name-only", "--no-renames", "-z", &base, to, "--"],
+        )?;
+        Ok(split_z(&out.stdout).into_iter().collect())
+    };
+    let ours = changed(head)?;
+    Ok(changed(commit)?.intersection(&ours).cloned().collect())
+}
+
+/// The `merge` attribute of each path, as `git check-attr` gives it with the gate's
+/// configuration: from the checkout's `.gitattributes`, or `commit`'s with `source`, and
+/// `info/attributes`.
+fn merge_attributes(
+    dir: &Path,
+    source: Option<&str>,
+    paths: &[String],
+) -> Result<Vec<(String, String)>> {
+    let mut cmd = git::command(dir);
+    cmd.args(GATE_CONFIG)
+        .args(["check-attr", "-z", "--stdin"])
+        .env("GIT_ATTR_NOSYSTEM", "1")
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped());
+    if let Some(s) = source {
+        cmd.arg(format!("--source={s}"));
+    }
+    cmd.arg("merge");
+    let mut child = cmd
+        .spawn()
+        .map_err(|e| Failure::refused(format!("cannot run git: {e}")))?;
+    {
+        use std::io::Write as _;
+        let mut stdin = child.stdin.take().expect("piped");
+        for p in paths {
+            let _ = stdin.write_all(p.as_bytes());
+            let _ = stdin.write_all(b"\0");
+        }
+    }
+    let out = child
+        .wait_with_output()
+        .map_err(|e| Failure::refused(format!("git check-attr: {e}")))?;
+    if !out.status.success() {
+        return Err(Failure::refused(format!(
+            "git check-attr merge failed: {}",
+            String::from_utf8_lossy(&out.stderr).trim()
+        )));
+    }
+    let fields = split_z(&out.stdout);
+    Ok(fields
+        .chunks(3)
+        .filter(|c| c.len() == 3)
+        .map(|c| (c[0].clone(), c[2].clone()))
+        .collect())
+}
+
+/// Refuses (4) a merge in which a path changed on both sides would be merged by a merge
+/// driver that is not git's own (`text`, `binary`, `union`): one that `.gitattributes` (either
+/// side's) or `info/attributes` assigns, that `merge.default` names, or a built-in name the git
+/// configuration redefines. Such a driver could settle a conflict without a word (DESIGN §8.2:
+/// the gate never resolves anything).
+pub fn refuse_merge_drivers(dir: &Path, head: &str, commit: &str, name: &str) -> Result<()> {
+    let both = changed_on_both_sides(dir, head, commit)?;
+    if both.is_empty() {
+        return Ok(());
+    }
+    let default = config_value(dir, "merge.default")?;
+    let mut problems: Vec<String> = Vec::new();
+    for source in [None, Some(commit)] {
+        for (path, value) in merge_attributes(dir, source, &both)? {
+            let driver = match value.as_str() {
+                // `merge` set or unset: git's text and binary merges, never a configured one.
+                "set" | "unset" => continue,
+                "unspecified" => match &default {
+                    Some(d) => d.clone(),
+                    None => continue,
+                },
+                other => other.to_owned(),
+            };
+            let line = if !BUILT_IN_DRIVERS.contains(&driver.as_str()) {
+                format!("{path}: merge driver {driver:?}")
+            } else if config_value(dir, &format!("merge.{driver}.driver"))?.is_some() {
+                format!(
+                    "{path}: merge={driver}, which the git configuration redefines (merge.{driver}.driver)"
+                )
+            } else {
+                continue;
+            };
+            if !problems.contains(&line) {
+                problems.push(line);
+            }
+        }
+    }
+    if problems.is_empty() {
+        return Ok(());
+    }
+    Err(Failure::refused(format!(
+        "merging {name}: paths changed on both sides would be merged by a merge driver other than git's own (text, binary, union); the gate never lets anything resolve a conflict:\n  {}\nremove that merge attribute (.gitattributes, .git/info/attributes) or merge.default, or the driver from the git configuration; nothing was merged",
+        problems.join("\n  ")
+    )))
+}
+
+/// Merges one approved commit into the gate's `HEAD` (step 3). `old_regen` is
+/// [`regenerated_paths`] of OLD's committed settings; a rules item settles nothing.
+pub fn merge_one(gate: &Path, item: &Item, old_regen: &BTreeSet<String>) -> Result<Merged> {
+    let none = BTreeSet::new();
+    let regen = if item.rules { &none } else { old_regen };
     merge_commit(gate, &item.commit, &item.name, regen)
 }
 
-/// Merges `commit` (the branch `name`'s) into the gate's `HEAD`.
+/// Merges `commit` (the branch `name`'s) into the gate's `HEAD`. A conflict is settled only in
+/// paths both `old_regen` and the merged settings (the index's, after the merge) name in a
+/// hook with `commit`; the incoming side is taken there.
 pub fn merge_commit(
     gate: &Path,
     commit: &str,
     name: &str,
-    regen: &BTreeSet<String>,
+    old_regen: &BTreeSet<String>,
 ) -> Result<Merged> {
+    refuse_merge_drivers(gate, "HEAD", commit, name)?;
     let message = format!("Merge branch '{name}'");
-    let out = git::output(gate, merge_args(commit, &message))?;
+    let out = gate_git(gate, merge_args(commit, &message))?;
     if out.status.success() {
         return Ok(Merged::Clean);
     }
@@ -1009,13 +1291,24 @@ pub fn merge_commit(
         .success();
     if conflicted.is_empty() {
         if in_merge {
-            let _ = git::output(gate, ["merge", "--abort"]);
+            let _ = gate_git(gate, ["merge", "--abort"]);
         }
         return Err(Failure::refused(format!(
             "git merge of {name} in the gate failed: {}",
             String::from_utf8_lossy(&out.stderr).trim()
         )));
     }
+    let regen: BTreeSet<String> = if old_regen.is_empty() {
+        BTreeSet::new()
+    } else {
+        match settings_at(gate, "") {
+            Ok(Some(merged)) => regenerated_paths(&merged)
+                .intersection(old_regen)
+                .cloned()
+                .collect(),
+            _ => BTreeSet::new(),
+        }
+    };
     let real: Vec<String> = conflicted
         .iter()
         .filter(|p| !regen.contains(*p))
@@ -1026,12 +1319,12 @@ pub fn merge_commit(
         return Ok(Merged::Conflict(real));
     }
     for p in &conflicted {
-        let theirs = git::output(gate, ["checkout", "--theirs", "--", p])?;
+        let theirs = gate_git(gate, ["checkout", "--theirs", "--", p])?;
         let staged = if theirs.status.success() {
-            git::output(gate, ["add", "--", p])?
+            gate_git(gate, ["add", "--", p])?
         } else {
             // The incoming side deleted it.
-            git::output(gate, ["rm", "-q", "-f", "--", p])?
+            gate_git(gate, ["rm", "-q", "-f", "--", p])?
         };
         if !staged.status.success() {
             abort(gate)?;
@@ -1041,7 +1334,7 @@ pub fn merge_commit(
             )));
         }
     }
-    let commit_out = git::output(
+    let commit_out = gate_git(
         gate,
         ["commit", "-q", "--no-edit", "--no-verify", "--no-gpg-sign"],
     )?;
@@ -1056,7 +1349,7 @@ pub fn merge_commit(
 }
 
 fn abort(gate: &Path) -> Result<()> {
-    let out = git::output(gate, ["merge", "--abort"])?;
+    let out = gate_git(gate, ["merge", "--abort"])?;
     if !out.status.success() {
         return Err(Failure::refused(format!(
             "git merge --abort in the gate failed: {}",
@@ -1101,7 +1394,7 @@ fn conflict_with(
 /// True when merging `a` and `b` conflicts in a path no hook regenerates (`git merge-tree`,
 /// touching no files).
 fn trees_conflict(dir: &Path, a: &str, b: &str, regen: &BTreeSet<String>) -> bool {
-    let Ok(out) = git::output(
+    let Ok(out) = gate_git(
         dir,
         [
             "merge-tree",
@@ -1125,17 +1418,29 @@ fn trees_conflict(dir: &Path, a: &str, b: &str, regen: &BTreeSet<String>) -> boo
     }
 }
 
-/// Step 4: the `merge.after` hooks in the gate. Returns whether all passed.
-pub(crate) fn after_hooks(run: &mut Run, gate: &Path, settings: &Settings) -> Result<bool> {
+/// How step 4's hooks ended.
+pub struct HooksEnd {
+    /// Every hook passed and left nothing uncommitted.
+    pub ok: bool,
+    /// Per hook with `commit`, the paths its commit changed.
+    pub touched: std::collections::BTreeMap<String, BTreeSet<String>>,
+}
+
+/// Step 4: the `merge.after` hooks in the gate.
+pub(crate) fn after_hooks(run: &mut Run, gate: &Path, settings: &Settings) -> Result<HooksEnd> {
+    let mut end = HooksEnd {
+        ok: false,
+        touched: Default::default(),
+    };
     for h in &settings.merge.after {
         let rec = run.step(&format!("after:{}", h.name), &h.run, gate, &[])?;
         if !rec.passed() {
             println!("  merge.after {}: FAILED (log {})", h.name, rec.log);
             run.fail(format!("merge.after {} failed (log {})", h.name, rec.log));
-            return Ok(false);
+            return Ok(end);
         }
         if run.interrupted().is_some() {
-            return Ok(false);
+            return Ok(end);
         }
         let changed = unclean_paths(gate)?;
         match (&h.commit, changed.is_empty()) {
@@ -1156,8 +1461,24 @@ pub(crate) fn after_hooks(run: &mut Run, gate: &Path, settings: &Settings) -> Re
                         h.name,
                         String::from_utf8_lossy(&commit.stderr).trim()
                     ));
-                    return Ok(false);
+                    return Ok(end);
                 }
+                let paths = git::output(
+                    gate,
+                    [
+                        "diff-tree",
+                        "--no-commit-id",
+                        "--name-only",
+                        "--no-renames",
+                        "-r",
+                        "-z",
+                        "HEAD",
+                    ],
+                )?;
+                end.touched
+                    .entry(h.name.clone())
+                    .or_default()
+                    .extend(split_z(&paths.stdout));
                 println!(
                     "  merge.after {}: committed {} path(s): {msg}",
                     h.name,
@@ -1171,11 +1492,124 @@ pub(crate) fn after_hooks(run: &mut Run, gate: &Path, settings: &Settings) -> Re
                     h.name,
                     changed.join(", ")
                 ));
+                return Ok(end);
+            }
+        }
+    }
+    end.ok = true;
+    Ok(end)
+}
+
+/// After step 4, each conflict settled with the incoming side (HF1) must hold what a hook of
+/// the merged settings with `commit` that names it produced: its commit changed the path, or,
+/// with the path removed, running the hooks that name it again gives back exactly `M`'s tree.
+/// Otherwise RED: the path would hold one side's hand edit, not the generated content.
+pub(crate) fn verify_settled(
+    run: &mut Run,
+    gate: &Checkout,
+    settings: &Settings,
+    m: &str,
+    settled: &BTreeSet<String>,
+    touched: &std::collections::BTreeMap<String, BTreeSet<String>>,
+) -> Result<bool> {
+    let mut again: Vec<String> = Vec::new();
+    let mut paths: Vec<&String> = Vec::new();
+    for p in settled {
+        let hooks: Vec<&crate::settings::AfterHook> = settings
+            .merge
+            .after
+            .iter()
+            .filter(|h| h.commit.is_some() && h.regenerates.contains(p))
+            .collect();
+        if hooks.is_empty() {
+            run.fail(format!(
+                "the conflict in {p} was settled for a merge.after hook, but no hook with commit names it in the merged settings"
+            ));
+            return Ok(false);
+        }
+        if hooks
+            .iter()
+            .any(|h| touched.get(&h.name).is_some_and(|t| t.contains(p)))
+        {
+            continue;
+        }
+        paths.push(p);
+        for h in hooks {
+            if !again.contains(&h.name) {
+                again.push(h.name.clone());
+            }
+        }
+    }
+    if paths.is_empty() {
+        return Ok(true);
+    }
+    println!(
+        "  regenerated paths not rewritten by their hook's commit, checked by running it again: {}",
+        paths
+            .iter()
+            .map(|p| p.as_str())
+            .collect::<Vec<_>>()
+            .join(", ")
+    );
+    for p in &paths {
+        match fs::remove_file(gate.root.join(p)) {
+            Ok(()) => {}
+            Err(e) if e.kind() == ErrorKind::NotFound => {}
+            Err(e) => {
+                run.fail(format!("{p}: {e}"));
                 return Ok(false);
             }
         }
     }
-    Ok(true)
+    let mut ok = true;
+    for h in settings
+        .merge
+        .after
+        .iter()
+        .filter(|h| again.contains(&h.name))
+    {
+        let rec = run.step(&format!("regenerate:{}", h.name), &h.run, &gate.root, &[])?;
+        if !rec.passed() {
+            run.fail(format!(
+                "merge.after {} failed when run again (log {})",
+                h.name, rec.log
+            ));
+            ok = false;
+            break;
+        }
+    }
+    if ok {
+        let now = tree::tree_id(gate).ok();
+        let want = git::run(&gate.root, ["rev-parse", &format!("{m}^{{tree}}")])?;
+        if now.as_deref() != Some(want.as_str()) {
+            let files = unclean_paths(&gate.root).unwrap_or_default();
+            run.fail(format!(
+                "merge.after {} did not regenerate {} as merged: running it again gives another tree ({}); a regenerates hook must always rewrite its files",
+                again.join(", "),
+                paths
+                    .iter()
+                    .map(|p| p.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", "),
+                files.join(", ")
+            ));
+            ok = false;
+        }
+    }
+    if !ok {
+        // Back what atelier removed and no hook wrote again; anything else stays for inspection.
+        let missing: Vec<&str> = paths
+            .iter()
+            .filter(|p| fs::symlink_metadata(gate.root.join(p)).is_err())
+            .map(|p| p.as_str())
+            .collect();
+        if !missing.is_empty() {
+            let mut args = vec!["checkout", "-q", m, "--"];
+            args.extend(missing);
+            let _ = git::output(&gate.root, args);
+        }
+    }
+    Ok(ok)
 }
 
 /// The gate's tree id must be `m`'s tree; a failure line otherwise.
@@ -1200,14 +1634,13 @@ fn tree_is(run: &mut Run, gate: &Checkout, m: &str, when: &str) -> Result<bool> 
 }
 
 /// A platform run on this computer, in the gate worktree on `M` (DESIGN §2.5).
-fn run_local(g: &mut GateRun<'_>, home: &Path, platform: &str) -> Result<PlatformOutcome> {
-    let gate = g.gate.root.clone();
+pub fn run_local(g: &mut GateRun<'_>, home: &Path, platform: &str) -> Result<PlatformOutcome> {
     let runs_dir = g.ctx.state.runs_dir();
     run_local_in(
-        &mut g.run,
+        g.run,
         &runs_dir,
-        &gate,
-        &g.settings,
+        &g.gate.root,
+        g.settings,
         home,
         platform,
         None,
@@ -1274,12 +1707,26 @@ pub fn run_local_in(
                 argv.push(file.to_string_lossy().into_owned());
                 name = format!("check-only@{platform}");
             }
-            let env = vec![(DISPATCHED_VAR.to_owned(), "1".to_owned())];
-            let before = runs_under(runs_dir, run.id());
+            // The check takes the id it is given, so its run is known exactly; a check step that
+            // runs atelier itself starts runs of its own under it.
+            let wanted = crate::runs::new_run_id()?;
+            let env = vec![
+                (DISPATCHED_VAR.to_owned(), "1".to_owned()),
+                (crate::runs::RUN_ID_VAR.to_owned(), wanted.clone()),
+            ];
+            let before = direct_runs_under(runs_dir, run.id());
             let rec = run.step(&name, &argv, gate, &env)?;
-            let inner = runs_under(runs_dir, run.id())
-                .into_iter()
-                .find(|id| !before.contains(id));
+            let inner = if direct_runs_under(runs_dir, run.id()).contains(&wanted) {
+                Some(wanted)
+            } else {
+                // A pinned atelier that does not take the id: the one new run directly under
+                // this one, if there is exactly one.
+                let new: Vec<String> = direct_runs_under(runs_dir, run.id())
+                    .into_iter()
+                    .filter(|id| !before.contains(id))
+                    .collect();
+                (new.len() == 1).then(|| new[0].clone())
+            };
             let result = inner
                 .as_ref()
                 .and_then(|id| RunResult::read(&runs_dir.join(id)).ok().flatten());
@@ -1372,19 +1819,19 @@ fn failed_names(r: &RunResult) -> Vec<String> {
     out
 }
 
-/// The runs started under the run `outer` (their `ATELIER_RUNS` list names it): the inner
-/// `atelier check` runs of a gate.
-pub fn runs_under(runs_dir: &Path, outer: &str) -> BTreeSet<String> {
+/// The runs started directly by a step of the run `outer`: their `ATELIER_RUNS` list ends with
+/// `outer`, then their own id.
+pub fn direct_runs_under(runs_dir: &Path, outer: &str) -> BTreeSet<String> {
     let mut found = BTreeSet::new();
     let Ok(entries) = fs::read_dir(runs_dir) else {
         return found;
     };
     for e in entries.flatten() {
-        if let Ok(Some(info)) = RunInfo::read(&e.path())
-            && info.id != outer
-            && info.runs.iter().any(|r| r == outer)
-        {
-            found.insert(info.id);
+        if let Ok(Some(info)) = RunInfo::read(&e.path()) {
+            let n = info.runs.len();
+            if n >= 2 && info.runs[n - 2] == outer && info.runs[n - 1] == info.id {
+                found.insert(info.id);
+            }
         }
     }
     found
@@ -1405,8 +1852,9 @@ fn red(
 ) -> Result<GateEnd> {
     let id = run.id().to_owned();
     let (result, lock) = run.finish_keeping_lock(false)?;
+    let cause = result.failures.join("; ");
     let what = if failed.is_empty() {
-        result.failures.join("; ")
+        cause.clone()
     } else {
         failed.join(", ")
     };
@@ -1421,6 +1869,7 @@ fn red(
         failures,
         run_id: id,
         m,
+        cause,
     })
 }
 

@@ -73,12 +73,13 @@ pub enum Cmd {
     Merge {
         #[arg(required = true)]
         branches: Vec<String>,
-        /// A platform the owner waived for this merge.
+        /// A platform the owner waived for this merge; repeat it for several, each with its
+        /// own --reason, in the same order.
         #[arg(long, value_name = "PLATFORM", requires = "reason")]
-        waive: Option<String>,
-        /// The owner's words for the waiver.
+        waive: Vec<String>,
+        /// The owner's words for the waiver named by the --waive in the same position.
         #[arg(long, requires = "waive")]
-        reason: Option<String>,
+        reason: Vec<String>,
     },
     /// Finish a pending promotion.
     Promote {
@@ -352,14 +353,22 @@ pub fn run(cmd: Cmd, cwd: &Path) -> Result<Exit> {
             reason,
         } => {
             let ctx = preflight::run(cwd, cmd.name(), cmd.needs())?;
-            let waiver = match (waive, reason) {
-                (Some(platform), Some(reason)) => Some(crate::gate::Waiver {
+            if waive.len() != reason.len() {
+                return Err(crate::exit::Failure::usage(format!(
+                    "each --waive needs its own --reason ({} --waive, {} --reason)",
+                    waive.len(),
+                    reason.len()
+                )));
+            }
+            let waivers: Vec<crate::gate::Waiver> = waive
+                .iter()
+                .zip(reason)
+                .map(|(platform, reason)| crate::gate::Waiver {
                     platform: platform.clone(),
                     reason: reason.clone(),
-                }),
-                _ => None,
-            };
-            return crate::gate::run(&ctx, branches, waiver);
+                })
+                .collect();
+            return crate::gate::run(&ctx, branches, &waivers);
         }
         Cmd::Promote { discard } => {
             let ctx = preflight::run(cwd, cmd.name(), cmd.needs())?;
@@ -454,6 +463,7 @@ mod tests {
             "atelier follow",
             "atelier approve disk-api 3f2a9c1",
             "atelier merge disk-api disk-ui --waive linux-x86_64 --reason owner",
+            "atelier merge a --waive linux-x86_64 --reason r1 --waive macos-aarch64 --reason r2",
             "atelier promote --discard",
             "atelier tmp --short -- sh -c true",
             "atelier clean a b --yes",

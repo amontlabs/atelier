@@ -1262,7 +1262,7 @@ fn a_red_batch_names_the_culprit_and_the_green_prefix_lands_after_one_full_gate(
     assert!(so.contains("prefix a: none of the failures appear"), "{so}");
     assert!(
         so.contains(&format!(
-            "merge: b breaks: {}: step verify",
+            "merge: b breaks: on prefix a, b: {}: step verify (check run ",
             this_platform()
         )),
         "{so}"
@@ -1461,7 +1461,7 @@ fn bisection_reruns_the_failed_tests_by_name_on_a_rust_workspace() {
     assert!(so.contains("prefix a: none of the failures appear"), "{so}");
     assert!(
         so.contains(&format!(
-            "merge: b breaks: {}: a::tb$breaks_b",
+            "merge: b breaks: on prefix a, b: {}: a::tb$breaks_b (check run ",
             this_platform()
         )),
         "{so}"

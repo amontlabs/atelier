@@ -12,11 +12,11 @@
 
 use std::collections::BTreeMap;
 use std::fs;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 use crate::check::{Only, OnlyTest};
-use crate::exit::{Failure, Result};
-use crate::gate::{self, Item, Merged, PlatformOutcome};
+use crate::exit::Result;
+use crate::gate::{self, GateRun, Item, Merged, PlatformOutcome, Platforms};
 use crate::git;
 use crate::locks::HeldLock;
 use crate::preflight::Context;
@@ -31,6 +31,8 @@ pub const KIND: &str = "gate-bisect";
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Failures {
     pub platform: String,
+    /// The machine it failed on, when not this computer: the re-run goes there first.
+    pub machine: Option<String>,
     /// The failure cannot be narrowed: the platform's whole run is repeated.
     pub whole: bool,
     /// The failed tests by name and the failed steps.
@@ -42,8 +44,17 @@ impl Failures {
     pub fn whole(platform: &str) -> Failures {
         Failures {
             platform: platform.to_owned(),
+            machine: None,
             whole: true,
             only: Only::default(),
+        }
+    }
+
+    /// A failure on another machine, re-run whole there: its failed tests are on that machine.
+    pub fn whole_on(platform: &str, machine: &str) -> Failures {
+        Failures {
+            machine: Some(machine.to_owned()),
+            ..Self::whole(platform)
         }
     }
 
@@ -94,6 +105,7 @@ impl Failures {
         }
         Failures {
             platform: platform.to_owned(),
+            machine: None,
             whole,
             only,
         }
@@ -102,7 +114,10 @@ impl Failures {
     /// `tests a, b; steps links` or `its whole run`, for messages.
     pub fn describe(&self) -> String {
         if self.whole {
-            return format!("{}: its whole run", self.platform);
+            return match &self.machine {
+                Some(m) => format!("{}: its whole run (on {m})", self.platform),
+                None => format!("{}: its whole run", self.platform),
+            };
         }
         let mut parts = Vec::new();
         if !self.only.tests.is_empty() {
@@ -127,19 +142,33 @@ pub struct Search<'a> {
     pub ctx: &'a Context,
     pub items: &'a [Item],
     pub old: &'a str,
+    /// OLD's committed settings: which conflicts may be settled (HF1).
+    pub old_settings: &'a Settings,
     /// The failed batch's merged commit.
     pub red_m: &'a str,
     pub red_run: &'a str,
     pub failures: &'a [Failures],
+    /// What made the gate RED, for a RED that is no platform's.
+    pub cause: &'a str,
 }
 
 impl Search<'_> {
     /// Runs the search; returns the lock and the length of the longest green prefix (0: even
     /// the first branch alone fails, nothing lands).
-    pub fn run(&self, lock: HeldLock) -> Result<(HeldLock, usize)> {
+    pub fn run(&self, lock: HeldLock, platforms: &mut dyn Platforms) -> Result<(HeldLock, usize)> {
         let root = &self.ctx.checkout.root;
         let n = self.items.len();
         let names: Vec<&str> = self.items.iter().map(|i| i.name.as_str()).collect();
+        if self.failures.is_empty() {
+            // The merged settings, the hooks or the tree made it RED: no platform failure to
+            // re-run, so no prefix can be judged by one.
+            println!(
+                "merge: no search: the RED is not a platform's failure ({}); re-running prefixes cannot tell which branch causes it, so no branch is blamed; {} stay approved",
+                self.cause,
+                names.join(", ")
+            );
+            return Ok((lock, 0));
+        }
         let what = describe_all(self.failures);
         println!(
             "merge: finding what breaks the batch ({}): prefixes longest first, re-running only {what}",
@@ -156,9 +185,6 @@ impl Search<'_> {
                 return Ok((lock, 0));
             }
         };
-        let home = std::env::var_os("HOME")
-            .map(PathBuf::from)
-            .ok_or_else(|| Failure::refused("HOME is not set"))?;
         let mut run = Run::start_held(
             &self.ctx.state,
             lock,
@@ -167,17 +193,22 @@ impl Search<'_> {
             &gate.root,
         )?;
         run.set_branch(Some(names.join(" ")));
-        let runs_dir = self.ctx.state.runs_dir();
-        let regen = gate::regenerated_paths(&self.ctx.settings);
+        let old_regen = gate::regenerated_paths(self.old_settings);
 
-        // Tree → verdict (true: none of the failures appeared).
-        let mut judged: BTreeMap<String, (bool, String)> = BTreeMap::new();
+        // Tree → (verdict, what judged it, what failed on it).
+        let mut judged: BTreeMap<String, (bool, String, String)> = BTreeMap::new();
         let red_tree = git::run(
             &gate.root,
             ["rev-parse", &format!("{}^{{tree}}", self.red_m)],
         )?;
-        judged.insert(red_tree, (false, "the failed batch".to_owned()));
+        judged.insert(
+            red_tree,
+            (false, "the failed batch".to_owned(), what.clone()),
+        );
 
+        // What failed on each prefix length judged (n: the failed batch).
+        let mut failed_on: BTreeMap<usize, String> = BTreeMap::new();
+        failed_on.insert(n, what.clone());
         let mut green = 0;
         let mut stopped = None;
         'prefixes: for k in (1..n).rev() {
@@ -186,9 +217,11 @@ impl Search<'_> {
                 stopped = Some(e.message);
                 break;
             }
+            let mut settled = std::collections::BTreeSet::new();
             for item in &self.items[..k] {
-                match gate::merge_one(&gate.root, item, &regen) {
-                    Ok(Merged::Clean) | Ok(Merged::Settled(_)) => {}
+                match gate::merge_one(&gate.root, item, &old_regen) {
+                    Ok(Merged::Clean) => {}
+                    Ok(Merged::Settled(paths)) => settled.extend(paths),
                     Ok(Merged::Conflict(files)) => {
                         stopped = Some(format!(
                             "prefix {label}: {} conflicts ({})",
@@ -206,44 +239,80 @@ impl Search<'_> {
             let settings = match Settings::load(&gate.root) {
                 Ok(s) => s,
                 Err(e) => {
-                    stopped = Some(e.message);
+                    stopped = Some(format!("prefix {label}: {}", e.message));
                     break;
                 }
             };
-            let hooks_ok = gate::after_hooks(&mut run, &gate.root, &settings)?;
+            let hooks = gate::after_hooks(&mut run, &gate.root, &settings)?;
+            let m = git::run(&gate.root, ["rev-parse", "HEAD"])?;
+            let mut hooks_ok = hooks.ok;
+            if hooks_ok {
+                hooks_ok =
+                    gate::verify_settled(&mut run, &gate, &settings, &m, &settled, &hooks.touched)?;
+            }
+            // Leftovers in the gate would come into every shorter prefix; atelier deletes
+            // nothing there, so the search stops.
+            let dirty = gate::unclean_paths(&gate.root)?;
+            if !dirty.is_empty() {
+                stopped = Some(format!(
+                    "prefix {label}: the gate is not clean after its merge.after hooks: {}; look at each path in {}, keep what matters and remove the rest",
+                    dirty.join(", "),
+                    gate.root.display()
+                ));
+                break;
+            }
+            if run.interrupted().is_some() {
+                stopped = Some("interrupted".to_owned());
+                break;
+            }
             let tree = git::run(&gate.root, ["rev-parse", "HEAD^{tree}"])?;
-            let clean = gate::unclean_paths(&gate.root)?.is_empty();
-            let verdict = if !hooks_ok || !clean {
-                println!("  prefix {label}: its merge.after hooks failed");
-                false
-            } else if let Some((v, of)) = judged.get(&tree) {
+            let (verdict, failed) = if !hooks_ok {
+                let why = format!(
+                    "its merge.after hooks: {}",
+                    run.failures().last().cloned().unwrap_or_default()
+                );
+                println!("  prefix {label}: {why}");
+                (false, why)
+            } else if let Some((v, of, failed)) = judged.get(&tree) {
                 println!(
                     "  prefix {label}: the same tree as {of}, already judged: {}",
                     word(*v)
                 );
-                *v
+                (*v, failed.clone())
             } else {
+                let names_needed: Vec<String> =
+                    self.failures.iter().map(|f| f.platform.clone()).collect();
+                if let Err(e) = gate::pinned_installed(&settings, &names_needed, &m, root) {
+                    stopped = Some(format!("prefix {label}: {}", e.message));
+                    break;
+                }
                 let mut all = true;
+                let mut what_failed = Vec::new();
                 for f in self.failures {
-                    if !gate::is_local(&f.platform) {
-                        stopped = Some(format!(
-                            "{} ran on another machine: re-running it comes with module 3.6",
-                            f.platform
-                        ));
-                        break 'prefixes;
-                    }
-                    let only = (!f.whole).then_some(&f.only);
-                    let out = gate::run_local_in(
-                        &mut run,
-                        &runs_dir,
-                        &gate.root,
-                        &settings,
-                        &home,
-                        &f.platform,
-                        only,
-                    )?;
-                    if !matches!(out, PlatformOutcome::Passed { .. }) {
-                        all = false;
+                    let out = {
+                        let mut g = GateRun {
+                            ctx: self.ctx,
+                            run: &mut run,
+                            gate: &gate,
+                            settings: &settings,
+                            m: &m,
+                        };
+                        platforms.rerun(&mut g, f)?
+                    };
+                    match out {
+                        PlatformOutcome::Passed { .. } => {}
+                        PlatformOutcome::Failed { what, failures, .. } => {
+                            all = false;
+                            what_failed.push(if failures.whole {
+                                format!("{}: {what}", f.platform)
+                            } else {
+                                format!("{} ({what})", failures.describe())
+                            });
+                        }
+                        PlatformOutcome::NoMachine(why) => {
+                            stopped = Some(format!("prefix {label}: {why}"));
+                            break 'prefixes;
+                        }
                     }
                     if run.interrupted().is_some() {
                         stopped = Some("interrupted".to_owned());
@@ -251,43 +320,52 @@ impl Search<'_> {
                     }
                 }
                 println!("  prefix {label}: {}", word(all));
-                judged.insert(tree, (all, format!("prefix {label}")));
-                all
+                let failed = what_failed.join("; ");
+                judged.insert(tree, (all, format!("prefix {label}"), failed.clone()));
+                (all, failed)
             };
             if verdict {
                 green = k;
                 break;
             }
+            failed_on.insert(k, failed);
         }
 
-        let failures = describe_all(self.failures);
-        let (passed, lock) = if let Some(why) = stopped {
+        let lock = if let Some(why) = stopped {
             run.fail(format!("search stopped: {why}"));
             println!(
                 "merge: the search stopped ({why}); the RED verdict stands and every branch stays approved"
             );
             let (_, lock) = run.finish_keeping_lock(false)?;
             green = 0;
-            (false, lock)
+            lock
         } else {
+            let culprit = names[green];
+            let failed = failed_on.get(&(green + 1)).cloned().unwrap_or_default();
             if green == n - 1 {
                 println!(
-                    "merge: fails only with the whole batch ({}), or is flaky: {failures}",
-                    names[n - 1]
+                    "merge: fails only with the whole batch ({culprit}), or is flaky: {failed}"
                 );
             } else {
-                println!("merge: {} breaks: {failures}", names[green]);
+                println!(
+                    "merge: {culprit} breaks: on prefix {}: {failed}",
+                    names[..=green].join(", ")
+                );
             }
             if green == 0 {
                 println!("merge: nothing lands; {} stay approved", names.join(", "));
             }
             let (_, lock) = run.finish_keeping_lock(true)?;
-            (true, lock)
+            lock
         };
-        let _ = passed;
         if green == 0 {
-            // Back to the failed batch's tree, for inspection.
-            let _ = gate::checkout_detached(&gate.root, self.red_m);
+            // Back to the failed batch's tree, for inspection, when the gate allows it.
+            if gate::unclean_paths(&gate.root)
+                .map(|d| d.is_empty())
+                .unwrap_or(false)
+            {
+                let _ = gate::checkout_detached(&gate.root, self.red_m);
+            }
         }
         let _ = short(root, self.old);
         Ok((lock, green))
@@ -303,9 +381,6 @@ fn word(v: bool) -> &'static str {
 }
 
 fn describe_all(failures: &[Failures]) -> String {
-    if failures.is_empty() {
-        return "the merge.after hooks".to_owned();
-    }
     failures
         .iter()
         .map(Failures::describe)

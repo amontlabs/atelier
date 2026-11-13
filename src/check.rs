@@ -121,7 +121,10 @@ pub fn run_mode(
     };
     // The prerequisite commands carry the id the run then takes, so any of them that leaves a
     // process behind is found by the marker scan.
-    let marker = runs::new_run_id()?;
+    let marker = match std::env::var(runs::RUN_ID_VAR) {
+        Ok(id) if runs::is_run_id(&id) && !ctx.state.runs_dir().join(&id).exists() => id,
+        _ => runs::new_run_id()?,
+    };
     let workspaces = prereq::workspaces(checkout, &ctx.settings, &marker);
     let platform = Platform::current();
     let snapshot = prereq::verify(checkout, &ctx.settings, &workspaces, platform, &marker)?;

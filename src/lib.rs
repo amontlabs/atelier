@@ -20,6 +20,7 @@ pub mod exit;
 pub mod follow;
 pub mod fsutil;
 pub mod gate;
+pub mod gate_machines;
 pub mod git;
 pub mod jobs;
 pub mod ledger;
