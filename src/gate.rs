@@ -232,7 +232,7 @@ pub fn run_with(
 
     let stack = Stack::new(&ctx.checkout, &ctx.state, &integration);
     let old = stack.integration_tip()?;
-    let items = preconditions(ctx, &v, &stack, branches, &old)?;
+    let items = preconditions(ctx, &v, &stack, branches)?;
 
     // Machines first, so an unavailable platform costs seconds, not a whole run.
     let mut missing = Vec::new();
@@ -650,7 +650,6 @@ fn preconditions(
     v: &crate::state::Versioned,
     stack: &Stack,
     branches: &[String],
-    old: &str,
 ) -> Result<Vec<Item>> {
     let root = &ctx.checkout.root;
     let mut items: Vec<Item> = Vec::new();
@@ -701,7 +700,7 @@ fn preconditions(
                 )));
             }
         }
-        let rules = changes_rules(root, &ctx.settings, old, &approval.commit)?;
+        let rules = changes_rules(root, &ctx.settings, &me.record.base, &approval.commit)?;
         items.push(Item {
             name: b.clone(),
             lifetime: me.record.lifetime.clone(),
@@ -721,9 +720,10 @@ fn preconditions(
     Ok(items)
 }
 
-/// True when the branch's own changes (from its merge base with `OLD`) touch `.atelier/`,
-/// `AGENTS.md` or a file the rules import into.
-fn changes_rules(root: &Path, settings: &Settings, old: &str, commit: &str) -> Result<bool> {
+/// True when the branch's own commits (from its recorded base) touch `.atelier/`, `AGENTS.md`
+/// or a file the rules import into. A stacked branch is judged by its own commits; its lower
+/// branch is judged by its own.
+fn changes_rules(root: &Path, settings: &Settings, base: &str, commit: &str) -> Result<bool> {
     let out = git::output(
         root,
         [
@@ -731,13 +731,14 @@ fn changes_rules(root: &Path, settings: &Settings, old: &str, commit: &str) -> R
             "--name-only",
             "--no-renames",
             "-z",
-            &format!("{old}...{commit}"),
+            base,
+            commit,
             "--",
         ],
     )?;
     if !out.status.success() {
         return Err(Failure::refused(format!(
-            "git diff {old}...{commit} failed: {}",
+            "git diff {base} {commit} failed: {}",
             String::from_utf8_lossy(&out.stderr).trim()
         )));
     }
@@ -976,6 +977,7 @@ fn merge_args<'a>(commit: &'a str, message: &'a str) -> Vec<&'a str> {
         "--no-verify",
         "--no-gpg-sign",
         "--no-autostash",
+        "--no-verify-signatures",
         "--no-overwrite-ignore",
         "-m",
         message,

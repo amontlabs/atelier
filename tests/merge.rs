@@ -1329,3 +1329,144 @@ fn a_tree_already_judged_is_not_run_again() {
         .count();
     assert_eq!(only, 0, "no tree is tested twice");
 }
+
+// ---------------------------------------------------------------------------------------------
+// Bisection on a Rust workspace: the failed tests re-run by name (`check --only`)
+
+fn real_home() -> PathBuf {
+    PathBuf::from(std::env::var_os("HOME").expect("HOME"))
+}
+
+fn rust_env(cmd: &mut std::process::Command, plain: &Path) {
+    let mut dirs = vec![plain.to_path_buf()];
+    if let Some(p) = std::env::var_os("PATH") {
+        dirs.extend(std::env::split_paths(&p));
+    }
+    cmd.env("PATH", std::env::join_paths(dirs).unwrap())
+        .env(
+            "RUSTUP_HOME",
+            std::env::var_os("RUSTUP_HOME")
+                .map(PathBuf::from)
+                .unwrap_or_else(|| real_home().join(".rustup")),
+        )
+        .env(
+            "CARGO_HOME",
+            std::env::var_os("CARGO_HOME")
+                .map(PathBuf::from)
+                .unwrap_or_else(|| real_home().join(".cargo")),
+        )
+        .env_remove("ATELIER_RUNS")
+        .env_remove("MBX_DISABLE")
+        .env_remove("CARGO_TARGET_DIR")
+        .env_remove("CARGO_BUILD_TARGET_DIR")
+        .env_remove("RUSTC_WRAPPER")
+        .env_remove("CARGO_BUILD_RUSTC_WRAPPER")
+        .env_remove("RUSTC_WORKSPACE_WRAPPER")
+        .env_remove("NEXTEST_RETRIES")
+        .env_remove("NEXTEST_FLAKY_RESULT");
+}
+
+#[test]
+fn bisection_reruns_the_failed_tests_by_name_on_a_rust_workspace() {
+    let repo = Repo::new();
+    let plain = repo.tmp.path().join("plainbin");
+    fs::create_dir_all(&plain).unwrap();
+    let proxy = std::env::var_os("CARGO_HOME")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| real_home().join(".cargo"))
+        .join("bin/cargo");
+    if proxy.is_file() {
+        std::os::unix::fs::symlink(&proxy, plain.join("cargo")).unwrap();
+    }
+    let mut v = std::process::Command::new("cargo");
+    v.args(["nextest", "--version"]).current_dir(&repo.root);
+    rust_env(&mut v, &plain);
+    let v = v.output().unwrap();
+    let nextest = stdout(&v)
+        .split_whitespace()
+        .nth(1)
+        .expect("cargo-nextest is installed")
+        .to_owned();
+    let channel = {
+        let text =
+            fs::read_to_string(Path::new(env!("CARGO_MANIFEST_DIR")).join("rust-toolchain.toml"))
+                .unwrap();
+        let t: toml::Table = toml::from_str(&text).unwrap();
+        t["toolchain"]["channel"].as_str().unwrap().to_owned()
+    };
+    repo.install_self(VERSION);
+    repo.write(".gitignore", "target\n");
+    repo.write(
+        "rust-toolchain.toml",
+        &format!("[toolchain]\nchannel = \"{channel}\"\n"),
+    );
+    repo.write(
+        "Cargo.toml",
+        "[workspace]\nmembers = [\"a\"]\nresolver = \"3\"\n",
+    );
+    repo.write(
+        "a/Cargo.toml",
+        "[package]\nname = \"a\"\nversion = \"0.1.0\"\nedition = \"2024\"\n",
+    );
+    repo.write("a/src/lib.rs", "pub fn one() -> u32 {\n    1\n}\n");
+    repo.write(
+        ".atelier/atelier.toml",
+        &format!(
+            "atelier = \"{VERSION}\"\nworkspaces = [\".\"]\npromotion_wait_seconds = 1\n\n[rust]\nnextest = \"{nextest}\"\n\n[platforms.{}]\nrun = \"check\"\n",
+            this_platform()
+        ),
+    );
+    repo.write_rules();
+    let mut lock = std::process::Command::new("cargo");
+    lock.arg("generate-lockfile").current_dir(&repo.root);
+    rust_env(&mut lock, &plain);
+    assert!(lock.output().unwrap().status.success());
+    repo.commit_all("workspace");
+    let base = repo.root.parent().unwrap().to_path_buf();
+    let p = Proj { repo, base };
+    let run = |args: &[&str]| {
+        let mut c = p.repo.atelier_cmd(p.main(), args, &[]);
+        rust_env(&mut c, &plain);
+        c.output().unwrap()
+    };
+    let test_file = |name: &str, body: &str| format!("#[test]\nfn {name}() {{\n    {body}\n}}\n");
+    for (b, file, body) in [
+        (
+            "a",
+            "a/tests/ta.rs",
+            test_file("passes_a", "assert_eq!(a::one(), 1);"),
+        ),
+        (
+            "b",
+            "a/tests/tb.rs",
+            test_file("breaks_b", "assert_eq!(a::one(), 2);"),
+        ),
+        (
+            "c",
+            "a/tests/tc.rs",
+            test_file("passes_c", "assert_eq!(a::one(), 1);"),
+        ),
+    ] {
+        let wt = p.wt(b);
+        let out = run(&["start", b, "--path", wt.to_str().unwrap()]);
+        assert_eq!(code(&out), 0, "{}", stderr(&out));
+        let c = commit(&wt, file, &body, b);
+        let out = run(&["approve", b, &c]);
+        assert_eq!(code(&out), 0, "{}", stderr(&out));
+    }
+    let out = run(&["merge", "a", "b", "c"]);
+    assert_eq!(code(&out), 1, "{}", both(&out));
+    let so = stdout(&out);
+    assert!(so.contains("prefix a, b: fails"), "{so}");
+    assert!(so.contains("prefix a: none of the failures appear"), "{so}");
+    assert!(
+        so.contains(&format!(
+            "merge: b breaks: {}: a::tb$breaks_b",
+            this_platform()
+        )),
+        "{so}"
+    );
+    assert!(so.contains("merged a"), "{so}");
+    assert_eq!(p.record("a").state, BranchState::Merged);
+    assert_eq!(p.record("b").state, BranchState::Active);
+}

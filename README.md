@@ -10,7 +10,7 @@ parts the project uses.
 The design is kept outside this repository (`DESIGN.md`, revision 5, with mechanics in
 `DESIGN-r4.md`). The formats every version shares are in [docs/FROZEN-LAYER.md](docs/FROZEN-LAYER.md).
 
-## Status: modules 3.1, 3.2, 3.3, 3.5, 3.6 and 3.7
+## Status: modules 3.1 to 3.7
 
 Built so far, with tests on throwaway git repositories:
 
@@ -55,7 +55,14 @@ work only it remembers.
 It reads the merged commit and the recorded worktree from the branch record's `merged` table
 (`docs/FROZEN-LAYER.md`); module 3.4 writes it.
 
-The other commands (`approve`, `merge`, `promote`, `status`) come in later modules.
+`approve`, `merge` and `promote` (module 3.4, [docs/MERGE.md](docs/MERGE.md)): approvals bound
+to one commit and one worktree, the gate worktree `<main checkout>.gate`, `--no-ff` merges with
+conflicts in regenerated paths settled by the after-merge hook, the check through the merged
+commit's pinned atelier, mode A promotion (checks a–e, one local push in its own process group,
+the wait and exit 7, interrupted promotions reported path by path), and red batch bisection.
+Platforms of other machines run on machines chosen as `atelier test` chooses them, all at once.
+
+The other command (`status`) comes in a later module.
 
 ## Layout
 
@@ -77,6 +84,8 @@ The other commands (`approve`, `merge`, `promote`, `status`) come in later modul
 | `start`, `follow` | the two commands |
 | `tmp`, `clean` | the two commands (module 3.5); `clean` also holds the plan and every re-check |
 | `rules` | rules currency check (stub until module 3.7) |
+| `approve`, `gate`, `promote`, `bisect` | `approve`; `merge` (preconditions, gate worktree, merges, hooks, platforms); mode A promotion and `promote`; red batch bisection |
+| `ledger` | the versioned layer's approvals, `merges.tsv` and promotion record |
 | `check`, `prereq`, `nextest` | the `check` command; tool and mbx prerequisites; nextest flags, file refusals and result parsing |
 | `testcmd` | `test`, `machines`, `machines init` |
 | `jobs` | a platform's job (preparation, command or run) and the machine preflight |

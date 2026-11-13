@@ -62,13 +62,16 @@ impl Only {
             .collect()
     }
 
-    /// The nextest filterset selecting exactly these tests.
+    /// The nextest filterset selecting these tests by test name. The libtest-JSON name's prefix
+    /// (`<crate>::<binary>`) is not nextest's binary id (`nx::nx` for the library `nx`,
+    /// `nx::tool` for `nx::bin/tool`), so the run may also select same-named tests of other
+    /// binaries; only the listed names are judged.
     fn filterset(tests: &[&OnlyTest]) -> String {
         tests
             .iter()
-            .map(|t| match t.name.split_once('$') {
-                Some((bin, test)) => format!("(binary_id(={bin}) & test(={test}))"),
-                None => format!("test(={})", t.name),
+            .map(|t| {
+                let test = t.name.split_once('$').map_or(t.name.as_str(), |(_, t)| t);
+                format!("test(={test})")
             })
             .collect::<Vec<_>>()
             .join(" | ")
@@ -481,8 +484,10 @@ impl Checker<'_> {
                 Some(f) => {
                     argv.extend(["nextest", "run"].map(str::to_owned));
                     argv.extend(nextest::FLAGS.iter().map(|s| (*s).to_owned()));
-                    argv.push("-E".to_owned());
+                    // A listed test the tree no longer has is a failure that does not appear.
+                    argv.push("--no-tests=pass".to_owned());
                     // The tests named failed in a full run, so no exclusion applies to them.
+                    argv.push("-E".to_owned());
                     argv.push(f.clone());
                 }
             }
@@ -490,6 +495,17 @@ impl Checker<'_> {
             let ok = self.step(&name, &argv, &ws.dir, Some(&file))?;
             let stream = fs::read_to_string(self.run.dir().join(&file)).unwrap_or_default();
             let results = nextest::parse_results(&stream);
+            if let Some(o) = &self.only {
+                let listed = o.tests_in(ws);
+                let appeared = results.iter().any(|r| {
+                    r.verdict == Verdict::Failed && listed.iter().any(|t| t.name == r.name)
+                });
+                if !ok && !appeared && !results.is_empty() {
+                    // Only same-named tests of other binaries failed: not a listed failure.
+                    self.run.discard_failed_step();
+                    println!("    none of the listed tests failed");
+                }
+            }
             let counts = self.counts.get_or_insert_with(TestCounts::default);
             for r in &results {
                 match r.verdict {
@@ -516,7 +532,7 @@ impl Checker<'_> {
                 }
             }
             append(&self.run.dir().join(TEST_RESULTS), &tsv);
-            if ok && results.is_empty() {
+            if ok && results.is_empty() && self.only.is_none() {
                 self.fail(
                     &name,
                     "nextest passed but reported no test results".to_owned(),
