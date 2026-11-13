@@ -92,6 +92,9 @@ pub enum Cmd {
         /// Execute the plan instead of printing it.
         #[arg(long)]
         yes: bool,
+        /// Let these commits go: work the branch's reflog alone remembers, which clean listed.
+        #[arg(long, num_args = 1.., value_name = "COMMIT")]
+        discard: Vec<String>,
     },
     /// Run a platform's check, or a given command, on a machine of that platform.
     #[command(group(ArgGroup::new("which").required(true).args(["platform", "all"])))]
@@ -344,9 +347,13 @@ pub fn run(cmd: Cmd, cwd: &Path) -> Result<Exit> {
             let ctx = preflight::run(cwd, cmd.name(), cmd.needs())?;
             return crate::tmp::run(&ctx, cwd, *short, command);
         }
-        Cmd::Clean { branches, yes } => {
+        Cmd::Clean {
+            branches,
+            yes,
+            discard,
+        } => {
             let ctx = preflight::run(cwd, cmd.name(), cmd.needs())?;
-            return crate::clean::run(&ctx, branches, *yes);
+            return crate::clean::run(&ctx, branches, *yes, discard);
         }
         _ => {
             let _context = preflight::run(cwd, cmd.name(), cmd.needs())?;

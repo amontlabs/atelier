@@ -1,6 +1,6 @@
 //! `atelier tmp` and `atelier clean` (DESIGN §3, r4 §3.9) on throwaway repositories: the plan, the
-//! deletions, and every destructive case REVIEW-1 (findings 1, 2, 6, 28) and REVIEW-3 (findings 1,
-//! 2, 7) found. Merged state is set the way `merge` (module 3.4) will, through
+//! deletions, and every destructive case REVIEW-1 (findings 1, 2, 6, 28), REVIEW-3 (findings 1,
+//! 2, 7) and the module 3.5 review (findings 1-9) found. Merged state is set the way `merge` (module 3.4) will, through
 //! `MergeFacts::record`.
 
 mod common;
@@ -8,7 +8,7 @@ mod common;
 use std::fs;
 use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
-use std::process::{Output, Stdio};
+use std::process::{Command, Output, Stdio};
 use std::time::{Duration, Instant};
 
 use atelier::git::Checkout;
@@ -944,11 +944,9 @@ fn tmp_registers_the_folder_under_the_lifetime_and_runs_the_command_in_place() {
     let said = lines.next().unwrap().to_owned();
     let entry = p.folders("a").pop().unwrap();
     assert_eq!(Path::new(&said), entry.path);
-    assert!(
-        entry
-            .path
-            .starts_with(fs::canonicalize(&p.tmpdir).unwrap().join("atelier"))
-    );
+    let root = fs::canonicalize(&p.tmpdir).unwrap().join(user_root());
+    assert!(entry.path.starts_with(&root), "{}", entry.path.display());
+    assert_eq!(fs::metadata(&root).unwrap().mode() & 0o777, 0o700);
     assert!(entry.still_matches());
     assert_eq!(fs::metadata(&entry.path).unwrap().mode() & 0o777, 0o700);
     assert!(text.contains("GREEN"), "{text}");
@@ -1079,4 +1077,537 @@ fn merge_facts_round_trip_and_keep_what_they_do_not_know() {
     rec.later
         .insert("merged".into(), toml::Value::String("x".into()));
     assert!(MergeFacts::read(&rec).is_err());
+}
+
+// ---------------------------------------------------------------------------------------------
+// The module 3.5 review's probes
+
+fn user_root() -> String {
+    // SAFETY: geteuid has no preconditions.
+    format!("atelier-{}", unsafe { libc::geteuid() })
+}
+
+/// A disk image mounted at a folder, detached when dropped. `None` (the test is skipped, and
+/// says why) where an ordinary user cannot mount one: anywhere but macOS, or when `hdiutil`
+/// fails.
+struct Mount {
+    at: PathBuf,
+}
+
+impl Mount {
+    fn at(dir: &Path, images: &Path) -> Option<Mount> {
+        if !cfg!(target_os = "macos") {
+            eprintln!(
+                "skipped: mounting a file system needs hdiutil (macOS); on Linux it needs root"
+            );
+            return None;
+        }
+        fs::create_dir_all(dir).unwrap();
+        fs::create_dir_all(images).unwrap();
+        let img = images.join(format!("img-{}.dmg", fs::read_dir(images).unwrap().count()));
+        let made = Command::new("hdiutil")
+            .args(["create", "-quiet", "-size", "4m", "-fs", "HFS+"])
+            .args(["-volname", "atl", "-layout", "NONE"])
+            .arg(&img)
+            .status()
+            .is_ok_and(|s| s.success());
+        let mounted = made
+            && Command::new("hdiutil")
+                .args(["attach", "-quiet", "-nobrowse", "-noverify", "-noautoopen"])
+                .arg("-mountpoint")
+                .arg(dir)
+                .arg(&img)
+                .status()
+                .is_ok_and(|s| s.success());
+        if !mounted {
+            eprintln!("skipped: hdiutil could not create and mount a disk image here");
+            return None;
+        }
+        assert_ne!(
+            fs::metadata(dir).unwrap().dev(),
+            fs::metadata(dir.parent().unwrap()).unwrap().dev()
+        );
+        Some(Mount {
+            at: dir.to_path_buf(),
+        })
+    }
+}
+
+impl Drop for Mount {
+    fn drop(&mut self) {
+        let detach = |force: bool| {
+            let mut c = Command::new("hdiutil");
+            c.args(["detach", "-quiet"]);
+            if force {
+                c.arg("-force");
+            }
+            c.arg(&self.at).status().is_ok_and(|s| s.success())
+        };
+        if !detach(false) {
+            detach(true);
+        }
+    }
+}
+
+fn all_out(out: &Output) -> String {
+    format!("{}{}", stdout(out), stderr(out))
+}
+
+/// Nothing was deleted for the branch: its worktree is registered, it and its branch exist, its
+/// record is merged.
+fn nothing_deleted(p: &Proj, branch: &str, wt: &Path) {
+    assert!(wt.join(".git").is_file(), "{}", wt.display());
+    assert!(
+        git(p.main(), &["worktree", "list", "--porcelain"])
+            .contains(&format!("worktree {}", wt.display())),
+        "the worktree is still registered"
+    );
+    assert!(p.branch_exists(branch));
+    assert_eq!(p.record(branch).unwrap().state, BranchState::Merged);
+}
+
+// Finding 1: a mount inside a temp folder.
+#[test]
+fn a_mount_inside_a_temp_folder_stops_the_clean_and_the_mounted_files_stay() {
+    let p = Proj::new();
+    let wt = p.start("a", None);
+    let entry = registered_folder(&p, &wt, "a");
+    let mnt = entry.path.join("mnt");
+    let Some(m) = Mount::at(&mnt, &p.base.join("images")) else {
+        return;
+    };
+    fs::write(m.at.join("precious.txt"), "p").unwrap();
+    p.land("a", &wt);
+
+    for args in [&["a"][..], &["a", "--yes"]] {
+        let out = p.clean(args);
+        refused(&out, "mounted in it");
+        assert!(all_out(&out).contains(&mnt.display().to_string()));
+    }
+    assert!(mnt.join("precious.txt").is_file());
+    assert!(entry.path.join("data").is_file());
+    nothing_deleted(&p, "a", &wt);
+
+    // The deletion itself never enters the mount either.
+    let err = atelier::dirfd::remove_tree(
+        entry.path.parent().unwrap(),
+        entry.path.file_name().unwrap(),
+        (entry.dev, entry.ino),
+    )
+    .unwrap_err();
+    assert!(err.to_string().contains("another device"), "{err}");
+    assert!(mnt.join("precious.txt").is_file());
+
+    drop(m);
+    let out = p.clean(&["a", "--yes"]);
+    assert_eq!(code(&out), 0, "{}", all_out(&out));
+    assert!(!entry.path.exists());
+    assert!(!wt.exists());
+}
+
+// Finding 4: a mount inside the worktree.
+#[test]
+fn a_mount_inside_the_worktree_stops_the_clean_before_anything_is_deleted() {
+    let p = Proj::new();
+    let wt = p.start("a", None);
+    let entry = registered_folder(&p, &wt, "a");
+    let mnt = wt.join("target/mnt");
+    let Some(m) = Mount::at(&mnt, &p.base.join("images")) else {
+        return;
+    };
+    fs::write(m.at.join("keep.txt"), "k").unwrap();
+    p.land("a", &wt);
+
+    let out = p.clean(&["a", "--yes"]);
+    refused(&out, "mounted in it");
+    assert!(all_out(&out).contains(&mnt.display().to_string()));
+    assert!(mnt.join("keep.txt").is_file());
+    assert!(entry.path.join("data").is_file(), "the temp folder stays");
+    nothing_deleted(&p, "a", &wt);
+
+    // Once it is unmounted, clean finishes.
+    drop(m);
+    let out = p.clean(&["a", "--yes"]);
+    assert_eq!(code(&out), 0, "{}", all_out(&out));
+    assert!(!wt.exists());
+    assert!(!p.branch_exists("a"));
+}
+
+// Finding 2: edits hidden by --assume-unchanged and --skip-worktree.
+#[test]
+fn local_edits_hidden_by_index_flags_stop_the_clean() {
+    let p = Proj::new();
+    let wt = p.start("a", None);
+    fs::write(wt.join("conf.txt"), "c\n").unwrap();
+    commit(&wt, "sk.txt", "s\n", "config");
+    p.land("a", &wt);
+    git(&wt, &["update-index", "--assume-unchanged", "conf.txt"]);
+    git(&wt, &["update-index", "--skip-worktree", "sk.txt"]);
+    // Unchanged flagged files are no reason to keep the worktree.
+    let out = p.clean(&["a"]);
+    assert_eq!(code(&out), 0, "{}", all_out(&out));
+
+    fs::write(wt.join("conf.txt"), "local\n").unwrap();
+    fs::write(wt.join("sk.txt"), "local\n").unwrap();
+    assert_eq!(
+        git(&wt, &["status", "--porcelain"]),
+        "",
+        "git status sees nothing"
+    );
+    let out = p.clean(&["a", "--yes"]);
+    refused(&out, "hidden by --assume-unchanged or --skip-worktree");
+    let text = all_out(&out);
+    assert!(
+        text.contains("conf.txt") && text.contains("sk.txt"),
+        "{text}"
+    );
+    assert_eq!(fs::read_to_string(wt.join("conf.txt")).unwrap(), "local\n");
+    nothing_deleted(&p, "a", &wt);
+
+    // Restored, or absent (as a sparse checkout leaves a skip-worktree file): nothing is lost.
+    fs::write(wt.join("conf.txt"), "c\n").unwrap();
+    fs::remove_file(wt.join("sk.txt")).unwrap();
+    let out = p.clean(&["a", "--yes"]);
+    assert_eq!(code(&out), 0, "{}", all_out(&out));
+    assert!(!wt.exists());
+}
+
+// Finding 3: a repository nested in an ignored folder.
+#[test]
+fn an_ignored_nested_repository_stops_the_clean_and_the_plan_names_the_ignored_entries() {
+    let p = Proj::new();
+    let wt = p.start("a", None);
+    exclude(&p, "vendor/");
+    exclude(&p, "NOTES.md");
+    let up = wt.join("vendor/up");
+    fs::create_dir_all(&up).unwrap();
+    git(&up, &["init", "-q"]);
+    let unpushed = commit(&up, "u.txt", "u\n", "unpushed");
+    fs::write(wt.join("NOTES.md"), "mine\n").unwrap();
+    fs::create_dir_all(wt.join("target")).unwrap();
+    fs::write(wt.join("target/out.o"), "x").unwrap();
+    p.land("a", &wt);
+    assert_eq!(git(&wt, &["status", "--porcelain"]), "");
+
+    for args in [&["a"][..], &["a", "--yes"]] {
+        let out = p.clean(args);
+        refused(&out, "nested git repository");
+        assert!(all_out(&out).contains(&up.display().to_string()));
+    }
+    assert_eq!(git(&up, &["rev-parse", "HEAD"]), unpushed);
+    nothing_deleted(&p, "a", &wt);
+
+    // Moved out: the plan says which ignored entries go with the worktree.
+    fs::remove_dir_all(wt.join("vendor")).unwrap();
+    let out = p.clean(&["a"]);
+    assert_eq!(code(&out), 0, "{}", all_out(&out));
+    assert!(
+        stdout(&out).contains("with its ignored files: NOTES.md, target/"),
+        "{}",
+        stdout(&out)
+    );
+    let out = p.clean(&["a", "--yes"]);
+    assert_eq!(code(&out), 0, "{}", all_out(&out));
+    assert!(!wt.exists());
+}
+
+/// A `git` on `PATH` that logs its arguments and, the first time it is asked to move `victim`,
+/// first does what the review's probe did in the window: moves that worktree away and adds a new
+/// worktree of branch `d` at its path, with an ignored file.
+fn git_wrapper(p: &Proj, victim: &Path) -> (String, PathBuf) {
+    let real = String::from_utf8(
+        Command::new("sh")
+            .args(["-c", "command -v git"])
+            .output()
+            .unwrap()
+            .stdout,
+    )
+    .unwrap()
+    .trim()
+    .to_owned();
+    let bin = p.base.join("gitbin");
+    fs::create_dir_all(&bin).unwrap();
+    let log = p.base.join("git.log");
+    let script = format!(
+        "#!/bin/sh\n\
+         echo \"$*\" >> '{log}'\n\
+         if [ \"$1 $2 $3\" = 'worktree move {v}' ] && [ -e '{bin}/attack' ]; then\n\
+           rm '{bin}/attack'\n\
+           '{real}' -C '{main}' worktree move '{v}' '{v}-moved' &&\n\
+           '{real}' -C '{main}' worktree add -q -b d '{v}' &&\n\
+           mkdir -p '{v}/target' && echo theirs > '{v}/target/build'\n\
+         fi\n\
+         exec '{real}' \"$@\"\n",
+        log = log.display(),
+        v = victim.display(),
+        bin = bin.display(),
+        real = real,
+        main = p.main().display(),
+    );
+    fs::write(bin.join("git"), script).unwrap();
+    use std::os::unix::fs::PermissionsExt;
+    fs::set_permissions(bin.join("git"), fs::Permissions::from_mode(0o755)).unwrap();
+    (
+        format!("{}:{}", bin.display(), std::env::var("PATH").unwrap()),
+        log,
+    )
+}
+
+// Finding 5: the worktree is moved to a name no one knows, checked there, then removed.
+#[test]
+fn the_worktree_is_moved_aside_and_checked_again_before_git_removes_it() {
+    let p = Proj::new();
+    let wt = p.start("a", None);
+    p.land("a", &wt);
+    let (path, log) = git_wrapper(&p, &wt);
+    let tmpdir = p.tmpdir.to_str().unwrap().to_owned();
+    let run = |args: &[&str]| {
+        p.repo
+            .atelier_env(p.main(), args, &[("PATH", &path), ("TMPDIR", &tmpdir)])
+    };
+
+    // The review's probe: another worktree takes the path just before the removal.
+    fs::write(p.base.join("gitbin/attack"), "").unwrap();
+    let out = run(&["clean", "a", "--yes"]);
+    assert_eq!(code(&out), 1, "{}", all_out(&out));
+    assert!(
+        all_out(&out).contains("is not the recorded worktree after the move"),
+        "{}",
+        all_out(&out)
+    );
+    // d's worktree, with its ignored file, is back at the path and whole.
+    assert_eq!(git(&wt, &["symbolic-ref", "HEAD"]), "refs/heads/d");
+    assert_eq!(
+        fs::read_to_string(wt.join("target/build")).unwrap(),
+        "theirs\n"
+    );
+    let moved = PathBuf::from(format!("{}-moved", wt.display()));
+    assert_eq!(git(&moved, &["symbolic-ref", "HEAD"]), "refs/heads/a");
+    assert!(p.branch_exists("a"));
+    assert_eq!(p.record("a").unwrap().state, BranchState::Merged);
+
+    // Undo the probe; the clean then goes through the random name.
+    git(p.main(), &["worktree", "remove", wt.to_str().unwrap()]);
+    git(
+        p.main(),
+        &[
+            "worktree",
+            "move",
+            moved.to_str().unwrap(),
+            wt.to_str().unwrap(),
+        ],
+    );
+    fs::write(&log, "").unwrap();
+    let out = run(&["clean", "a", "--yes"]);
+    assert_eq!(code(&out), 0, "{}", all_out(&out));
+    assert!(!wt.exists());
+    let calls = fs::read_to_string(&log).unwrap();
+    let prefix = format!(
+        "worktree move {} {}.atelier-removing-",
+        wt.display(),
+        wt.display()
+    );
+    let mv = calls
+        .lines()
+        .find(|l| l.starts_with(&prefix))
+        .unwrap_or_else(|| panic!("{calls}"));
+    let aside = mv.rsplit(' ').next().unwrap();
+    assert!(
+        calls
+            .lines()
+            .any(|l| l == format!("worktree remove {aside}")),
+        "{calls}"
+    );
+    assert!(
+        !calls
+            .lines()
+            .any(|l| l == format!("worktree remove {}", wt.display())),
+        "{calls}"
+    );
+    assert!(!Path::new(aside).exists());
+}
+
+// Finding 6: deletions run least destructive first, and a failure stops there.
+#[test]
+fn a_temp_folder_that_cannot_be_deleted_stops_the_clean_before_the_worktree_and_the_branch() {
+    use std::os::unix::fs::PermissionsExt;
+    let p = Proj::new();
+    let wt = p.start("a", None);
+    let entry = registered_folder(&p, &wt, "a");
+    let ro = entry.path.join("ro");
+    fs::create_dir(&ro).unwrap();
+    fs::write(ro.join("f"), "f").unwrap();
+    fs::set_permissions(&ro, fs::Permissions::from_mode(0o500)).unwrap();
+    p.land("a", &wt);
+
+    for _ in 0..2 {
+        let out = p.clean(&["a", "--yes"]);
+        assert_eq!(code(&out), 1, "{}", all_out(&out));
+        assert!(
+            all_out(&out).contains("Permission denied"),
+            "{}",
+            all_out(&out)
+        );
+        nothing_deleted(&p, "a", &wt);
+        assert!(MergeFacts::read(&p.record("a").unwrap()).unwrap().is_some());
+    }
+    fs::set_permissions(&ro, fs::Permissions::from_mode(0o700)).unwrap();
+    let out = p.clean(&["a", "--yes"]);
+    assert_eq!(code(&out), 0, "{}", all_out(&out));
+    assert!(!entry.path.exists() && !wt.exists() && !p.branch_exists("a"));
+}
+
+// Finding 7: work committed after approval and reset away.
+#[test]
+fn work_reset_away_after_approval_stops_the_branch_deletion_until_it_is_discarded() {
+    let p = Proj::new();
+    let wt = p.start("a", None);
+    // An amend before approval replaces a commit: the old one is not work made after approval.
+    commit(&wt, "b.txt", "b\n", "b");
+    fs::write(wt.join("b.txt"), "b2\n").unwrap();
+    git(&wt, &["commit", "-q", "-a", "--amend", "-m", "b2"]);
+    let merged = p.land("a", &wt);
+    let after = commit(&wt, "x.txt", "after\n", "after approval");
+    git(&wt, &["reset", "-q", "--hard", &merged]);
+
+    for args in [&["a"][..], &["a", "--yes"]] {
+        let out = p.clean(args);
+        refused(&out, "only it remembers");
+        let text = all_out(&out);
+        assert!(text.contains(&format!("{after} after approval")), "{text}");
+        assert!(text.contains(&format!("--discard {after}")), "{text}");
+        assert!(
+            !text.contains(" b\n"),
+            "the amended commit is not listed: {text}"
+        );
+    }
+    nothing_deleted(&p, "a", &wt);
+
+    // Another ref that keeps it: nothing is lost.
+    git(p.main(), &["branch", "keep", &after]);
+    assert_eq!(code(&p.clean(&["a"])), 0);
+    git(p.main(), &["branch", "-q", "-D", "keep"]);
+
+    // Something that is not a commit is a usage error.
+    assert_eq!(code(&p.clean(&["a", "--yes", "--discard", "nope"])), 2);
+    let out = p.clean(&["a", "--yes", "--discard", &after[..12]]);
+    assert_eq!(code(&out), 0, "{}", all_out(&out));
+    assert!(!wt.exists());
+    assert!(!p.branch_exists("a"));
+}
+
+// Finding 8: the branch lock is shared by tmp and check, exclusive for clean.
+#[test]
+fn two_tmp_commands_of_one_branch_run_at_once() {
+    let p = Proj::new();
+    let wt = p.start("a", None);
+    let child = p
+        .repo
+        .atelier_cmd(
+            &wt,
+            &[
+                "tmp",
+                "--",
+                "sh",
+                "-c",
+                "touch \"$ATELIER_TMP/started\"; while [ ! -e \"$ATELIER_TMP/stop\" ]; do sleep 0.05; done",
+            ],
+            &[("TMPDIR", p.tmpdir.to_str().unwrap())],
+        )
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let deadline = Instant::now() + Duration::from_secs(20);
+    let folder = loop {
+        if let Some(e) = p.folders("a").pop()
+            && e.path.join("started").exists()
+        {
+            break e.path;
+        }
+        assert!(Instant::now() < deadline, "tmp command never started");
+        std::thread::sleep(Duration::from_millis(50));
+    };
+    let out = p.tmp(&wt, false, "true");
+    assert_eq!(code(&out), 0, "{}", all_out(&out));
+    assert_eq!(p.folders("a").len(), 2);
+    // start, which takes the lock exclusive, refuses meanwhile.
+    p.land("a", &wt);
+    refused(&p.clean(&["a", "--yes"]), "held by another atelier command");
+    fs::write(folder.join("stop"), "").unwrap();
+    let out = child.wait_with_output().unwrap();
+    assert_eq!(code(&out), 0, "{}", String::from_utf8_lossy(&out.stderr));
+}
+
+#[test]
+fn check_holds_the_branch_lock_of_an_atelier_branch() {
+    let p = Proj::new();
+    let wt = p.start("a", None);
+    let state = p.state();
+    let held = HeldLock::acquire(&state, LockKey::branch("a")).unwrap();
+    let out = p.run(&wt, &["check"]);
+    refused(&out, "branch lock a is held by another atelier command");
+    drop(held);
+    // Shared with tmp: a shared holder does not stop it at the lock.
+    let _shared = HeldLock::acquire_shared(&state, LockKey::branch("a")).unwrap();
+    let out = p.run(&wt, &["check"]);
+    assert!(
+        !all_out(&out).contains("branch lock a"),
+        "{}",
+        all_out(&out)
+    );
+}
+
+// Finding 9: one temp root per user.
+#[test]
+fn the_temp_root_is_per_user_and_private() {
+    use std::os::unix::fs::PermissionsExt;
+    let p = Proj::new();
+    let wt = p.start("a", None);
+    // Another user's shared folder at the old place blocks nothing.
+    fs::write(p.tmpdir.join("atelier"), "someone else's").unwrap();
+    // A root of ours that others can enter is refused.
+    let root = p.tmpdir.join(user_root());
+    fs::create_dir(&root).unwrap();
+    fs::set_permissions(&root, fs::Permissions::from_mode(0o755)).unwrap();
+    refused(&p.tmp(&wt, false, "true"), "open to other users");
+    fs::set_permissions(&root, fs::Permissions::from_mode(0o700)).unwrap();
+    assert_eq!(code(&p.tmp(&wt, false, "true")), 0);
+    let entry = p.folders("a").pop().unwrap();
+    assert!(entry.path.starts_with(fs::canonicalize(&root).unwrap()));
+    assert_eq!(
+        fs::read_to_string(p.tmpdir.join("atelier")).unwrap(),
+        "someone else's"
+    );
+
+    // TMPDIR unset: `<the system's temp dir>/atelier-<uid>`, `/tmp` on Linux (on macOS, std
+    // falls back to the user's own temp dir).
+    let before: Vec<PathBuf> = p.folders("a").into_iter().map(|e| e.path).collect();
+    let out = p
+        .repo
+        .atelier_cmd(&wt, &["tmp", "--", "true"], &[])
+        .env_remove("TMPDIR")
+        .output()
+        .unwrap();
+    assert_eq!(code(&out), 0, "{}", all_out(&out));
+    let entry = p
+        .folders("a")
+        .into_iter()
+        .find(|e| !before.contains(&e.path))
+        .unwrap();
+    let tmp_root = entry.path.ancestors().nth(3).unwrap().to_path_buf();
+    assert_eq!(
+        tmp_root.file_name().unwrap().to_str(),
+        Some(user_root().as_str())
+    );
+    assert!(!tmp_root.starts_with(fs::canonicalize(&p.tmpdir).unwrap()));
+    if cfg!(target_os = "linux") {
+        assert_eq!(tmp_root, Path::new("/tmp").join(user_root()));
+    }
+    assert_eq!(fs::metadata(&tmp_root).unwrap().mode() & 0o777, 0o700);
+    p.land("a", &wt);
+    let out = p.clean(&["a", "--yes"]);
+    assert_eq!(code(&out), 0, "{}", all_out(&out));
+    assert!(!entry.path.exists());
+    let _ = fs::remove_dir(entry.path.parent().unwrap().parent().unwrap());
 }

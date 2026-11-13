@@ -12,7 +12,7 @@ use std::time::{Duration, Instant};
 
 use crate::exit::{Exit, Result};
 use crate::git::{self, Checkout};
-use crate::locks::LockKey;
+use crate::locks::{HeldLock, LockKey};
 use crate::nextest::{self, Verdict};
 use crate::platform::Platform;
 use crate::preflight::Context;
@@ -29,9 +29,31 @@ pub fn run(ctx: &Context, compile_only: bool) -> Result<Exit> {
     run_noting(ctx, compile_only, &mut None)
 }
 
+/// The branch checked out here when atelier has a record of it.
+fn started_branch(ctx: &Context) -> Result<Option<String>> {
+    let out = crate::git::output(
+        &ctx.checkout.root,
+        ["symbolic-ref", "--no-recurse", "-q", "HEAD"],
+    )?;
+    let full = String::from_utf8_lossy(&out.stdout).trim().to_owned();
+    let Some(branch) = full
+        .strip_prefix("refs/heads/")
+        .filter(|_| out.status.success())
+    else {
+        return Ok(None);
+    };
+    Ok(crate::records::BranchRecord::read(&ctx.state, branch)?.map(|_| branch.to_owned()))
+}
+
 /// As [`run`], and sets `id` to the check's run id once the run has started.
 pub fn run_noting(ctx: &Context, compile_only: bool, id: &mut Option<String>) -> Result<Exit> {
     let checkout = &ctx.checkout;
+    // In the worktree of a branch atelier started, the branch lock is held shared for the whole
+    // check, so `clean`, `follow` and `start` refuse while it runs (r4 §3.9 step 1).
+    let _branch_lock = match started_branch(ctx)? {
+        Some(b) => Some(HeldLock::acquire_shared(&ctx.state, LockKey::branch(&b))?),
+        None => None,
+    };
     // The prerequisite commands carry the id the run then takes, so any of them that leaves a
     // process behind is found by the marker scan.
     let marker = runs::new_run_id()?;

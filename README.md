@@ -45,10 +45,13 @@ Module 3.6, machines: the owner's machines file, `atelier machines`, `atelier ma
 the hang-up watcher, the result read with a second ssh). See [docs/MACHINES.md](docs/MACHINES.md).
 
 `atelier tmp [--short] -- <command>` (module 3.5) runs a command with a registered temp folder in
-`ATELIER_TMP` for the branch checked out in the current worktree, holding the branch lock until
-the command ends. `atelier clean [<branch>…] [--yes]` prints a plan, or with `--yes` deletes what
-`merge` recorded as merged: the worktree `approve` recorded, the branch, its registered temp
-folders and its mbx build, each condition re-checked at the moment of deletion (`src/clean.rs`).
+`ATELIER_TMP` for the branch checked out in the current worktree, holding the branch lock shared
+until the command ends. `atelier clean [<branch>…] [--yes] [--discard <commit>…]` prints a plan,
+or with `--yes` deletes what `merge` recorded as merged: its registered temp folders, the worktree
+`approve` recorded, the branch, and its mbx build, in that order, each condition re-checked at the
+moment of deletion (`src/clean.rs`). It refuses, changing nothing, when a mount, a nested
+repository or a hidden local edit is in what it would delete, or when the branch's reflog holds
+work only it remembers.
 It reads the merged commit and the recorded worktree from the branch record's `merged` table
 (`docs/FROZEN-LAYER.md`); module 3.4 writes it.
 

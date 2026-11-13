@@ -1,7 +1,12 @@
-//! Locks (r4 §3.1): an exclusive `flock` on a file in the frozen layer, taken by the atelier
-//! process and held until it exits. Never handed to the programs atelier starts (they get no
-//! copy of the descriptor: Rust opens files close-on-exec), so a held lock means one thing only:
-//! "an atelier process for this is alive".
+//! Locks (r4 §3.1): a `flock` on a file in the frozen layer, taken by the atelier process and
+//! held until it exits. Never handed to the programs atelier starts (they get no copy of the
+//! descriptor: Rust opens files close-on-exec), so a held lock means one thing only: "an atelier
+//! process for this is alive".
+//!
+//! A branch lock is taken shared by the commands that only use the branch while they run (`tmp`,
+//! and `check` in the branch's worktree: several may hold it at once) and exclusive by those that
+//! change or delete it (`clean`, `follow`, `start`) (r4 §3.9 step 1). Every other lock is only
+//! taken exclusive.
 //!
 //! Next to each lock file, `<name>.procs` records what an atelier holding the lock started: the
 //! run ids and each step's process group while it may have members. Whoever takes the lock next
@@ -18,6 +23,13 @@
 //! Later versions may append fields; this version keeps them when it rewrites the file. Any other
 //! non-empty line makes the record unreadable: taking the lock refuses (4) and names the file,
 //! and nothing is rewritten.
+//!
+//! An exclusive holder reads the record when it takes the lock, refuses while anything recorded
+//! lives, and then owns the file. Shared holders run beside each other, so a shared holder never
+//! refuses for what the record lists (it may be another holder's live run), and changes only its
+//! own lines: each change re-reads the file and writes it back while holding `<name>.procs.lock`
+//! exclusive for that moment. Survivors of a shared holder therefore stop the next exclusive
+//! taker (`clean`), not the next `tmp`.
 
 use std::fs::{self, File, OpenOptions};
 use std::io::ErrorKind;
@@ -238,16 +250,56 @@ pub struct HeldLock {
     key: LockKey,
     _file: File,
     record_path: PathBuf,
+    /// Exclusive: the whole record. Shared: only this holder's lines.
     record: Record,
+    shared: bool,
+}
+
+/// `<locks>/<id><ext>`: the extension is appended, never put in place of a `.` the key has
+/// (`branch/v1.2` and `branch/v1.3` are two locks).
+fn lock_file(state: &State, key: &LockKey, ext: &str) -> PathBuf {
+    let mut p = state.locks_dir().join(key.rel()).into_os_string();
+    p.push(ext);
+    PathBuf::from(p)
+}
+
+fn read_record(path: &std::path::Path, key: &LockKey) -> Result<Record> {
+    match fs::read_to_string(path) {
+        Ok(t) => Record::parse(&t).map_err(|m| {
+            Failure::refused(format!(
+                "{}: {m}; this atelier cannot tell what it records, so the {} stays refused until it is read by the version that wrote it or repaired by hand",
+                path.display(),
+                key.describe()
+            ))
+        }),
+        Err(e) if e.kind() == ErrorKind::NotFound => Ok(Record::default()),
+        Err(e) => Err(Failure::refused(format!("{}: {e}", path.display()))),
+    }
 }
 
 impl HeldLock {
-    /// Takes the lock without waiting. Refuses (4) when another atelier holds it, and when
-    /// processes of an earlier run under it are still alive (listed, never signalled).
+    /// Takes the lock exclusive without waiting. Refuses (4) when another atelier holds it
+    /// (shared or exclusive), and when processes of an earlier run under it are still alive
+    /// (listed, never signalled).
     pub fn acquire(state: &State, key: LockKey) -> Result<HeldLock> {
-        let rel = key.rel();
-        let lock_path = state.locks_dir().join(&rel).with_extension("lock");
-        let record_path = state.locks_dir().join(&rel).with_extension("procs");
+        let mut held = Self::take(state, key, false)?;
+        held.record = read_record(&held.record_path, &held.key)?;
+        held.check_earlier_runs()?;
+        Ok(held)
+    }
+
+    /// Takes a branch lock shared without waiting: other shared holders may hold it too.
+    /// Refuses (4) while a command holds it exclusive. What the record lists is left to the next
+    /// exclusive taker, but a record this version cannot read still refuses.
+    pub fn acquire_shared(state: &State, key: LockKey) -> Result<HeldLock> {
+        let held = Self::take(state, key, true)?;
+        read_record(&held.record_path, &held.key)?;
+        Ok(held)
+    }
+
+    fn take(state: &State, key: LockKey, shared: bool) -> Result<HeldLock> {
+        let lock_path = lock_file(state, &key, ".lock");
+        let record_path = lock_file(state, &key, ".procs");
         if let Some(parent) = lock_path.parent() {
             fs::create_dir_all(parent).ctx(parent.display())?;
         }
@@ -258,7 +310,12 @@ impl HeldLock {
             .truncate(false)
             .open(&lock_path)
             .ctx(lock_path.display())?;
-        match file.try_lock() {
+        let taken = if shared {
+            file.try_lock_shared()
+        } else {
+            file.try_lock()
+        };
+        match taken {
             Ok(()) => {}
             Err(std::fs::TryLockError::WouldBlock) => {
                 return Err(Failure::refused(format!(
@@ -270,25 +327,17 @@ impl HeldLock {
                 return Err(Failure::refused(format!("{}: {e}", lock_path.display())));
             }
         }
-        let record = match fs::read_to_string(&record_path) {
-            Ok(t) => Record::parse(&t).map_err(|m| {
-                Failure::refused(format!(
-                    "{}: {m}; this atelier cannot tell what it records, so the {} stays refused until it is read by the version that wrote it or repaired by hand",
-                    record_path.display(),
-                    key.describe()
-                ))
-            })?,
-            Err(e) if e.kind() == ErrorKind::NotFound => Record::default(),
-            Err(e) => return Err(Failure::refused(format!("{}: {e}", record_path.display()))),
-        };
-        let mut held = HeldLock {
+        Ok(HeldLock {
             key,
             _file: file,
             record_path,
-            record,
-        };
-        held.check_earlier_runs()?;
-        Ok(held)
+            record: Record::default(),
+            shared,
+        })
+    }
+
+    pub fn is_shared(&self) -> bool {
+        self.shared
     }
 
     pub fn key(&self) -> &LockKey {
@@ -338,55 +387,75 @@ impl HeldLock {
             )));
         }
         self.record = Record::default();
-        self.save()
+        save(&self.record_path, &self.record)
     }
 
     /// Records a run that holds this lock.
     pub fn add_run(&mut self, id: &str) -> Result<()> {
-        self.record.runs.push(RunLine {
+        let line = RunLine {
             id: id.to_owned(),
             later: Vec::new(),
-        });
-        self.save()
+        };
+        self.change(|r| r.runs.push(line.clone()))
     }
 
     /// Forgets a run: none of its processes is left.
     pub fn remove_run(&mut self, id: &str) -> Result<()> {
-        self.record.runs.retain(|r| r.id != id);
-        self.save()
+        self.change(|r| r.runs.retain(|l| l.id != id))
     }
 
     /// Records a step's process group with its leader's start time ([`procs::start_time`]).
     pub fn add_group(&mut self, pgid: i32, run: &str, leader_start: Option<String>) -> Result<()> {
-        self.record.groups.push(GroupLine {
+        let line = GroupLine {
             pgid,
             run: run.to_owned(),
             leader_start,
             later: Vec::new(),
-        });
-        self.save()
+        };
+        self.change(|r| r.groups.push(line.clone()))
     }
 
     /// Forgets a process group: it is empty.
     pub fn remove_group(&mut self, pgid: i32) -> Result<()> {
-        self.record.groups.retain(|g| g.pgid != pgid);
-        self.save()
+        self.change(|r| r.groups.retain(|g| g.pgid != pgid))
     }
 
-    fn save(&self) -> Result<()> {
-        if self.record.is_empty() {
-            return match fs::remove_file(&self.record_path) {
-                Ok(()) => Ok(()),
-                Err(e) if e.kind() == ErrorKind::NotFound => Ok(()),
-                Err(e) => Err(Failure::refused(format!(
-                    "{}: {e}",
-                    self.record_path.display()
-                ))),
-            };
+    /// Applies one change to this holder's lines and writes the record. A shared holder applies
+    /// it to the file as it is now, under `<name>.procs.lock`, so the other holders' lines stay.
+    fn change(&mut self, f: impl Fn(&mut Record)) -> Result<()> {
+        f(&mut self.record);
+        if !self.shared {
+            return save(&self.record_path, &self.record);
         }
-        fsutil::write_atomic(&self.record_path, self.record.render().as_bytes())
-            .ctx(self.record_path.display())
+        let mutex_path = {
+            let mut p = self.record_path.clone().into_os_string();
+            p.push(".lock");
+            PathBuf::from(p)
+        };
+        let mutex = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(&mutex_path)
+            .ctx(mutex_path.display())?;
+        // Held for one read and one write; every holder keeps it that short, so waiting is safe.
+        mutex.lock().ctx(mutex_path.display())?;
+        let mut all = read_record(&self.record_path, &self.key)?;
+        f(&mut all);
+        save(&self.record_path, &all)
     }
+}
+
+fn save(path: &std::path::Path, record: &Record) -> Result<()> {
+    if record.is_empty() {
+        return match fs::remove_file(path) {
+            Ok(()) => Ok(()),
+            Err(e) if e.kind() == ErrorKind::NotFound => Ok(()),
+            Err(e) => Err(Failure::refused(format!("{}: {e}", path.display()))),
+        };
+    }
+    fsutil::write_atomic(path, record.render().as_bytes()).ctx(path.display())
 }
 
 #[cfg(test)]
@@ -550,6 +619,77 @@ mod tests {
         assert!(state.locks_dir().join("branch/a%252%46b.lock").is_file());
         drop(held);
         acquire_after_release(&state, LockKey::branch("a/b"));
+    }
+
+    #[test]
+    fn shared_holders_run_together_and_an_exclusive_taker_waits_for_none_of_them() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = State::open_at(dir.path().join("atelier")).unwrap();
+        let key = LockKey::branch("a");
+        let mut one = HeldLock::acquire_shared(&state, key.clone()).unwrap();
+        let mut two = HeldLock::acquire_shared(&state, key.clone()).unwrap();
+        assert!(one.is_shared());
+        // clean, follow and start refuse while a shared holder runs.
+        let e = HeldLock::acquire(&state, key.clone()).unwrap_err();
+        assert_eq!(e.exit, crate::exit::Exit::Refused);
+        assert!(e.message.contains("held by another atelier command"));
+        // Each holder keeps the other's lines.
+        let other = "20261113T1012Z-8899aabbccddeeff";
+        one.add_run(ID).unwrap();
+        two.add_run(other).unwrap();
+        one.add_group(9_999_998, ID, None).unwrap();
+        let path = state.locks_dir().join("branch/a.procs");
+        let r = Record::parse(&fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(r.run_ids(), vec![ID.to_owned(), other.to_owned()]);
+        assert_eq!(r.groups.len(), 1);
+        one.remove_group(9_999_998).unwrap();
+        one.remove_run(ID).unwrap();
+        let r = Record::parse(&fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(r.run_ids(), vec![other.to_owned()]);
+        two.remove_run(other).unwrap();
+        assert!(!path.exists());
+        drop((one, two));
+        // An exclusive holder refuses a shared taker.
+        let held = acquire_after_release(&state, key.clone());
+        let e = HeldLock::acquire_shared(&state, key.clone()).unwrap_err();
+        assert!(e.message.contains("held by another atelier command"));
+        drop(held);
+    }
+
+    #[test]
+    fn survivors_of_a_shared_holder_stop_the_next_exclusive_taker() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = State::open_at(dir.path().join("atelier")).unwrap();
+        let key = LockKey::branch("a");
+        let child = sleeper_group();
+        let pgid = child.id() as i32;
+        let mut held = HeldLock::acquire_shared(&state, key.clone()).unwrap();
+        held.add_group(pgid, ID, procs::start_time(pgid)).unwrap();
+        drop(held);
+        // Another shared taker runs beside it.
+        HeldLock::acquire_shared(&state, key.clone()).unwrap();
+        let e = loop {
+            match HeldLock::acquire(&state, key.clone()) {
+                Err(e) if e.message.contains("held by another") => {
+                    std::thread::sleep(std::time::Duration::from_millis(10))
+                }
+                other => break other.unwrap_err(),
+            }
+        };
+        assert!(e.message.contains("still alive"), "{}", e.message);
+        stop(child);
+        acquire_after_release(&state, key);
+    }
+
+    #[test]
+    fn a_dot_in_a_key_is_not_an_extension() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = State::open_at(dir.path().join("atelier")).unwrap();
+        let _one = HeldLock::acquire(&state, LockKey::branch("v1.2")).unwrap();
+        // Another branch whose name differs after the dot is another lock.
+        HeldLock::acquire(&state, LockKey::branch("v1.3")).unwrap();
+        assert!(state.locks_dir().join("branch/v1.2.lock").is_file());
+        assert!(state.locks_dir().join("branch/v1.3.lock").is_file());
     }
 
     #[test]

@@ -3,6 +3,11 @@
 //! before it, and the file is read, checked and replaced (`openat`, `fstatat`, `renameat`)
 //! relative to the descriptor of its own folder. Used by `follow` for the files it hands to
 //! Mergiraf (3.3 review round 2, N4).
+//!
+//! Also the walks `clean` uses on a folder it deletes: [`survey`] looks at every entry without
+//! following a link and reports what is on another device (a mount) and any nested `.git`;
+//! [`remove_tree`] deletes a folder through descriptors, checking each folder's device before it
+//! looks inside, so it never deletes anything on another file system.
 
 use std::ffi::{CString, OsStr, OsString};
 use std::fs::File;
@@ -139,6 +144,195 @@ fn walk(root: &Path, folders: &[OsString]) -> io::Result<(OwnedFd, Vec<Identity>
         chain.push(identity(&fstat(&fd)?));
     }
     Ok((fd, chain))
+}
+
+/// What [`survey`] found under a folder, as paths relative to it.
+#[derive(Debug, Default)]
+pub struct Survey {
+    /// Entries on another device than the folder: mount points, never entered.
+    pub mounts: Vec<PathBuf>,
+    /// Folders below the top that hold a `.git` (a file or a folder): nested repositories.
+    pub repos: Vec<PathBuf>,
+    /// Folders that could not be read, so what is inside them is unknown.
+    pub unreadable: Vec<(PathBuf, io::Error)>,
+}
+
+/// Walks the folder `root` (itself not a link) without following links and without entering
+/// another device.
+pub fn survey(root: &Path) -> io::Result<Survey> {
+    let fd = open_dir(root)?;
+    let dev = fstat(&fd)?.st_dev;
+    let mut found = Survey::default();
+    survey_in(&fd, dev, &mut PathBuf::new(), &mut found);
+    Ok(found)
+}
+
+fn survey_in(dir: &OwnedFd, dev: libc::dev_t, rel: &mut PathBuf, found: &mut Survey) {
+    let names = match read_names(dir) {
+        Ok(n) => n,
+        Err(e) => {
+            found.unreadable.push((rel.clone(), e));
+            return;
+        }
+    };
+    for name in names {
+        rel.push(&name);
+        match fstatat(dir, &name) {
+            Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+            Err(e) => found.unreadable.push((rel.clone(), e)),
+            Ok(st) if st.st_dev != dev => found.mounts.push(rel.clone()),
+            Ok(st) => {
+                if name == ".git" {
+                    if rel.components().count() > 1 {
+                        found
+                            .repos
+                            .push(rel.parent().map(Path::to_path_buf).unwrap_or_default());
+                    }
+                } else if st.st_mode & libc::S_IFMT == libc::S_IFDIR {
+                    match open_sub(dir, &name, dev) {
+                        Ok(Some(child)) => survey_in(&child, dev, rel, found),
+                        Ok(None) => found.mounts.push(rel.clone()),
+                        Err(e) => found.unreadable.push((rel.clone(), e)),
+                    }
+                }
+            }
+        }
+        rel.pop();
+    }
+}
+
+/// Deletes the folder `name` in the folder `parent` (a canonical path) when it is a real folder
+/// with the identity `expect`, and everything in it, through descriptors: no link is followed,
+/// and a folder whose device is not `expect`'s is never entered or deleted (an error naming it).
+/// Stops at the first error; what was deleted stays deleted.
+pub fn remove_tree(parent: &Path, name: &OsStr, expect: Identity) -> io::Result<()> {
+    let pfd = open_dir(parent)?;
+    let fd = openat(&pfd, name, DIR_FLAGS | libc::O_NOFOLLOW, 0)?;
+    if identity(&fstat(&fd)?) != expect {
+        return Err(io::Error::other(format!(
+            "{} is not the registered folder any more",
+            parent.join(name).display()
+        )));
+    }
+    let dev = expect.0 as libc::dev_t;
+    let mut rel = PathBuf::from(name);
+    empty(&fd, dev, &mut rel).map_err(|(at, e)| {
+        io::Error::new(e.kind(), format!("{}: {e}", parent.join(at).display()))
+    })?;
+    drop(fd);
+    unlink(&pfd, name, libc::AT_REMOVEDIR)
+        .map_err(|e| io::Error::new(e.kind(), format!("{}: {e}", parent.join(name).display())))
+}
+
+/// Deletes everything in `dir`; on an error, the path where it happened.
+fn empty(
+    dir: &OwnedFd,
+    dev: libc::dev_t,
+    rel: &mut PathBuf,
+) -> std::result::Result<(), (PathBuf, io::Error)> {
+    let names = read_names(dir).map_err(|e| (rel.clone(), e))?;
+    for name in names {
+        rel.push(&name);
+        let st = match fstatat(dir, &name) {
+            Ok(st) => st,
+            Err(e) if e.kind() == io::ErrorKind::NotFound => {
+                rel.pop();
+                continue;
+            }
+            Err(e) => return Err((rel.clone(), e)),
+        };
+        if st.st_dev != dev {
+            return Err((rel.clone(), other_device()));
+        }
+        if st.st_mode & libc::S_IFMT == libc::S_IFDIR {
+            match open_sub(dir, &name, dev) {
+                Ok(Some(child)) => empty(&child, dev, rel)?,
+                Ok(None) => return Err((rel.clone(), other_device())),
+                Err(e) => return Err((rel.clone(), e)),
+            }
+            unlink(dir, &name, libc::AT_REMOVEDIR).map_err(|e| (rel.clone(), e))?;
+        } else {
+            unlink(dir, &name, 0).map_err(|e| (rel.clone(), e))?;
+        }
+        rel.pop();
+    }
+    Ok(())
+}
+
+fn other_device() -> io::Error {
+    io::Error::other("on another device (a mount): not entered, not deleted")
+}
+
+const DIR_FLAGS: libc::c_int = libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC;
+
+fn open_dir(path: &Path) -> io::Result<OwnedFd> {
+    let c = cstr(path.as_os_str())?;
+    let raw = unsafe { libc::open(c.as_ptr(), DIR_FLAGS | libc::O_NOFOLLOW) };
+    if raw < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(unsafe { OwnedFd::from_raw_fd(raw) })
+}
+
+/// Opens a folder in `dir` without following a link; `None` when it is on another device.
+fn open_sub(dir: &OwnedFd, name: &OsStr, dev: libc::dev_t) -> io::Result<Option<OwnedFd>> {
+    let fd = openat(dir, name, DIR_FLAGS | libc::O_NOFOLLOW, 0)?;
+    Ok((fstat(&fd)?.st_dev == dev).then_some(fd))
+}
+
+fn unlink(dir: &OwnedFd, name: &OsStr, flags: libc::c_int) -> io::Result<()> {
+    let c = cstr(name)?;
+    if unsafe { libc::unlinkat(dir.as_raw_fd(), c.as_ptr(), flags) } != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(())
+}
+
+/// The names in a folder, without `.` and `..`, read through a copy of its descriptor.
+fn read_names(dir: &OwnedFd) -> io::Result<Vec<OsString>> {
+    let copy = unsafe { libc::dup(dir.as_raw_fd()) };
+    if copy < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    let d = unsafe { libc::fdopendir(copy) };
+    if d.is_null() {
+        let e = io::Error::last_os_error();
+        unsafe { libc::close(copy) };
+        return Err(e);
+    }
+    // The copy shares the offset with `dir`: start from the beginning.
+    unsafe { libc::rewinddir(d) };
+    let mut names = Vec::new();
+    let result = loop {
+        // SAFETY: errno is thread-local; readdir signals an error only through it.
+        unsafe { *errno() = 0 };
+        let ent = unsafe { libc::readdir(d) };
+        if ent.is_null() {
+            let code = unsafe { *errno() };
+            break if code == 0 {
+                Ok(())
+            } else {
+                Err(io::Error::from_raw_os_error(code))
+            };
+        }
+        let name = unsafe { std::ffi::CStr::from_ptr((*ent).d_name.as_ptr()) };
+        let bytes = name.to_bytes();
+        if bytes != b"." && bytes != b".." {
+            names.push(OsStr::from_bytes(bytes).to_owned());
+        }
+    };
+    unsafe { libc::closedir(d) };
+    result.map(|()| names)
+}
+
+#[cfg(target_os = "macos")]
+fn errno() -> *mut libc::c_int {
+    unsafe { libc::__error() }
+}
+
+#[cfg(target_os = "linux")]
+fn errno() -> *mut libc::c_int {
+    unsafe { libc::__errno_location() }
 }
 
 fn openat(

@@ -3,14 +3,19 @@
 //!
 //! The branch comes from this worktree's `HEAD`, never from an argument, so a worker cannot
 //! register a folder against another branch. It must have an `active` record; a detached `HEAD`,
-//! the main checkout and the gate worktree are refused (4). The branch's lock is held from before
-//! the folder exists until the command and its processes are done, so `clean` refuses while
-//! anything uses the folder; there is no way to get a folder without holding it. The folder is
+//! the main checkout and the gate worktree are refused (4). The branch's lock is held shared from
+//! before the folder exists until the command and its processes are done, so several `tmp`
+//! commands of one branch run at once while `clean` (which takes it exclusive) refuses; there is
+//! no way to get a folder without holding it. The folder is
 //! registered (canonical path, file-system identity) under the branch's lifetime id before the
 //! command starts, and stays after it, for inspection, until `clean`.
 //!
-//! Folders: `<temp dir>/atelier/<repo id>/<branch key>/<id>/`, or with `--short`
-//! `/tmp/atl-<id>/`, which keeps socket paths under macOS's 104 bytes. Mode 0700. A program that
+//! Folders: `<temp dir>/atelier-<uid>/<repo id>/<branch key>/<id>/` (the temp dir is `$TMPDIR`,
+//! or `/tmp` when it is unset; one root per user, so users of a shared `/tmp` neither collide
+//! nor block each other), or with `--short` `/tmp/atl-<id>/`, which keeps socket paths under
+//! macOS's 104 bytes. Every folder atelier makes there is mode 0700; an existing
+//! `atelier-<uid>` is used only when it is a real folder owned by this user that no one else can
+//! enter. A program that
 //! creates something outside the folder (a virtual machine, a container) writes one line per thing
 //! into `<folder>/leftovers`, and removes the line when the thing is gone: `clean` refuses while
 //! that file is not empty.
@@ -55,7 +60,7 @@ pub fn run(ctx: &Context, cwd: &Path, short: bool, command: &[String]) -> Result
         ));
     }
     let branch = crate::follow::current_branch(checkout, "tmp")?;
-    let lock = HeldLock::acquire(&ctx.state, LockKey::branch(&branch))?;
+    let lock = HeldLock::acquire_shared(&ctx.state, LockKey::branch(&branch))?;
     let stack = Stack::new(checkout, &ctx.state, &ctx.settings.integration_branch);
     let (rec, _tip) = stack.started(&branch)?;
 
@@ -139,18 +144,13 @@ fn make_folder(ctx: &Context, branch: &str, id: &str, short: bool) -> Result<(Pa
             temp.display()
         )));
     }
-    let base = canonical(&temp)
-        .join("atelier")
-        .join(repo_id(&ctx.checkout))
-        .join(names::key(branch));
-    let mut at = canonical(&temp);
-    for part in ["atelier"]
-        .into_iter()
-        .map(str::to_owned)
-        .chain([repo_id(&ctx.checkout), names::key(branch)])
-    {
+    let root = canonical(&temp).join(user_root_name());
+    ensure_private_dir(&root, true)?;
+    let base = root.join(repo_id(&ctx.checkout)).join(names::key(branch));
+    let mut at = root;
+    for part in [repo_id(&ctx.checkout), names::key(branch)] {
         at.push(part);
-        ensure_private_dir(&at)?;
+        ensure_private_dir(&at, false)?;
     }
     debug_assert_eq!(at, base);
     let folder = base.join(id);
@@ -158,9 +158,15 @@ fn make_folder(ctx: &Context, branch: &str, id: &str, short: bool) -> Result<(Pa
     Ok((folder.clone(), folder))
 }
 
+/// `atelier-<uid>`: this user's temp root under the temp dir.
+pub fn user_root_name() -> String {
+    // SAFETY: geteuid has no preconditions.
+    format!("atelier-{}", unsafe { libc::geteuid() })
+}
+
 /// A folder of ours that exists or is created now: a real folder (never a link) owned by this
-/// user.
-fn ensure_private_dir(path: &Path) -> Result<()> {
+/// user; with `private`, also closed to group and others.
+fn ensure_private_dir(path: &Path, private: bool) -> Result<()> {
     match fs::symlink_metadata(path) {
         Ok(m) => {
             // SAFETY: geteuid has no preconditions.
@@ -168,6 +174,13 @@ fn ensure_private_dir(path: &Path) -> Result<()> {
                 return Err(Failure::refused(format!(
                     "{} exists and is not a folder owned by this user: atelier will not put temp folders in it",
                     path.display()
+                )));
+            }
+            if private && m.mode() & 0o077 != 0 {
+                return Err(Failure::refused(format!(
+                    "{} is open to other users (mode {:o}): atelier will not put temp folders in it; chmod 700 it",
+                    path.display(),
+                    m.mode() & 0o7777
                 )));
             }
             Ok(())

@@ -1,39 +1,52 @@
-//! `atelier clean [<branch>…] [--yes]` (DESIGN §3, r4 §3.9): deletes what was merged and what
-//! atelier made, and nothing else.
+//! `atelier clean [<branch>…] [--yes] [--discard <commit>…]` (DESIGN §3, r4 §3.9): deletes what
+//! was merged and what atelier made, and nothing else.
 //!
-//! For each branch, under its lock (and the run lock of the worktree it deletes), nothing is
-//! trusted that is not re-read from the disk now. The facts that grant authority are the
-//! branch's record (state `merged`) and its [`MergeFacts`]: the commit that was merged and the
-//! one worktree `approve` recorded, by canonical path and file-system identity. A branch whose
-//! record is missing, active, or without those facts is never touched.
+//! For each branch, under its lock taken exclusive (and the run lock of the worktree it deletes),
+//! nothing is trusted that is not re-read from the disk now. The facts that grant authority are
+//! the branch's record (state `merged`) and its [`MergeFacts`]: the commit that was merged and
+//! the one worktree `approve` recorded, by canonical path and file-system identity. A branch
+//! whose record is missing, active, or without those facts is never touched.
 //!
-//! Without `--yes` the same checks run and the plan is printed. With it, each deletion repeats its
-//! checks immediately before it happens:
+//! The plan checks every condition of every step below before anything is deleted for the
+//! branch, so a refusal (4) changes nothing. Without `--yes` it is printed. With it, the steps run
+//! in this order, least destructive first, and each repeats its checks immediately before it
+//! deletes:
 //!
-//! - the worktree: the recorded path is a real folder with the recorded identity and no link in
-//!   its path, the top of a registered worktree of this repository, not the main checkout and
-//!   not the gate, with nothing nested in it or around it, the branch checked out there at the
-//!   merged commit, no operation in progress, no uncommitted and no untracked file; removed with
-//!   `git worktree remove`, never `--force` (git itself refuses a dirty or locked worktree);
-//! - the branch: a plain ref still at the merged commit, not the integration branch, not checked
-//!   out or open in a rebase or bisect anywhere; deleted with `update-ref --no-deref -d` at that
-//!   commit;
-//! - each registered temp folder: its path has exactly the shape `tmp` gives it and is canonical,
-//!   it is a real folder with the registered identity owned by this user, and its `leftovers`
-//!   file (things created outside the folder) is empty or absent; removed without following
-//!   links;
-//! - `mbx clean --under <worktree>` when mbx is a prerequisite and the worktree's path is gone.
+//! 1. each registered temp folder: its path has exactly the shape `tmp` gives it and is
+//!    canonical, it is a real folder with the registered identity owned by this user, nothing in
+//!    it is on another device (a mount), and its `leftovers` file (things created outside the
+//!    folder) is empty or absent; removed through descriptors, never following a link and never
+//!    entering another device ([`dirfd::remove_tree`]);
+//! 2. the worktree: the recorded path is a real folder with the recorded identity and no link in
+//!    its path, the top of a registered worktree of this repository that is not locked, not the
+//!    main checkout and not the gate, with no worktree nested in it or around it, the branch
+//!    checked out there at the merged commit, no operation in progress, no uncommitted and no
+//!    untracked file, no local edit hidden by `--assume-unchanged` or `--skip-worktree`, and,
+//!    walked without following links, no entry on another device and no nested repository (a
+//!    `.git` below the top, ignored folders included). The plan names the ignored top-level
+//!    entries that go with it. It is first moved to a random name beside it (`git worktree
+//!    move`), so no other worktree can take its path meanwhile; its identity is checked there
+//!    again, then it is removed with `git worktree remove`, never `--force`;
+//! 3. the branch: a plain ref still at the merged commit, not the integration branch, not checked
+//!    out or open in a rebase or bisect anywhere, and its reflog names no commit that would be
+//!    lost: one no other ref reaches whose work the merged commit does not contain (work made
+//!    after approval, then reset away). Such commits are listed; naming each with `--discard`
+//!    lets them go. Deleted with `update-ref --no-deref -d` at the merged commit;
+//! 4. `mbx clean --under <worktree>` when mbx is a prerequisite and the worktree's path is gone.
 //!
-//! Then the record becomes `cleaned` and its facts are removed. Every condition of every step is
-//! checked before the first deletion of a branch, so a refusal changes nothing; a step that fails
-//! later leaves the record `merged`, and running `clean` again does the rest.
+//! Then the record becomes `cleaned` and its facts are removed. A step that fails (a file that
+//! cannot be deleted, a check that no longer holds, a git error) stops `clean` for the branch
+//! (exit 1): what was deleted stays deleted, the record stays `merged`, and running `clean`
+//! again does the rest.
 
 use std::fs;
 use std::io::{ErrorKind, Read};
+use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::MetadataExt;
 use std::path::{Component, Path, PathBuf};
 use std::process::Command;
 
+use crate::dirfd;
 use crate::exit::{Exit, Failure, Result};
 use crate::git::{self, Checkout, canonical};
 use crate::locks::{HeldLock, LockKey};
@@ -154,14 +167,26 @@ enum Tmp {
     },
 }
 
+/// A commit of the branch's reflog that deleting the branch would lose.
+struct Lost {
+    commit: String,
+    subject: String,
+    /// The commits lost with it (its own included).
+    count: usize,
+}
+
 struct Plan {
     wt: Wt,
+    /// The ignored top-level entries of the worktree, which `git worktree remove` deletes too.
+    ignored: Vec<String>,
     br: Br,
+    /// Lost commits the command line discards.
+    discarded: Vec<Lost>,
     tmps: Vec<Tmp>,
     mbx: bool,
 }
 
-pub fn run(ctx: &Context, branches: &[String], yes: bool) -> Result<Exit> {
+pub fn run(ctx: &Context, branches: &[String], yes: bool, discard: &[String]) -> Result<Exit> {
     let checkout = &ctx.checkout;
     let integration = &ctx.settings.integration_branch;
     let stack = Stack::new(checkout, &ctx.state, integration);
@@ -194,15 +219,29 @@ pub fn run(ctx: &Context, branches: &[String], yes: bool) -> Result<Exit> {
         }
         seen
     };
+    let mut discards: Vec<String> = Vec::new();
+    for d in discard {
+        let full = git::output(
+            &checkout.root,
+            ["rev-parse", "-q", "--verify", &format!("{d}^{{commit}}")],
+        )?;
+        if !full.status.success() || d.starts_with('-') {
+            return Err(Failure::usage(format!(
+                "clean: --discard {d} is not a commit"
+            )));
+        }
+        discards.push(String::from_utf8_lossy(&full.stdout).trim().to_owned());
+    }
     if targets.is_empty() {
         println!("clean: no merged branch");
         return Ok(Exit::Ok);
     }
 
     let (mut refused, mut failed) = (0, 0);
+    let mut used: Vec<String> = Vec::new();
     for branch in &targets {
         println!("{branch}");
-        match process(&cx, branch, yes) {
+        match process(&cx, branch, yes, &discards, &mut used) {
             Outcome::Done => {}
             Outcome::Refused(reasons) => {
                 refused += 1;
@@ -214,6 +253,11 @@ pub fn run(ctx: &Context, branches: &[String], yes: bool) -> Result<Exit> {
                 failed += 1;
                 println!("  failed: {why}");
             }
+        }
+    }
+    for (d, given) in discards.iter().zip(discard) {
+        if !used.contains(d) {
+            println!("clean: --discard {given} names no lost commit of these branches: ignored");
         }
     }
     if !yes {
@@ -243,7 +287,13 @@ enum Outcome {
     Failed(String),
 }
 
-fn process(cx: &Cx, branch: &str, yes: bool) -> Outcome {
+fn process(
+    cx: &Cx,
+    branch: &str,
+    yes: bool,
+    discards: &[String],
+    used: &mut Vec<String>,
+) -> Outcome {
     let state = &cx.ctx.state;
     let _lock = match HeldLock::acquire(state, LockKey::branch(branch)) {
         Ok(l) => l,
@@ -288,10 +338,11 @@ fn process(cx: &Cx, branch: &str, yes: bool) -> Outcome {
         Err(f) => return Outcome::Refused(vec![f.message]),
     };
 
-    let plan = match plan(cx, &rec, &facts) {
+    let plan = match plan(cx, &rec, &facts, discards) {
         Ok(p) => p,
         Err(reasons) => return Outcome::Refused(reasons),
     };
+    used.extend(plan.discarded.iter().map(|l| l.commit.clone()));
     // A `check` in the worktree holds its run lock: wait for none, refuse.
     let wt_lock = match &plan.wt {
         Wt::Ours(co) => match HeldLock::acquire(state, LockKey::worktree(co)) {
@@ -313,7 +364,7 @@ fn process(cx: &Cx, branch: &str, yes: bool) -> Outcome {
         }
         return Outcome::Done;
     }
-    match execute(cx, &rec, &facts, &plan) {
+    match execute(cx, &rec, &facts, &plan, discards) {
         Ok(()) => {
             drop(wt_lock);
             Outcome::Done
@@ -325,20 +376,6 @@ fn process(cx: &Cx, branch: &str, yes: bool) -> Outcome {
 fn describe(plan: &Plan, rec: &BranchRecord, facts: &MergeFacts) -> Vec<String> {
     let mut lines = Vec::new();
     let p = facts.worktree.display();
-    match &plan.wt {
-        Wt::Ours(_) => lines.push(format!("remove worktree {p}")),
-        Wt::Absent => lines.push(format!("(worktree {p} is already gone)")),
-        Wt::Elsewhere => lines.push(format!(
-            "(worktree {p} is not the one approve recorded any more: left alone)"
-        )),
-    }
-    if let Br::Delete = plan.br {
-        lines.push(format!(
-            "delete branch {} at {}",
-            rec.name,
-            &facts.commit[..12.min(facts.commit.len())]
-        ));
-    }
     for t in &plan.tmps {
         match t {
             Tmp::Remove { entry, .. } => {
@@ -350,6 +387,27 @@ fn describe(plan: &Plan, rec: &BranchRecord, facts: &MergeFacts) -> Vec<String> 
             )),
         }
     }
+    match &plan.wt {
+        Wt::Ours(_) if plan.ignored.is_empty() => lines.push(format!("remove worktree {p}")),
+        Wt::Ours(_) => lines.push(format!(
+            "remove worktree {p}, with its ignored files: {}",
+            plan.ignored.join(", ")
+        )),
+        Wt::Absent => lines.push(format!("(worktree {p} is already gone)")),
+        Wt::Elsewhere => lines.push(format!(
+            "(worktree {p} is not the one approve recorded any more: left alone)"
+        )),
+    }
+    if let Br::Delete = plan.br {
+        lines.push(format!(
+            "delete branch {} at {}",
+            rec.name,
+            &facts.commit[..12.min(facts.commit.len())]
+        ));
+        for l in &plan.discarded {
+            lines.push(format!("  discarding {}", describe_lost(l)));
+        }
+    }
     if plan.mbx {
         lines.push(format!("run mbx clean --under {p}"));
     }
@@ -357,8 +415,22 @@ fn describe(plan: &Plan, rec: &BranchRecord, facts: &MergeFacts) -> Vec<String> 
     lines
 }
 
+fn describe_lost(l: &Lost) -> String {
+    let more = if l.count > 1 {
+        format!(", with {} earlier commit(s) only it reaches", l.count - 1)
+    } else {
+        String::new()
+    };
+    format!("{} {}{more}", l.commit, l.subject)
+}
+
 /// Everything that must hold, read now. Every refusal is listed.
-fn plan(cx: &Cx, rec: &BranchRecord, facts: &MergeFacts) -> std::result::Result<Plan, Vec<String>> {
+fn plan(
+    cx: &Cx,
+    rec: &BranchRecord,
+    facts: &MergeFacts,
+    discards: &[String],
+) -> std::result::Result<Plan, Vec<String>> {
     let mut reasons: Vec<String> = Vec::new();
     let branch = &rec.name;
     for open in [
@@ -391,7 +463,22 @@ fn plan(cx: &Cx, rec: &BranchRecord, facts: &MergeFacts) -> std::result::Result<
         _ if wt_refused => Some(facts.worktree.as_path()),
         _ => None,
     };
+    let ignored = match &wt {
+        Wt::Ours(_) => ignored_top(&facts.worktree).unwrap_or_else(|why| {
+            reasons.push(why);
+            Vec::new()
+        }),
+        _ => Vec::new(),
+    };
+    let mut discarded = Vec::new();
     let br = match inspect_branch(cx, rec, facts, removing) {
+        Ok(Br::Delete) => {
+            match lost_check(cx, rec, facts, discards) {
+                Ok(d) => discarded = d,
+                Err(why) => reasons.push(why),
+            }
+            Br::Delete
+        }
         Ok(b) => b,
         Err(why) => {
             reasons.push(why);
@@ -414,7 +501,14 @@ fn plan(cx: &Cx, rec: &BranchRecord, facts: &MergeFacts) -> std::result::Result<
         return Err(reasons);
     }
     let mbx = cx.ctx.settings.prerequisites.mbx.is_some() && !matches!(wt, Wt::Elsewhere);
-    Ok(Plan { wt, br, tmps, mbx })
+    Ok(Plan {
+        wt,
+        ignored,
+        br,
+        discarded,
+        tmps,
+        mbx,
+    })
 }
 
 fn inspect_worktree(cx: &Cx, rec: &BranchRecord, facts: &MergeFacts) -> Check<Wt> {
@@ -511,6 +605,11 @@ fn inspect_worktree(cx: &Cx, rec: &BranchRecord, facts: &MergeFacts) -> Check<Wt
             facts.commit
         ));
     }
+    if co.git_dir.join("locked").exists() {
+        return Err(format!(
+            "{shown} is locked (git worktree lock): unlock it first if it may go"
+        ));
+    }
     for name in [
         "MERGE_HEAD",
         "CHERRY_PICK_HEAD",
@@ -553,6 +652,17 @@ fn inspect_worktree(cx: &Cx, rec: &BranchRecord, facts: &MergeFacts) -> Check<Wt
             "{shown} has uncommitted or untracked files ({}): it is not deleted",
             files.join(", ")
         ));
+    }
+    let hidden = hidden_edits(p)?;
+    if !hidden.is_empty() {
+        return Err(format!(
+            "{shown} has local edits git status does not show, hidden by --assume-unchanged or --skip-worktree ({}): it is not deleted",
+            hidden.join(", ")
+        ));
+    }
+    let found = dirfd::survey(p).map_err(|e| format!("{shown}: {e}"))?;
+    if let Some(why) = survey_refusal(p, &found, true) {
+        return Err(why);
     }
     Ok(Wt::Ours(co))
 }
@@ -650,13 +760,17 @@ fn inspect_tmp(cx: &Cx, rec: &BranchRecord, file: &Path, entry: &TmpEntry) -> Ch
         Err(e) if e.kind() == ErrorKind::NotFound => {}
         Err(e) => return Err(format!("{}: {e}", leftovers.display())),
     }
+    let found = dirfd::survey(&entry.path).map_err(|e| format!("{shown}: {e}"))?;
+    if let Some(why) = survey_refusal(&entry.path, &found, false) {
+        return Err(why);
+    }
     Ok(Tmp::Remove {
         file: file.to_path_buf(),
         entry: entry.clone(),
     })
 }
 
-/// The path is exactly what `tmp` makes: `<temp root>/atelier/<repo id>/<branch key>/<id>` or
+/// The path is exactly what `tmp` makes: `<temp dir>/atelier-<uid>/<repo id>/<branch key>/<id>` or
 /// `<canonical /tmp>/atl-<id>`, absolute, with no `.` or `..`.
 fn shape_ok(cx: &Cx, branch: &str, id: &str, path: &Path) -> bool {
     if !path.is_absolute()
@@ -675,7 +789,7 @@ fn shape_ok(cx: &Cx, branch: &str, id: &str, path: &Path) -> bool {
         .collect();
     let key = names::key(branch);
     if let [.., a, r, k, i] = comps.as_slice()
-        && *a == "atelier"
+        && *a == format!("atelier-{}", cx.uid)
         && *r == cx.repo_id
         && *k == key
         && *i == id
@@ -691,47 +805,10 @@ fn execute(
     rec: &BranchRecord,
     facts: &MergeFacts,
     plan: &Plan,
+    discards: &[String],
 ) -> std::result::Result<(), String> {
     let p = &facts.worktree;
     let branch = &rec.name;
-    if let Wt::Ours(_) = plan.wt {
-        match inspect_worktree(cx, rec, facts)? {
-            Wt::Ours(_) => {}
-            _ => {
-                return Err(format!(
-                    "{} changed since the plan: nothing deleted",
-                    p.display()
-                ));
-            }
-        }
-        let out = git::output(
-            &cx.main,
-            [
-                std::ffi::OsStr::new("worktree"),
-                "remove".as_ref(),
-                p.as_os_str(),
-            ],
-        )
-        .map_err(|f| f.message)?;
-        if !out.status.success() {
-            return Err(format!(
-                "git worktree remove {}: {}",
-                p.display(),
-                String::from_utf8_lossy(&out.stderr).trim()
-            ));
-        }
-        println!("  removed worktree {}", p.display());
-    }
-    if let Br::Delete = plan.br {
-        match inspect_branch(cx, rec, facts, None)? {
-            Br::Delete => {
-                refs::delete(cx.dir(), &names::branch_ref(branch), &facts.commit)
-                    .map_err(|f| f.message)?;
-                println!("  deleted branch {branch}");
-            }
-            Br::Absent => {}
-        }
-    }
     for t in &plan.tmps {
         match t {
             Tmp::Forget { file, why } => {
@@ -741,18 +818,16 @@ fn execute(
             Tmp::Remove { file, entry } => {
                 match inspect_tmp(cx, rec, file, entry)? {
                     Tmp::Remove { .. } => {
-                        if !entry.still_matches() {
-                            return Err(format!(
-                                "{} changed since the check: not deleted",
-                                entry.path.display()
-                            ));
-                        }
-                        fs::remove_dir_all(&entry.path)
-                            .map_err(|e| format!("{}: {e}", entry.path.display()))?;
+                        let (Some(parent), Some(name)) =
+                            (entry.path.parent(), entry.path.file_name())
+                        else {
+                            return Err(format!("{}: not a folder path", entry.path.display()));
+                        };
+                        dirfd::remove_tree(parent, name, (entry.dev, entry.ino))
+                            .map_err(|e| e.to_string())?;
                         println!("  removed temp folder {}", entry.path.display());
-                        if let Some(parent) = entry.path.parent()
-                            && parent.file_name().and_then(|n| n.to_str())
-                                == Some(names::key(branch).as_str())
+                        if parent.file_name().and_then(|n| n.to_str())
+                            == Some(names::key(branch).as_str())
                         {
                             let _ = fs::remove_dir(parent);
                         }
@@ -764,6 +839,31 @@ fn execute(
         }
     }
     let _ = fs::remove_dir(cx.ctx.state.tmp_dir().join(&rec.lifetime));
+
+    if let Wt::Ours(_) = plan.wt {
+        match inspect_worktree(cx, rec, facts)? {
+            Wt::Ours(_) => {}
+            _ => {
+                return Err(format!(
+                    "{} changed since the plan: not deleted",
+                    p.display()
+                ));
+            }
+        }
+        remove_worktree(cx, facts)?;
+        println!("  removed worktree {}", p.display());
+    }
+    if let Br::Delete = plan.br {
+        match inspect_branch(cx, rec, facts, None)? {
+            Br::Delete => {
+                lost_check(cx, rec, facts, discards)?;
+                refs::delete(cx.dir(), &names::branch_ref(branch), &facts.commit)
+                    .map_err(|f| f.message)?;
+                println!("  deleted branch {branch}");
+            }
+            Br::Absent => {}
+        }
+    }
     if plan.mbx {
         match fs::symlink_metadata(p) {
             Err(e) if e.kind() == ErrorKind::NotFound => {
@@ -793,6 +893,303 @@ fn execute(
         .map_err(|f| f.message)?;
     println!("  {branch} is cleaned");
     Ok(())
+}
+
+/// Moves the checked worktree to a random name beside it, checks it is still the recorded folder
+/// there, and removes it. A path no one else knows cannot be given to another worktree between
+/// the check and the removal. On a failure after the move, it is moved back.
+fn remove_worktree(cx: &Cx, facts: &MergeFacts) -> std::result::Result<(), String> {
+    let p = &facts.worktree;
+    let (Some(parent), Some(name)) = (p.parent(), p.file_name()) else {
+        return Err(format!("{}: not a folder path", p.display()));
+    };
+    let mut aside = name.to_owned();
+    aside.push(".atelier-removing-");
+    aside.push(crate::fsutil::random_hex(6).map_err(|e| e.to_string())?);
+    let aside = parent.join(aside);
+    let git_wt = |args: &[&std::ffi::OsStr]| -> std::result::Result<(), String> {
+        let mut all: Vec<&std::ffi::OsStr> = vec!["worktree".as_ref()];
+        all.extend(args);
+        let out = git::output(&cx.main, &all).map_err(|f| f.message)?;
+        if out.status.success() {
+            Ok(())
+        } else {
+            Err(format!(
+                "git worktree {}: {}",
+                args.iter()
+                    .map(|a| a.to_string_lossy())
+                    .collect::<Vec<_>>()
+                    .join(" "),
+                String::from_utf8_lossy(&out.stderr).trim()
+            ))
+        }
+    };
+    git_wt(&["move".as_ref(), p.as_os_str(), aside.as_os_str()])?;
+    let back = |why: String| -> String {
+        match git_wt(&["move".as_ref(), aside.as_os_str(), p.as_os_str()]) {
+            Ok(()) => why,
+            Err(e) => format!(
+                "{why}; moving it back to {} failed too ({e}): it is at {}",
+                p.display(),
+                aside.display()
+            ),
+        }
+    };
+    match fs::symlink_metadata(&aside) {
+        Ok(m) if m.is_dir() && m.dev() == facts.dev && m.ino() == facts.ino => {}
+        _ => {
+            return Err(back(format!(
+                "{} is not the recorded worktree after the move: not deleted",
+                aside.display()
+            )));
+        }
+    }
+    git_wt(&["remove".as_ref(), aside.as_os_str()]).map_err(back)
+}
+
+/// A refusal for what [`dirfd::survey`] found in `root`; nested repositories count when `repos`.
+fn survey_refusal(root: &Path, found: &dirfd::Survey, repos: bool) -> Option<String> {
+    let shown = root.display();
+    let list = |v: &[PathBuf]| {
+        v.iter()
+            .take(8)
+            .map(|r| root.join(r).display().to_string())
+            .collect::<Vec<_>>()
+            .join(", ")
+    };
+    if !found.mounts.is_empty() {
+        return Some(format!(
+            "{shown} has something of another file system mounted in it ({}): unmount it first; nothing is deleted",
+            list(&found.mounts)
+        ));
+    }
+    if repos && !found.repos.is_empty() {
+        return Some(format!(
+            "{shown} holds a nested git repository ({}), whose commits would go with it: move it out first; nothing is deleted",
+            list(&found.repos)
+        ));
+    }
+    if let Some((at, e)) = found.unreadable.first() {
+        return Some(format!(
+            "{} cannot be read ({e}), so what is in it is unknown: nothing is deleted",
+            root.join(at).display()
+        ));
+    }
+    None
+}
+
+/// Tracked files flagged `--assume-unchanged` or `--skip-worktree` that exist and differ from
+/// the index: local edits `git status` and `git worktree remove` do not see.
+fn hidden_edits(p: &Path) -> Check<Vec<String>> {
+    let out = git::output(p, ["ls-files", "-v", "-s", "-z"]).map_err(|f| f.message)?;
+    if !out.status.success() {
+        return Err(format!(
+            "git ls-files in {}: {}",
+            p.display(),
+            String::from_utf8_lossy(&out.stderr).trim()
+        ));
+    }
+    let mut differ: Vec<String> = Vec::new();
+    // Regular files to hash: (path, the index's blob).
+    let mut hash: Vec<(String, String)> = Vec::new();
+    for entry in out.stdout.split(|&b| b == 0).filter(|e| !e.is_empty()) {
+        let entry = String::from_utf8_lossy(entry);
+        let Some((meta, path)) = entry.split_once('\t') else {
+            continue;
+        };
+        let fields: Vec<&str> = meta.split(' ').collect();
+        let [tag, mode, oid, _stage] = fields.as_slice() else {
+            continue;
+        };
+        let flagged = tag.chars().all(|c| c.is_ascii_lowercase()) || *tag == "S";
+        if !flagged || *mode == "160000" {
+            continue;
+        }
+        let full = p.join(path);
+        let m = match fs::symlink_metadata(&full) {
+            Ok(m) => m,
+            Err(e) if e.kind() == ErrorKind::NotFound => continue,
+            Err(_) => {
+                differ.push(path.to_owned());
+                continue;
+            }
+        };
+        if *mode == "120000" {
+            let same = m.is_symlink()
+                && fs::read_link(&full).is_ok_and(|t| {
+                    git::output(p, ["cat-file", "blob", oid])
+                        .is_ok_and(|o| o.status.success() && o.stdout == t.as_os_str().as_bytes())
+                });
+            if !same {
+                differ.push(path.to_owned());
+            }
+        } else if !m.is_file() {
+            differ.push(path.to_owned());
+        } else {
+            hash.push((path.to_owned(), (*oid).to_owned()));
+        }
+    }
+    for chunk in hash.chunks(256) {
+        let mut args: Vec<&str> = vec!["hash-object", "--"];
+        args.extend(chunk.iter().map(|(path, _)| path.as_str()));
+        let out = git::output(p, &args).map_err(|f| f.message)?;
+        let got = String::from_utf8_lossy(&out.stdout);
+        let got: Vec<&str> = got.lines().collect();
+        for (i, (path, oid)) in chunk.iter().enumerate() {
+            if !out.status.success() || got.get(i) != Some(&oid.as_str()) {
+                differ.push(path.clone());
+            }
+        }
+    }
+    differ.truncate(8);
+    Ok(differ)
+}
+
+/// The top-level entries of the worktree that git ignores (folders end in `/`).
+fn ignored_top(p: &Path) -> Check<Vec<String>> {
+    let out = git::output(
+        p,
+        [
+            "ls-files",
+            "-o",
+            "-i",
+            "--exclude-standard",
+            "--directory",
+            "-z",
+        ],
+    )
+    .map_err(|f| f.message)?;
+    if !out.status.success() {
+        return Err(format!(
+            "git ls-files in {}: {}",
+            p.display(),
+            String::from_utf8_lossy(&out.stderr).trim()
+        ));
+    }
+    let mut top: Vec<String> = Vec::new();
+    for e in out.stdout.split(|&b| b == 0).filter(|e| !e.is_empty()) {
+        let e = String::from_utf8_lossy(e);
+        let name = match e.split_once('/') {
+            Some((first, _)) => format!("{first}/"),
+            None => e.into_owned(),
+        };
+        if !top.contains(&name) {
+            top.push(name);
+        }
+    }
+    top.sort();
+    Ok(top)
+}
+
+/// The commits of the branch's reflog, since it first held the merged commit, that deleting it
+/// would lose: reached by no other ref, not in the merged commit, with work the merged commit
+/// does not contain (a commit whose change the merged commit has, cherry-picked, is not lost). Refuses unless each is discarded on
+/// the command line; returns the discarded ones.
+fn lost_check(
+    cx: &Cx,
+    rec: &BranchRecord,
+    facts: &MergeFacts,
+    discards: &[String],
+) -> Check<Vec<Lost>> {
+    let lost = lost_commits(cx, rec, facts)?;
+    let (discarded, kept): (Vec<Lost>, Vec<Lost>) =
+        lost.into_iter().partition(|l| discards.contains(&l.commit));
+    if kept.is_empty() {
+        return Ok(discarded);
+    }
+    let all: Vec<&str> = kept
+        .iter()
+        .chain(&discarded)
+        .map(|l| l.commit.as_str())
+        .collect();
+    Err(format!(
+        "{}'s reflog holds work that only it remembers: no other ref reaches it and the merged commit does not contain it (made after approval, then reset away?):\n{}\n    keep it on a branch first (git branch <name> <commit>), or let it go: atelier clean {} --yes --discard {}",
+        rec.name,
+        kept.iter()
+            .map(|l| format!("      {}", describe_lost(l)))
+            .collect::<Vec<_>>()
+            .join("\n"),
+        rec.name,
+        all.join(" ")
+    ))
+}
+
+fn lost_commits(cx: &Cx, rec: &BranchRecord, facts: &MergeFacts) -> Check<Vec<Lost>> {
+    let dir = cx.dir();
+    let refname = names::branch_ref(&rec.name);
+    let lines = |args: &[&str]| -> Check<Vec<String>> {
+        let out = git::output(dir, args).map_err(|f| f.message)?;
+        if !out.status.success() {
+            return Err(format!(
+                "git {}: {}",
+                args.join(" "),
+                String::from_utf8_lossy(&out.stderr).trim()
+            ));
+        }
+        Ok(String::from_utf8_lossy(&out.stdout)
+            .lines()
+            .map(str::to_owned)
+            .filter(|l| !l.is_empty())
+            .collect())
+    };
+    let mut logged: Vec<String> = Vec::new();
+    if git::output(dir, ["reflog", "exists", &refname]).is_ok_and(|o| o.status.success()) {
+        // Newest first. Only what the branch held after it first reached the merged commit (the
+        // tip approve recorded) is work made after approval; earlier states, an amended commit
+        // for one, were superseded before anyone approved. With no such entry, all of it counts.
+        let all = lines(&["reflog", "show", "--format=%H", &refname, "--"])?;
+        let after = all
+            .iter()
+            .rposition(|c| *c == facts.commit)
+            .unwrap_or(all.len());
+        for c in &all[..after] {
+            if *c != facts.commit && !logged.contains(c) {
+                logged.push(c.clone());
+            }
+        }
+    }
+    if logged.is_empty() {
+        return Ok(Vec::new());
+    }
+    // Every commit only the reflog reaches.
+    let exclude = format!("--exclude={refname}");
+    let mut args: Vec<&str> = vec!["rev-list", "--ignore-missing"];
+    args.extend(logged.iter().map(String::as_str));
+    args.extend(["--not", &facts.commit, &exclude, "--all"]);
+    let unreached = lines(&args)?;
+    if unreached.is_empty() {
+        return Ok(Vec::new());
+    }
+    let mut lost: Vec<(String, usize)> = Vec::new();
+    for c in logged.iter().filter(|c| unreached.contains(c)) {
+        // Its commits whose change the merged commit's side has no equivalent of.
+        let range = format!("{}...{c}", facts.commit);
+        let unique = lines(&["rev-list", "--right-only", "--cherry-pick", &range])?;
+        let n = unique.iter().filter(|u| unreached.contains(u)).count();
+        if n > 0 {
+            lost.push((c.clone(), n));
+        }
+    }
+    if lost.is_empty() {
+        return Ok(Vec::new());
+    }
+    // Only the tips: an earlier lost commit inside a later one's history goes with it.
+    let mut args: Vec<&str> = vec!["merge-base", "--independent"];
+    args.extend(lost.iter().map(|(c, _)| c.as_str()));
+    let tips = lines(&args)?;
+    let mut out = Vec::new();
+    for (c, n) in lost.into_iter().filter(|(c, _)| tips.contains(c)) {
+        let subject = lines(&["log", "-1", "--format=%s", &c])?
+            .into_iter()
+            .next()
+            .unwrap_or_default();
+        out.push(Lost {
+            commit: c,
+            subject,
+            count: n,
+        });
+    }
+    Ok(out)
 }
 
 fn remove_entry(file: &Path) -> std::result::Result<(), String> {

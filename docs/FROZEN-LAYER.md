@@ -21,8 +21,9 @@ runs its pinned version beside the orchestrator's. These rules keep that safe.
 | Path | Content |
 |---|---|
 | `state.lock` | empty; `flock` shared by every command, exclusive during a conversion of the versioned layer |
-| `locks/gate.lock`, `locks/branch/<key>.lock`, `locks/worktree/<key>.lock` | empty; `flock` exclusive while an atelier holds the lock |
+| `locks/gate.lock`, `locks/branch/<key>.lock`, `locks/worktree/<key>.lock` | empty; `flock` exclusive while an atelier holds the lock; a branch lock is held shared by `tmp` and by `check` in the branch's worktree, exclusive by `clean`, `follow` and `start` |
 | `locks/…/<same name>.procs` | the lock record, below |
+| `locks/…/<same name>.procs.lock` | empty; `flock` exclusive for the moment a shared holder rewrites the record |
 | `runs/<run id>/run.toml` | written when a run starts |
 | `runs/<run id>/result` | written atomically when a run ends; absent for a run that was killed |
 | `runs/<run id>/<step key>.log` | a step's output |
@@ -71,8 +72,10 @@ group <pgid> <run id> <leader start time> [<later fields>...]
 - Empty lines are ignored. Any other line makes the record unreadable: the lock refuses (4), and
   the file is left as it is.
 
-Whoever takes the lock next reads the record and refuses (4) while any of these live, naming
-them. It never signals them.
+Whoever takes the lock exclusive next reads the record and refuses (4) while any of these
+live, naming them. It never signals them. Shared holders of a branch lock run beside each other:
+one never refuses for what the record lists, and changes only its own lines, re-reading the file
+and writing it back under `<same name>.procs.lock`.
 
 - A recorded group is alive and is still the one atelier started. If a process with pid == pgid
   exists and its start time differs from the recorded one, the pgid was reused: the line is not
@@ -211,12 +214,15 @@ branch checked out at `commit`; it deletes the branch only while the ref still h
 | `dev`, `ino` | integers | its file-system identity when registered |
 
 The entry's file name is `<entry id>.toml` (lowercase hex). `tmp` makes the folder at
-`<temp dir>/atelier/<repo id>/<branch key>/<entry id>/` (`<repo id>`: the 64-bit FNV-1a hash of the
+`<temp dir>/atelier-<uid>/<repo id>/<branch key>/<entry id>/` (`<temp dir>`: `$TMPDIR`, or the
+system's temp dir when it is unset, `/tmp` on Linux; `atelier-<uid>`: this user's root, mode 0700,
+used only when it is a folder this user owns that others cannot enter; `<repo id>`: the 64-bit FNV-1a hash of the
 canonical common git folder, 16 hex digits; `<branch key>`: `names::key` of the branch), or with
 `--short` at `/tmp/atl-<entry id>/`, always mode 0700. `clean` removes a folder only when its
 registered path has exactly that shape, is canonical and still names a real folder with the
-registered identity owned by this user, and its `leftovers` file (one line per thing created
-outside the folder) is empty or absent.
+registered identity owned by this user, nothing in it is on another device (a mount), and its
+`leftovers` file (one line per thing created outside the folder) is empty or absent; it deletes
+through folder descriptors and never enters another device.
 
 ## The versioned layer's format number
 
