@@ -142,7 +142,7 @@ pub fn main(action: RemoteAction) -> Result<Exit> {
             nonce,
         } => {
             let t = tag(&nonce);
-            match install(&from, &expect) {
+            match install(&home(), &from, &expect) {
                 Ok(Installed::Done(kept)) => say(&format!(
                     "{t}installed {}",
                     kept.map(|k| k.display().to_string()).unwrap_or_default()
@@ -444,6 +444,7 @@ pub fn checkout_obstructions(
 }
 
 /// What `remote-run install` did.
+#[derive(Debug, PartialEq)]
 enum Installed {
     Done(Option<PathBuf>),
     Busy(String),
@@ -453,22 +454,25 @@ enum Installed {
 /// Swaps `from` in as this version's install folder under the machine lock, if the install
 /// there is still `expect`. A failure before the swap removes `from` (this program's own new
 /// folder, nothing else uses it).
-fn install(from: &Path, expect: &str) -> std::result::Result<Installed, String> {
-    let result = install_locked(from, expect);
+fn install(home: &Path, from: &Path, expect: &str) -> std::result::Result<Installed, String> {
+    let result = install_locked(home, from, expect);
     if !matches!(result, Ok(Installed::Done(_))) {
         let _ = fs::remove_dir_all(from);
     }
     result
 }
 
-fn install_locked(from: &Path, expect: &str) -> std::result::Result<Installed, String> {
-    let home = home();
-    let _lock = match MachineLock::try_take(&home, "atelier machines init") {
+fn install_locked(
+    home: &Path,
+    from: &Path,
+    expect: &str,
+) -> std::result::Result<Installed, String> {
+    let _lock = match MachineLock::try_take(home, "atelier machines init") {
         Ok(Some(l)) => l,
-        Ok(None) => return Ok(Installed::Busy(MachineLock::holder(&home))),
+        Ok(None) => return Ok(Installed::Busy(MachineLock::holder(home))),
         Err(f) => return Err(f.message),
     };
-    let to = crate::dispatch::install_root(&home).join(crate::dispatch::VERSION);
+    let to = crate::dispatch::install_root(home).join(crate::dispatch::VERSION);
     let bin = to.join("bin/atelier");
     let found = if bin.exists() {
         let out = std::process::Command::new(&bin)
@@ -786,5 +790,226 @@ impl StreamState {
         let _ = out.flush();
         self.offsets
             .insert(log.to_path_buf(), offset + copied as u64);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::process::Command;
+
+    fn g(dir: &Path, args: &[&str]) -> String {
+        let out = Command::new("git")
+            .args(["-c", "user.name=t", "-c", "user.email=t@t"])
+            .args(args)
+            .current_dir(dir)
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .output()
+            .unwrap();
+        assert!(out.status.success(), "git {args:?}: {out:?}");
+        String::from_utf8_lossy(&out.stdout).trim().to_owned()
+    }
+
+    fn write(root: &Path, rel: &str, text: &str) {
+        let p = root.join(rel);
+        fs::create_dir_all(p.parent().unwrap()).unwrap();
+        fs::write(p, text).unwrap();
+    }
+
+    #[test]
+    fn ignored_files_in_the_checkouts_way_are_found_and_others_are_not() {
+        let tmp = tempfile::tempdir().unwrap();
+        let src = tmp.path().join("src");
+        fs::create_dir_all(&src).unwrap();
+        g(&src, &["init", "-q"]);
+        write(
+            &src,
+            ".gitignore",
+            "ign*\ndir/\nlink\nolddir/ign2\nlater/\n",
+        );
+        write(&src, "t.txt", "a\n");
+        write(&src, "olddir/f", "tracked\n");
+        write(
+            &src,
+            "was-file",
+            "tracked file, a folder in the next commit\n",
+        );
+        g(&src, &["add", "-A"]);
+        g(&src, &["commit", "-q", "-m", "a"]);
+        let machine = tmp.path().join("machine");
+        g(tmp.path(), &["clone", "-q", "src", "machine"]);
+
+        // The next commit tracks paths where the machine keeps ignored files.
+        write(&src, ".gitignore", "");
+        for (rel, text) in [
+            ("ign1", "tracked now\n"),
+            ("dir", "a file where a folder was\n"),
+            ("link/inner.txt", "under a link\n"),
+            ("t.txt", "b\n"),
+            ("new/ok.txt", "fresh\n"),
+            ("ign3", "not on the machine\n"),
+            ("later/inside.txt", "beside an ignored file\n"),
+        ] {
+            write(&src, rel, text);
+        }
+        fs::remove_dir_all(src.join("olddir")).unwrap();
+        write(&src, "olddir", "a file where a tracked folder was\n");
+        fs::remove_file(src.join("was-file")).unwrap();
+        write(&src, "was-file/x", "inside\n");
+        g(&src, &["add", "-A"]);
+        g(&src, &["commit", "-q", "-m", "b"]);
+        let target = g(&src, &["rev-parse", "HEAD"]);
+        g(&machine, &["fetch", "-q", "origin"]);
+
+        write(&machine, "ign1", "machine secret\n");
+        write(&machine, "dir/x.db", "machine data\n");
+        std::os::unix::fs::symlink("/tmp", machine.join("link")).unwrap();
+        write(&machine, "olddir/ign2", "kept beside tracked files\n");
+        write(
+            &machine,
+            "later/keep.txt",
+            "untouched: the commit only adds beside it\n",
+        );
+        assert_eq!(
+            g(
+                &machine,
+                &["status", "--porcelain", "--untracked-files=all"]
+            ),
+            ""
+        );
+        assert_eq!(
+            checkout_obstructions(&machine, &target).unwrap(),
+            ["dir", "ign1", "link", "olddir/ign2"]
+        );
+
+        // A checkout without a commit yet: every path of the target counts.
+        let fresh = tmp.path().join("fresh");
+        fs::create_dir_all(&fresh).unwrap();
+        g(&fresh, &["init", "-q"]);
+        write(&fresh, ".git/info/exclude", "ign1\n");
+        write(&fresh, "ign1", "machine secret\n");
+        g(&fresh, &["fetch", "-q", src.to_str().unwrap()]);
+        assert_eq!(checkout_obstructions(&fresh, &target).unwrap(), ["ign1"]);
+    }
+
+    fn fake_install(dir: &Path, identity: &str) {
+        write(
+            dir,
+            "bin/atelier",
+            &format!("#!/bin/sh\necho '{identity}'\n"),
+        );
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(dir.join("bin/atelier"), fs::Permissions::from_mode(0o755)).unwrap();
+    }
+
+    #[test]
+    fn an_install_is_swapped_in_under_the_lock_and_the_old_one_kept() {
+        let home = tempfile::tempdir().unwrap();
+        let home = home.path();
+        let root = crate::dispatch::install_root(home);
+        let to = root.join(crate::dispatch::VERSION);
+        let new = |tag: &str| {
+            let from = root.join(format!(".new-{tag}"));
+            fake_install(&from, &format!("new {tag}"));
+            from
+        };
+
+        // Nothing installed yet: a plain rename.
+        let from = new("a");
+        assert_eq!(install(home, &from, "none"), Ok(Installed::Done(None)));
+        assert!(!from.exists());
+        assert!(
+            fs::read_to_string(to.join("bin/atelier"))
+                .unwrap()
+                .contains("new a")
+        );
+
+        // Another install than expected: nothing replaced, the new folder removed.
+        let from = new("b");
+        assert_eq!(
+            install(home, &from, "something else"),
+            Ok(Installed::Changed("new a".to_owned()))
+        );
+        assert!(!from.exists());
+        assert!(
+            fs::read_to_string(to.join("bin/atelier"))
+                .unwrap()
+                .contains("new a")
+        );
+
+        // The machine lock held: busy, nothing replaced.
+        let held = MachineLock::try_take(home, "a run").unwrap().unwrap();
+        let from = new("c");
+        match install(home, &from, "new a") {
+            Ok(Installed::Busy(h)) => assert!(h.ends_with("a run"), "{h}"),
+            other => panic!("{other:?}"),
+        }
+        assert!(!from.exists());
+        drop(held);
+
+        // The expected install: exchanged, the old folder kept beside it.
+        let from = new("d");
+        let kept = match install(home, &from, "new a") {
+            Ok(Installed::Done(Some(k))) => k,
+            other => panic!("{other:?}"),
+        };
+        assert!(
+            fs::read_to_string(to.join("bin/atelier"))
+                .unwrap()
+                .contains("new d")
+        );
+        assert!(
+            fs::read_to_string(kept.join("bin/atelier"))
+                .unwrap()
+                .contains("new a")
+        );
+        assert!(
+            kept.file_name()
+                .unwrap()
+                .to_string_lossy()
+                .starts_with(&format!(".{}.replaced-", crate::dispatch::VERSION))
+        );
+        assert!(!from.exists());
+    }
+
+    #[test]
+    fn the_stream_takes_runs_by_id_or_by_pid_and_start_time_never_by_pid_alone() {
+        let me = std::process::id();
+        let start = procs::start_time(me as i32);
+        assert!(start.is_some());
+        let ids = Arc::new(Mutex::new(vec!["20260101T0000Z-aaaa".to_owned()]));
+        let s = StreamState {
+            runs_dir: PathBuf::new(),
+            tag: String::new(),
+            ids,
+            me: (me, start.clone()),
+            mine: Vec::new(),
+            others: BTreeSet::new(),
+            offsets: BTreeMap::new(),
+            last: None,
+        };
+        let info = |id: &str, pid: u32, pid_start: Option<String>| RunInfo {
+            id: id.to_owned(),
+            kind: crate::runs::RunKind::Check,
+            command: "check".to_owned(),
+            lock: String::new(),
+            worktree: PathBuf::new(),
+            branch: None,
+            started: String::new(),
+            pid,
+            pid_start,
+            atelier_version: String::new(),
+            runs: Vec::new(),
+        };
+        assert!(s.is_mine(&info("20260101T0000Z-aaaa", 1, None)));
+        assert!(s.is_mine(&info("20260101T0000Z-bbbb", me, start.clone())));
+        // An old run of an earlier process with the same pid.
+        assert!(!s.is_mine(&info(
+            "20200101T0000Z-cccc",
+            me,
+            Some("1.000000".to_owned())
+        )));
+        assert!(!s.is_mine(&info("20200101T0000Z-dddd", me, None)));
     }
 }

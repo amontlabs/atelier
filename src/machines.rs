@@ -99,7 +99,8 @@ impl MachinesFile {
         let text = std::fs::read_to_string(path)
             .map_err(|e| Failure::refused(format!("{}: {e}", path.display())))?;
         Self::parse(&text).map_err(|f| {
-            Failure::refused(
+            Failure::new(
+                f.exit,
                 f.message
                     .replacen("machines.toml", &path.display().to_string(), 1),
             )

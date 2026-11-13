@@ -1002,6 +1002,71 @@ mod tests {
     }
 
     #[test]
+    fn the_remote_command_reaches_sh_unchanged_from_every_login_shell() {
+        let script = "set -e\nprintf '%s|' 'it'\\''s' 'a!b' 'c\\d' 'e\\\\f' '100%' \"$((1+1))\" 'é'\nprintf '\\n'\n";
+        let want = "it's|a!b|c\\d|e\\\\f|100%|2|é|\n";
+        let line = remote_command(script);
+        assert!(!line.contains(['\n', '!']), "{line}");
+        assert!(!line.contains("\\\\"), "{line}");
+        assert_eq!(line.matches('\'').count(), 2, "{line}");
+        let mut ran = Vec::new();
+        for shell in [
+            "/bin/sh",
+            "/bin/bash",
+            "/bin/zsh",
+            "/bin/dash",
+            "/bin/tcsh",
+            "/bin/csh",
+            "/usr/bin/fish",
+            "/opt/homebrew/bin/fish",
+            "/usr/local/bin/fish",
+        ] {
+            if !Path::new(shell).exists() {
+                continue;
+            }
+            let out = Command::new(shell)
+                .arg("-c")
+                .arg(&line)
+                .env("HOME", "/nonexistent")
+                .output()
+                .unwrap();
+            assert_eq!(
+                String::from_utf8_lossy(&out.stdout),
+                want,
+                "{shell}: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+            ran.push(shell);
+        }
+        assert!(ran.contains(&"/bin/sh"), "{ran:?}");
+    }
+
+    #[test]
+    fn a_result_must_name_the_commit_its_tree_and_no_uncommitted_change() {
+        let mut r: RunResult = toml::from_str(
+            "id = \"x\"\nkind = \"test-narrow\"\ncommand = \"c\"\noutcome = \"passed\"\nworktree = \"/w\"\natelier_version = \"0\"\nstarted = \"s\"\nended = \"e\"\nfailures = []\nsurvivors = []\nsteps = []\ncommit = \"c1\"\ntree = \"t1\"\nuncommitted = false\n",
+        )
+        .unwrap();
+        assert_eq!(different_tree("x", &r, "c1", "t1"), None);
+        r.tree = Some("t2".to_owned());
+        r.uncommitted = Some(true);
+        let line = different_tree("x", &r, "c1", "t1").unwrap();
+        assert!(
+            line.starts_with(
+                "tested a different tree: run x recorded commit c1, tree t2, uncommitted true"
+            ),
+            "{line}"
+        );
+        r.tree = Some("t1".to_owned());
+        r.uncommitted = Some(false);
+        r.commit = Some("c0".to_owned());
+        assert!(different_tree("x", &r, "c1", "t1").is_some());
+        r.commit = Some("c1".to_owned());
+        r.uncommitted = None;
+        assert!(different_tree("x", &r, "c1", "t1").is_some());
+    }
+
+    #[test]
     fn protocol_lines_need_the_session_nonce() {
         let out = b"log line\r\natelier-remote-abc: taken\r\natelier-remote-xyz: done\natelier-remote-abc: run 1\n";
         assert_eq!(protocol_lines(out, "abc"), ["taken", "run 1"]);

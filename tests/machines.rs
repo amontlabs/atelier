@@ -682,3 +682,434 @@ fn a_stale_remote_atelier_is_not_ready() {
         both(&out)
     );
 }
+
+impl World {
+    /// Replaces the pinned atelier on a fake machine with a script.
+    fn replace_bin(&self, machine: &str, script: &str) -> PathBuf {
+        let bin = self.machines.join(format!(
+            "{machine}/.local/share/atelier/{VERSION}/bin/atelier"
+        ));
+        fs::remove_file(&bin).unwrap();
+        fs::write(&bin, script).unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&bin, fs::Permissions::from_mode(0o755)).unwrap();
+        bin
+    }
+
+    /// Waits until `box` has started its `n`th run.
+    fn wait_for_remote_runs(&self, n: usize) {
+        let until = Instant::now() + Duration::from_secs(30);
+        loop {
+            let runs = self.machines.join("box/checkouts");
+            let started = fs::read_dir(&runs)
+                .into_iter()
+                .flatten()
+                .flat_map(|c| fs::read_dir(c.unwrap().path().join(".git/atelier/runs")))
+                .flatten()
+                .filter(|r| r.as_ref().unwrap().path().join("run.toml").is_file())
+                .count();
+            if started >= n {
+                return;
+            }
+            assert!(Instant::now() < until, "box never started run {n}");
+            std::thread::sleep(Duration::from_millis(50));
+        }
+    }
+
+    /// Writes, commits, and returns the new HEAD.
+    fn commit_file(&self, rel: &str, contents: &str) -> String {
+        self.repo.write(rel, contents);
+        self.repo.commit_all(rel)
+    }
+}
+
+#[test]
+fn a_remote_checkout_whose_files_are_not_the_commits_tree_is_refused() {
+    // The old commit ignores stray.txt and the machine keeps one; the new commit stops
+    // ignoring it, so after the checkout it would be part of the tested tree.
+    let w = World::new("machines = [\"box\"]\n");
+    w.init_box();
+    w.commit_file(".gitignore", "out/\nstray.txt\n");
+    assert_eq!(code(&w.run(&["test", &here(), "--", "true"])), 0);
+    let stray = w.box_checkout().join("stray.txt");
+    fs::write(&stray, "the machine's\n").unwrap();
+    w.commit_file(".gitignore", "out/\n");
+
+    let out = w.run(&["test", &here(), "--", "true"]);
+    assert_eq!(code(&out), 4, "{}", both(&out));
+    assert_eq!(stdout(&out).trim(), format!("{}: REFUSED on box", here()));
+    assert!(
+        stderr(&out).contains("are not the commit's") && stderr(&out).contains("stray.txt"),
+        "{}",
+        both(&out)
+    );
+    assert_eq!(fs::read_to_string(&stray).unwrap(), "the machine's\n");
+}
+
+#[test]
+fn a_remote_result_for_another_tree_or_without_runs_fails() {
+    let w = World::new("machines = [\"box\"]\n");
+    w.init_box();
+    assert_eq!(code(&w.run(&["test", &here(), "--", "true"])), 0);
+    // A remote atelier that answers the probe for real but reports the last run again with
+    // another tree, or no run at all.
+    let script = format!(
+        r#"#!/bin/sh
+if [ "$1 $2" != "remote-run run" ]; then exec {real} "$@"; fi
+for a in "$@"; do [ "$prev" = --nonce ] && nonce=$a; prev=$a; done
+t="atelier-remote-$nonce: "
+printf '%staken\n' "$t"
+if [ "$(cat "$HOME/mode")" = wrongtree ]; then
+  runs=$(echo "$HOME"/checkouts/*/.git/atelier/runs)
+  id=$(ls "$runs" | tail -1)
+  perl -pi -e 's/^tree = .*/tree = "0000000000000000000000000000000000000000"/' "$runs/$id/result"
+  printf '%srun %s\n' "$t" "$id"
+fi
+printf '%sdone\n' "$t"
+"#,
+        real = atelier_bin().display()
+    );
+    w.replace_bin("box", &script);
+    let mode = w.machines.join("box/mode");
+
+    fs::write(&mode, "wrongtree").unwrap();
+    let out = w.run(&["test", &here(), "--", "true"]);
+    assert_eq!(code(&out), 1, "{}", both(&out));
+    assert_eq!(stdout(&out).trim(), format!("{}: FAIL on box", here()));
+    assert!(
+        stderr(&out).contains("box: tested a different tree: run "),
+        "{}",
+        both(&out)
+    );
+    // This computer's run records the tree the machine reported.
+    let local = w.results(&w.repo.root);
+    let last = local.last().unwrap();
+    assert_eq!(
+        last.tree.as_deref(),
+        Some("0000000000000000000000000000000000000000")
+    );
+    assert_eq!(last.uncommitted, Some(true));
+
+    fs::write(&mode, "norun").unwrap();
+    let out = w.run(&["test", &here(), "--", "true"]);
+    assert_eq!(code(&out), 1, "{}", both(&out));
+    assert!(
+        stderr(&out).contains("box: the session reported no run"),
+        "{}",
+        both(&out)
+    );
+}
+
+#[test]
+fn ignored_files_in_the_way_of_the_remote_checkout_are_refused_and_kept() {
+    let w = World::new("machines = [\"box\"]\n");
+    w.init_box();
+    w.commit_file(".gitignore", "out/\n.env\nlocal/\n");
+    assert_eq!(code(&w.run(&["test", &here(), "--", "true"])), 0);
+    let c = w.box_checkout();
+    fs::write(c.join(".env"), "MACHINE SECRET\n").unwrap();
+    fs::create_dir_all(c.join("local")).unwrap();
+    fs::write(c.join("local/keep.db"), "machine data\n").unwrap();
+    w.repo.write(".env", "from the commit\n");
+    w.repo.write("local", "now a file\n");
+    git(&w.repo.root, &["add", "-f", ".env", "local"]);
+    git(&w.repo.root, &["commit", "-q", "-m", "track them"]);
+    let before = git(&c, &["rev-parse", "HEAD"]);
+
+    let out = w.run(&["test", &here(), "--", "true"]);
+    assert_eq!(code(&out), 4, "{}", both(&out));
+    assert_eq!(stdout(&out).trim(), format!("{}: REFUSED on box", here()));
+    let err = stderr(&out);
+    assert!(
+        err.contains("would overwrite or remove") && err.contains(".env; local"),
+        "{err}"
+    );
+    assert_eq!(
+        fs::read_to_string(c.join(".env")).unwrap(),
+        "MACHINE SECRET\n"
+    );
+    assert_eq!(
+        fs::read_to_string(c.join("local/keep.db")).unwrap(),
+        "machine data\n"
+    );
+    assert_eq!(git(&c, &["rev-parse", "HEAD"]), before, "not checked out");
+}
+
+#[test]
+fn files_changed_while_waiting_for_this_computer_are_red() {
+    let w = World::new("machines = [\"here\"]\n");
+    let held = hold_machine_lock(&w.repo.home);
+    let mut child = w
+        .command(&w.repo.root, &["test", &here(), "--", "true"])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let mut err = std::io::BufReader::new(child.stderr.take().unwrap());
+    let mut line = String::new();
+    std::io::BufRead::read_line(&mut err, &mut line).unwrap();
+    assert!(line.contains("waiting for a busy machine"), "{line}");
+    w.repo.write("sub/keep", "edited while waiting\n");
+    drop(held);
+    let mut rest = String::new();
+    std::io::Read::read_to_string(&mut err, &mut rest).unwrap();
+    let out = child.wait_with_output().unwrap();
+    assert_eq!(code(&out), 1, "{rest}");
+    assert_eq!(
+        stdout(&out).trim(),
+        format!(
+            "{}: FAIL on here (local) · RED: the tree changed during the run",
+            here()
+        ),
+        "{rest}"
+    );
+    assert!(
+        rest.contains("the tree changed during the run: tree "),
+        "{rest}"
+    );
+    let local = w.results(&w.repo.root);
+    assert!(
+        local[0]
+            .failures
+            .iter()
+            .any(|f| f.starts_with("the tree changed during the run")),
+        "{:?}",
+        local[0]
+    );
+    assert!(local[0].steps.is_empty(), "nothing ran: {:?}", local[0]);
+}
+
+#[test]
+fn files_changed_during_a_remote_run_are_red() {
+    let w = World::new("machines = [\"box\"]\n");
+    w.init_box();
+    let child = w
+        .command(&w.repo.root, &["test", &here(), "--", "sleep", "3"])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    w.wait_for_remote_runs(1);
+    w.repo.write("sub/keep", "edited during the run\n");
+    let out = child.wait_with_output().unwrap();
+    assert_eq!(code(&out), 1, "{}", both(&out));
+    assert_eq!(
+        stdout(&out).trim(),
+        format!(
+            "{}: PASS on box · RED: the tree changed during the run",
+            here()
+        )
+    );
+    // HEAD moving is a change too.
+    w.repo.write("sub/keep", "x\n");
+    let child = w
+        .command(&w.repo.root, &["test", &here(), "--", "sleep", "3"])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    w.wait_for_remote_runs(2);
+    w.commit_file("new.txt", "new\n");
+    let out = child.wait_with_output().unwrap();
+    assert_eq!(code(&out), 1, "{}", both(&out));
+    assert!(stderr(&out).contains("HEAD moved from "), "{}", both(&out));
+}
+
+#[test]
+fn machines_init_prints_its_plan_and_replaces_another_install_only_with_yes() {
+    let w = World::new("");
+    let script = "#!/bin/sh\necho '0.1.0 0000000000000000'\n";
+    let bin = w.replace_bin("box", script);
+    let out = w.run(&["machines", "init", "box"]);
+    assert_eq!(code(&out), 4, "{}", both(&out));
+    let text = stdout(&out);
+    assert!(text.starts_with("box: plan\n"), "{text}");
+    assert!(text.contains("create it (git init)"), "{text}");
+    assert!(
+        text.contains("replace 0.1.0 0000000000000000 at ~/.local/share/atelier/"),
+        "{text}"
+    );
+    assert!(
+        stderr(&out).contains("nothing was changed; run atelier machines init box --yes"),
+        "{}",
+        both(&out)
+    );
+    assert_eq!(fs::read_to_string(&bin).unwrap(), script, "not replaced");
+    assert!(
+        !w.machines.join("box/checkouts").exists(),
+        "no checkout created"
+    );
+}
+
+#[test]
+fn remote_commands_survive_a_tcsh_login_shell() {
+    let tcsh = Path::new("/bin/tcsh");
+    if !tcsh.exists() {
+        eprintln!("no /bin/tcsh here: the csh quoting rules are covered by remote::tests only");
+        return;
+    }
+    let w = World::new("machines = [\"box\"]\n");
+    let text = "it's a 'quote'! \\ 100% $HOME `x` \"y\"";
+    w.commit_file("data.txt", &format!("{text}\n"));
+    let run = |args: &[&str]| {
+        w.command(&w.repo.root, args)
+            .env("FAKE_SSH_SHELL", tcsh)
+            .output()
+            .unwrap()
+    };
+    let out = run(&["machines", "init", "box"]);
+    assert_eq!(code(&out), 0, "{}", both(&out));
+    let out = run(&["test", &here(), "--", "grep", "-qxF", text, "data.txt"]);
+    assert_eq!(code(&out), 0, "{}", both(&out));
+    assert_eq!(stdout(&out).trim(), format!("{}: PASS on box", here()));
+    let out = run(&["machines"]);
+    assert!(
+        stdout(&out).contains("reachable, ready, free"),
+        "{}",
+        both(&out)
+    );
+}
+
+#[test]
+fn a_login_shell_that_cannot_run_the_command_is_not_ready() {
+    let w = World::new("machines = [\"box\"]\n");
+    w.init_box();
+    let shell = w.repo.tmp.path().join("odd-shell");
+    fs::write(
+        &shell,
+        "#!/bin/sh\necho 'odd-shell: cannot parse that' >&2\nexit 1\n",
+    )
+    .unwrap();
+    use std::os::unix::fs::PermissionsExt;
+    fs::set_permissions(&shell, fs::Permissions::from_mode(0o755)).unwrap();
+    let out = w
+        .command(&w.repo.root, &["test", &here(), "--", "true"])
+        .env("FAKE_SSH_SHELL", &shell)
+        .output()
+        .unwrap();
+    assert_eq!(code(&out), 3, "{}", both(&out));
+    assert!(
+        stderr(&out).contains(
+            "box: not ready: its login shell did not run atelier's command (exec /bin/sh -c '…'): odd-shell: cannot parse that"
+        ),
+        "{}",
+        both(&out)
+    );
+}
+
+#[test]
+fn a_machine_name_that_starts_with_a_dash_is_a_usage_error() {
+    let w = World::new("");
+    w.machines_file(Some(
+        "\n[machines.-box]\nssh = \"box\"\nplatform = \"linux-x86_64\"\npriority = 1\n",
+    ));
+    let out = w.run(&["machines"]);
+    assert_eq!(code(&out), 2, "{}", both(&out));
+    assert!(
+        stderr(&out).contains("a machine name cannot start with '-': -box"),
+        "{}",
+        both(&out)
+    );
+}
+
+#[test]
+fn a_caller_folder_that_is_not_in_the_commit_is_refused() {
+    let w = World::new("");
+    w.init_box();
+    // An empty folder and an ignored one: neither is in the commit, neither changes the tree.
+    for rel in ["empty", "out/deep"] {
+        let dir = w.repo.root.join(rel);
+        fs::create_dir_all(&dir).unwrap();
+        let out = w.run_in(&dir, &["test", &here(), "--", "true"]);
+        assert_eq!(code(&out), 4, "{rel}: {}", both(&out));
+        assert!(
+            stderr(&out).contains(&format!("{rel} is not a folder of the committed HEAD")),
+            "{}",
+            both(&out)
+        );
+    }
+    let out = w.run_in(&w.repo.root.join("sub"), &["test", &here(), "--", "true"]);
+    assert_eq!(code(&out), 0, "{}", both(&out));
+}
+
+#[test]
+fn all_prints_its_final_line_after_an_error_in_one_platform() {
+    let other = other_platform();
+    let w = World::new("machines = [\"here\"]\n");
+    w.repo.write(
+        ".atelier/atelier.toml",
+        &format!(
+            "atelier = \"{VERSION}\"\n\n[platforms.{}]\nrun = [\"-bad\"]\nmachines = [\"here\"]\n\n[platforms.{other}]\nrun = [\"true\"]\n",
+            here()
+        ),
+    );
+    w.repo.write_rules();
+    w.repo.commit_all("two platforms");
+    let out = w.run(&["test", "--all"]);
+    let mut words = [
+        format!("{}: ERROR", here()),
+        format!("{other}: no machine available"),
+    ];
+    words.sort();
+    assert_eq!(stdout(&out).trim(), words.join(" · "), "{}", both(&out));
+    assert_eq!(code(&out), 2, "{}", both(&out));
+}
+
+#[test]
+fn a_platform_whose_run_is_check_runs_atelier_check_here_and_there() {
+    let w = World::new("");
+    w.repo.write(
+        ".atelier/atelier.toml",
+        &format!(
+            "atelier = \"{VERSION}\"\n\n[platforms.{}]\nrun = \"check\"\nprepare = [\"sh\", \"-c\", \"echo prepared\"]\n\n[[check.steps]]\nname = \"lint\"\nrun = [\"sh\", \"-c\", \"echo linted\"]\n",
+            here()
+        ),
+    );
+    w.repo.write_rules();
+    w.repo.commit_all("check platform");
+    w.init_box();
+
+    // On box: the preparation run and the check's own run, both announced and both read.
+    let out = w.run(&["test", &here()]);
+    assert_eq!(code(&out), 0, "{}", both(&out));
+    assert_eq!(
+        stdout(&out).trim().lines().last().unwrap(),
+        format!("{}: PASS on box (down offline)", here())
+    );
+    let remote = w.results(&w.box_checkout());
+    let kinds: Vec<String> = remote.iter().map(|r| r.kind.as_str().to_owned()).collect();
+    assert_eq!(kinds, ["test-full", "check"], "{remote:?}");
+    let local = w.results(&w.repo.root);
+    let run_dir = w.repo.root.join(".git/atelier/runs").join(&local[0].id);
+    let ids = fs::read_to_string(run_dir.join("remote-runs")).unwrap();
+    assert_eq!(
+        ids.lines().collect::<Vec<_>>(),
+        remote.iter().map(|r| r.id.as_str()).collect::<Vec<_>>()
+    );
+    let log = fs::read_to_string(run_dir.join("remote-box.log")).unwrap();
+    assert!(log.contains("linted"), "{log}");
+
+    // Here: the same two runs in this worktree.
+    w.machines_file(Some(""));
+    let mut settings = fs::read_to_string(w.repo.root.join(".atelier/atelier.toml")).unwrap();
+    settings = settings.replace(
+        "run = \"check\"\n",
+        "run = \"check\"\nmachines = [\"here\"]\n",
+    );
+    w.repo.write(".atelier/atelier.toml", &settings);
+    w.repo.write_rules();
+    w.repo.commit_all("here");
+    let out = w.run(&["test", &here()]);
+    assert_eq!(code(&out), 0, "{}", both(&out));
+    assert_eq!(
+        stdout(&out).trim().lines().last().unwrap(),
+        format!("{}: PASS on here (local)", here())
+    );
+    let kinds: Vec<String> = w
+        .results(&w.repo.root)
+        .iter()
+        .skip(1)
+        .map(|r| r.kind.as_str().to_owned())
+        .collect();
+    assert_eq!(kinds, ["test-full", "check"]);
+}

@@ -10,7 +10,9 @@
 //! the crates from crates.io (or its own cargo mirror).
 //!
 //! [`hash`] identifies the source: two binaries of one version built from different source (a
-//! development build) are told apart, so a remote run never uses a stale program.
+//! development build) are told apart, so a remote run does not use a stale program by mistake.
+//! It is what the installed program says about itself, not a check of its integrity: code run
+//! as the account that owns the install could replace it (docs/MACHINES.md, same-user trust).
 
 /// One embedded file: its path in the source tree and its bytes.
 macro_rules! src_file {
