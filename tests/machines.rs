@@ -724,26 +724,44 @@ impl World {
 }
 
 #[test]
-fn a_remote_checkout_whose_files_are_not_the_commits_tree_is_refused() {
+fn a_remote_checkout_whose_files_are_not_the_commits_tree_is_not_ready_and_left_as_it_was() {
     // The old commit ignores stray.txt and the machine keeps one; the new commit stops
     // ignoring it, so after the checkout it would be part of the tested tree.
     let w = World::new("machines = [\"box\"]\n");
     w.init_box();
     w.commit_file(".gitignore", "out/\nstray.txt\n");
     assert_eq!(code(&w.run(&["test", &here(), "--", "true"])), 0);
-    let stray = w.box_checkout().join("stray.txt");
+    let c = w.box_checkout();
+    let stray = c.join("stray.txt");
     fs::write(&stray, "the machine's\n").unwrap();
+    let before = git(&c, &["rev-parse", "HEAD"]);
     w.commit_file(".gitignore", "out/\n");
 
-    let out = w.run(&["test", &here(), "--", "true"]);
-    assert_eq!(code(&out), 4, "{}", both(&out));
-    assert_eq!(stdout(&out).trim(), format!("{}: REFUSED on box", here()));
-    assert!(
-        stderr(&out).contains("are not the commit's") && stderr(&out).contains("stray.txt"),
-        "{}",
-        both(&out)
-    );
-    assert_eq!(fs::read_to_string(&stray).unwrap(), "the machine's\n");
+    let mut lines = Vec::new();
+    for _ in 0..2 {
+        let out = w.run(&["test", &here(), "--", "true"]);
+        assert_eq!(code(&out), 3, "{}", both(&out));
+        let line = stdout(&out).trim().to_owned();
+        assert!(
+            line.starts_with(&format!(
+                "{}: no machine available (box not ready: after checking out ",
+                here()
+            )) && line.contains("are not the commit's")
+                && line.contains("the checkout is back at")
+                && line.contains("stray.txt"),
+            "{}",
+            both(&out)
+        );
+        lines.push(line);
+        assert_eq!(fs::read_to_string(&stray).unwrap(), "the machine's\n");
+        assert_eq!(git(&c, &["rev-parse", "HEAD"]), before, "back where it was");
+        assert_eq!(
+            git(&c, &["status", "--porcelain", "--untracked-files=all"]),
+            "",
+            "clean again"
+        );
+    }
+    assert_eq!(lines[0], lines[1], "the same answer every time");
 }
 
 #[test]
@@ -801,38 +819,73 @@ printf '%sdone\n' "$t"
 }
 
 #[test]
-fn ignored_files_in_the_way_of_the_remote_checkout_are_refused_and_kept() {
-    let w = World::new("machines = [\"box\"]\n");
+fn files_in_the_way_of_a_remote_checkout_make_it_not_ready_and_the_next_machine_runs() {
+    // box (priority 10) keeps ignored files where the new commit puts tracked ones: a file the
+    // commit tracks, a folder it makes a file, a folder inside an ignored folder, and an ignored
+    // nested repository. box2 (priority 20) is ready.
+    let w = World::new("machines = [\"box\", \"box2\"]\n");
+    w.add_machine("box2");
+    w.machines_file(Some(&format!(
+        "\n[machines.box2]\nssh = \"box2\"\nplatform = \"{}\"\npriority = 20\npath = [\"/usr/bin\", \"/bin\"]\ncheckouts = \"~/checkouts\"\n",
+        here()
+    )));
     w.init_box();
-    w.commit_file(".gitignore", "out/\n.env\nlocal/\n");
+    assert_eq!(code(&w.run(&["machines", "init", "box2"])), 0);
+    w.commit_file(".gitignore", "out/\n.env\nlocal/\nbuild/\n");
     assert_eq!(code(&w.run(&["test", &here(), "--", "true"])), 0);
     let c = w.box_checkout();
     fs::write(c.join(".env"), "MACHINE SECRET\n").unwrap();
-    fs::create_dir_all(c.join("local")).unwrap();
-    fs::write(c.join("local/keep.db"), "machine data\n").unwrap();
+    for (rel, text) in [
+        ("local/keep.db", "machine data\n"),
+        ("build/cache/keep.db", "machine cache\n"),
+        ("build/lib/work.txt", "machine work\n"),
+    ] {
+        fs::create_dir_all(c.join(rel).parent().unwrap()).unwrap();
+        fs::write(c.join(rel), text).unwrap();
+    }
+    git(&c.join("build/lib"), &["init", "-q"]);
     w.repo.write(".env", "from the commit\n");
     w.repo.write("local", "now a file\n");
-    git(&w.repo.root, &["add", "-f", ".env", "local"]);
+    w.repo.write("build/cache", "a file\n");
+    w.repo.write("build/lib", "a file\n");
+    git(
+        &w.repo.root,
+        &["add", "-f", ".env", "local", "build/cache", "build/lib"],
+    );
     git(&w.repo.root, &["commit", "-q", "-m", "track them"]);
     let before = git(&c, &["rev-parse", "HEAD"]);
 
-    let out = w.run(&["test", &here(), "--", "true"]);
-    assert_eq!(code(&out), 4, "{}", both(&out));
-    assert_eq!(stdout(&out).trim(), format!("{}: REFUSED on box", here()));
-    let err = stderr(&out);
-    assert!(
-        err.contains("would overwrite or remove") && err.contains(".env; local"),
-        "{err}"
-    );
-    assert_eq!(
-        fs::read_to_string(c.join(".env")).unwrap(),
-        "MACHINE SECRET\n"
-    );
-    assert_eq!(
-        fs::read_to_string(c.join("local/keep.db")).unwrap(),
-        "machine data\n"
-    );
-    assert_eq!(git(&c, &["rev-parse", "HEAD"]), before, "not checked out");
+    let mut lines = Vec::new();
+    for _ in 0..2 {
+        let out = w.run(&["test", &here(), "--", "true"]);
+        assert_eq!(code(&out), 0, "{}", both(&out));
+        let line = stdout(&out).trim().to_owned();
+        assert!(
+            line.starts_with(&format!(
+                "{}: PASS on box2 (box not ready: checking out ",
+                here()
+            )) && line.contains("would overwrite or remove"),
+            "{line}"
+        );
+        for named in [".env", "local", "build/cache", "build/lib"] {
+            assert!(line.contains(named), "{named} in {line}");
+        }
+        lines.push(line);
+        assert_eq!(
+            fs::read_to_string(c.join(".env")).unwrap(),
+            "MACHINE SECRET\n"
+        );
+        for (rel, text) in [
+            ("local/keep.db", "machine data\n"),
+            ("build/cache/keep.db", "machine cache\n"),
+            ("build/lib/work.txt", "machine work\n"),
+        ] {
+            assert_eq!(fs::read_to_string(c.join(rel)).unwrap(), text, "{rel}");
+        }
+        assert!(c.join("build/lib/.git").is_dir());
+        assert_eq!(git(&c, &["rev-parse", "HEAD"]), before, "not checked out");
+    }
+    assert_eq!(lines[0], lines[1], "the same answer every time");
 }
 
 #[test]

@@ -5,12 +5,13 @@
 //!
 //! `remote-run run`, in order: the platform from `uname`; the project's checkout and the pushed
 //! commit; the machine lock (`busy`); a clean checkout (changes and unknown files are listed,
-//! never deleted); no git-ignored file in the way of the checkout ([`checkout_obstructions`]);
-//! the commit checked out; the files exactly the commit's tree; the command preflight (version,
-//! settings, rules); the machine preflight on the commit's files ([`jobs::machine_problems`]);
-//! the checkout's run lock; then `taken`, and the job's runs. A failure before `taken` is
-//! `not-ready <line>`, or `refused <line>` for files in the checkout that atelier would have to
-//! delete or that change what is tested (the owner must move them; the caller exits 4).
+//! never deleted); the commit checked out by git, which refuses when a file it does not track,
+//! ignored ones included, is in the way ([`check_out`]); the files exactly the commit's tree,
+//! else the checkout goes back to where it was; the command preflight (version, settings,
+//! rules); the machine preflight on the commit's files ([`jobs::machine_problems`]); the
+//! checkout's run lock; then `taken`, and the job's runs. A failure before `taken` is
+//! `not-ready <line>`: the caller moves on to its next machine, and the same machine gives the
+//! same line until its owner moves the files it names.
 //!
 //! `remote-run install` is run by `machines init` with the program it just built: under the
 //! machine lock it swaps the new folder in as the pinned version's folder (one atomic exchange)
@@ -129,7 +130,6 @@ pub fn main(action: RemoteAction) -> Result<Exit> {
             let t = tag(&common.nonce);
             match run(&common, &commit, dir.as_deref(), command) {
                 Ok(()) => say(&format!("{t}done")),
-                Err(Stop::Refused(l)) => say(&format!("{t}refused {}", one_line(&l))),
                 Err(Stop::NotReady(l)) => say(&format!("{t}not-ready {}", one_line(&l))),
                 Err(Stop::Busy(h)) => say(&format!("{t}busy {h}")),
                 Err(Stop::Error(e)) => say(&format!("{t}error {}", one_line(&e))),
@@ -157,8 +157,6 @@ pub fn main(action: RemoteAction) -> Result<Exit> {
 }
 
 enum Stop {
-    /// Files in the checkout the owner must move: the caller exits 4.
-    Refused(String),
     NotReady(String),
     Busy(String),
     /// After `taken`.
@@ -263,34 +261,7 @@ fn run(
             listed(status.lines())
         )));
     }
-    let in_the_way = checkout_obstructions(&root, commit).map_err(Stop::NotReady)?;
-    if !in_the_way.is_empty() {
-        return Err(Stop::Refused(format!(
-            "the checkout {} holds git-ignored files that checking out {} would overwrite or remove; atelier deletes nothing there, move them away: {}",
-            common.checkout,
-            commit.get(..12).unwrap_or(commit),
-            listed(in_the_way.iter())
-        )));
-    }
-    git_ok(&root, &["checkout", "-q", "--detach", commit]).map_err(Stop::NotReady)?;
-
-    let checkout = git::Checkout::find(&root)
-        .map_err(|f| Stop::NotReady(f.message))?
-        .ok_or_else(|| Stop::NotReady(format!("{} is not a checkout", common.checkout)))?;
-    let tree = tree::tree_id(&checkout).map_err(|f| Stop::NotReady(f.message))?;
-    if tree != commit_tree {
-        let status = git_ok(
-            &root,
-            &["status", "--porcelain=v1", "--untracked-files=all"],
-        )
-        .unwrap_or_default();
-        return Err(Stop::Refused(format!(
-            "after checking out {} the files in {} are not the commit's (tree {tree}, the commit's {commit_tree}): files git ignored before are not ignored by this commit; atelier deletes nothing there, move them away: {}",
-            commit.get(..12).unwrap_or(commit),
-            common.checkout,
-            listed(status.lines())
-        )));
-    }
+    check_out(&root, &common.checkout, commit, &commit_tree).map_err(Stop::NotReady)?;
 
     let ctx = preflight::run(
         &root,
@@ -351,97 +322,101 @@ fn listed<I: IntoIterator<Item = S>, S: AsRef<str>>(items: I) -> String {
     }
 }
 
-/// The git-ignored files in `root` that `git checkout <target>` would overwrite or remove (git
-/// treats ignored files as expendable). The checkout is clean, so anything on disk that `HEAD`
-/// does not track is ignored. For every path `target` adds or changes against `HEAD` (every
-/// path of `target` when there is no `HEAD`): an untracked file or link at that path, an
-/// untracked file or link where one of its parent folders would go (DESIGN r4 §3.8 8A check e),
-/// and the ignored files inside a folder at that path, which the checkout replaces by a file.
-pub fn checkout_obstructions(
+/// Checks `commit` out in the clean checkout `root` with git's own `--no-overwrite-ignore`: git
+/// refuses, before it changes anything, when a file it does not track (an ignored one included)
+/// would be overwritten or removed, and names it. Then the files must be exactly the commit's
+/// tree; when they are not (files ignored before are not ignored by this commit), the checkout
+/// goes back to where it was. A refusal leaves the checkout as it was, so the same machine gives
+/// the same answer every time. `Err` is the machine's not-ready line.
+pub fn check_out(
     root: &Path,
-    target: &str,
-) -> std::result::Result<Vec<String>, String> {
-    let z = |args: &[&str]| -> std::result::Result<Vec<String>, String> {
-        let out = git::output(root, args).map_err(|f| f.message)?;
-        if !out.status.success() {
-            return Err(format!(
-                "git {}: {}",
-                args.join(" "),
-                String::from_utf8_lossy(&out.stderr).trim()
-            ));
-        }
-        Ok(out
-            .stdout
-            .split(|b| *b == 0)
-            .filter(|p| !p.is_empty())
-            .map(|p| String::from_utf8_lossy(p).into_owned())
-            .collect())
-    };
-    let has_head = git::output(root, ["rev-parse", "-q", "--verify", "HEAD^{commit}"])
-        .map_err(|f| f.message)?
-        .status
-        .success();
-    let (tracked, changed): (BTreeSet<String>, Vec<String>) = if has_head {
-        (
-            z(&["ls-tree", "-r", "-z", "--name-only", "HEAD"])?
-                .into_iter()
-                .collect(),
-            z(&[
-                "diff",
-                "--name-only",
-                "-z",
-                "--no-renames",
-                "--diff-filter=AMT",
-                "HEAD",
-                target,
-            ])?,
-        )
-    } else {
-        (
-            BTreeSet::new(),
-            z(&["ls-tree", "-r", "-z", "--name-only", target])?,
-        )
-    };
-    let ignored = z(&[
-        "ls-files",
-        "-z",
-        "--others",
-        "--ignored",
-        "--exclude-standard",
-        "--directory",
-    ])?;
-    let mut found = BTreeSet::new();
-    for p in &changed {
-        let parts: Vec<&str> = p.split('/').collect();
-        for i in 1..parts.len() {
-            let q = parts[..i].join("/");
-            match fs::symlink_metadata(root.join(&q)) {
-                Ok(m) if m.is_dir() => {}
-                Ok(_) if tracked.contains(&q) => {}
-                Ok(_) => {
-                    found.insert(q);
-                }
-                Err(_) => break,
-            }
-        }
-        match fs::symlink_metadata(root.join(p)) {
-            Err(_) => {}
-            Ok(m) if m.is_dir() => {
-                let inside = format!("{p}/");
-                for e in &ignored {
-                    if e.starts_with(&inside) {
-                        found.insert(e.trim_end_matches('/').to_owned());
-                    }
-                }
-            }
-            Ok(_) if tracked.contains(p) => {}
-            Ok(_) => {
-                found.insert(p.clone());
-            }
-        }
+    shown: &str,
+    commit: &str,
+    commit_tree: &str,
+) -> std::result::Result<(), String> {
+    let short = commit.get(..12).unwrap_or(commit);
+    let old_head = git_ok(root, &["rev-parse", "-q", "--verify", "HEAD^{commit}"]).ok();
+    let old_ref = git_ok(root, &["symbolic-ref", "-q", "HEAD"]).ok();
+    let out = git::output(
+        root,
+        [
+            "-c",
+            "core.quotePath=false",
+            "checkout",
+            "-q",
+            "--no-overwrite-ignore",
+            "--detach",
+            commit,
+        ],
+    )
+    .map_err(|f| f.message)?;
+    if !out.status.success() {
+        let err = String::from_utf8_lossy(&out.stderr);
+        let named: Vec<&str> = err
+            .lines()
+            .filter_map(|l| l.strip_prefix('\t'))
+            .map(str::trim)
+            .filter(|l| !l.is_empty())
+            .collect();
+        return Err(if named.is_empty() {
+            format!("git checkout {short} in {shown} failed: {}", one_line(&err))
+        } else {
+            format!(
+                "checking out {short} in {shown} would overwrite or remove files that git does not track there (ignored ones included); atelier deletes nothing there, move them away: {}",
+                listed(named)
+            )
+        });
     }
-    Ok(found.into_iter().collect())
+
+    let checkout = git::Checkout::find(root)
+        .map_err(|f| f.message)?
+        .ok_or_else(|| format!("{shown} is not a checkout"))?;
+    let tree = tree::tree_id(&checkout).map_err(|f| f.message)?;
+    if tree == commit_tree {
+        return Ok(());
+    }
+    let status =
+        git_ok(root, &["status", "--porcelain=v1", "--untracked-files=all"]).unwrap_or_default();
+    let back = match go_back(root, commit, old_head.as_deref(), old_ref.as_deref()) {
+        Ok(()) => format!(
+            "the checkout is back at {}",
+            old_head
+                .as_deref()
+                .and_then(|h| h.get(..12))
+                .unwrap_or("no commit")
+        ),
+        Err(e) => format!("returning the checkout to where it was failed: {e}"),
+    };
+    Err(format!(
+        "after checking out {short} the files in {shown} are not the commit's (tree {tree}, the commit's {commit_tree}): files git ignored before are not ignored by this commit; {back}; atelier deletes nothing there, move them away: {}",
+        listed(status.lines())
+    ))
 }
+
+/// Returns a checkout that has just checked `commit` out to `old_head` (none: no commit yet)
+/// and to the branch `HEAD` named before, if any. Only files the two commits track change.
+fn go_back(
+    root: &Path,
+    commit: &str,
+    old_head: Option<&str>,
+    old_ref: Option<&str>,
+) -> std::result::Result<(), String> {
+    match old_head {
+        Some(h) => git_ok(
+            root,
+            &["checkout", "-q", "--no-overwrite-ignore", "--detach", h],
+        )?,
+        // No commit before: from the commit to the empty tree, and an empty index.
+        None => git_ok(root, &["read-tree", "-m", "-u", commit, EMPTY_TREE])?,
+    };
+    if let Some(r) = old_ref {
+        git_ok(root, &["symbolic-ref", "HEAD", r])?;
+    }
+    Ok(())
+}
+
+/// git's id of the empty tree.
+const EMPTY_TREE: &str = "4b825dc642cb6eb9a060e54bf8d69288fbee4904";
 
 /// What `remote-run install` did.
 #[derive(Debug, PartialEq)]
@@ -817,80 +792,280 @@ mod tests {
         fs::write(p, text).unwrap();
     }
 
+    /// Everything a checkout holds: `HEAD`, the branch it names, the index, and every path
+    /// under the root (a nested repository's `.git` included) with its contents or target.
+    fn snapshot(root: &Path) -> Vec<String> {
+        let opt = |args: &[&str]| {
+            let out = Command::new("git")
+                .args(args)
+                .current_dir(root)
+                .output()
+                .unwrap();
+            String::from_utf8_lossy(&out.stdout).trim().to_owned()
+        };
+        let mut all = vec![
+            opt(&["rev-parse", "-q", "--verify", "HEAD"]),
+            opt(&["symbolic-ref", "-q", "HEAD"]),
+            opt(&["ls-files", "-s"]),
+        ];
+        fn walk(dir: &Path, rel: &str, top: bool, out: &mut Vec<String>) {
+            let mut entries: Vec<_> = fs::read_dir(dir).unwrap().map(|e| e.unwrap()).collect();
+            entries.sort_by_key(|e| e.file_name());
+            for e in entries {
+                let name = e.file_name().to_string_lossy().into_owned();
+                if top && name == ".git" {
+                    continue;
+                }
+                let r = format!("{rel}{name}");
+                let m = fs::symlink_metadata(e.path()).unwrap();
+                if m.file_type().is_symlink() {
+                    out.push(format!(
+                        "L {r} {}",
+                        fs::read_link(e.path()).unwrap().display()
+                    ));
+                } else if m.is_dir() {
+                    out.push(format!("D {r}"));
+                    walk(&e.path(), &format!("{r}/"), false, out);
+                } else {
+                    out.push(format!("F {r} {}", fs::read_to_string(e.path()).unwrap()));
+                }
+            }
+        }
+        walk(root, "", true, &mut all);
+        all
+    }
+
+    /// The layouts of the 3.6 review (rounds 1 and 2): a machine checkout at an old commit,
+    /// files there that git does not track, and a new commit that tracks paths in their way.
+    /// Git refuses each one, before changing anything, naming the path; the same refusal comes
+    /// back on a second try. Layouts that lose nothing are checked out.
     #[test]
-    fn ignored_files_in_the_checkouts_way_are_found_and_others_are_not() {
+    fn the_checkout_refuses_files_in_its_way_and_changes_nothing() {
         let tmp = tempfile::tempdir().unwrap();
-        let src = tmp.path().join("src");
+        let tmp = tmp.path().canonicalize().unwrap();
+        // (layout, ignore rules of the old commit, what the new commit changes, what the
+        // machine keeps, the path git names or None when the checkout goes ahead)
+        type Setup = fn(&Path, &Path);
+        let cases: Vec<(&str, &str, Setup, Setup, Option<&str>)> = vec![
+            (
+                "an ignored file the commit tracks",
+                ".env\n",
+                |s, _| write(s, ".env", "tracked\n"),
+                |m, _| write(m, ".env", "machine secret\n"),
+                Some(".env"),
+            ),
+            (
+                "an ignored folder the commit makes a file",
+                "local/\n",
+                |s, _| write(s, "local", "a file\n"),
+                |m, _| write(m, "local/keep.db", "machine data\n"),
+                Some("local"),
+            ),
+            (
+                "a folder inside an ignored folder the commit makes a file",
+                "build/\n",
+                |s, _| write(s, "build/cache", "a file\n"),
+                |m, _| write(m, "build/cache/keep.db", "machine data\n"),
+                Some("build/cache"),
+            ),
+            (
+                "an ignored nested repository the commit makes a file",
+                "build/\n",
+                |s, _| write(s, "build/lib", "a file\n"),
+                |m, _| {
+                    fs::create_dir_all(m.join("build/lib")).unwrap();
+                    g(&m.join("build/lib"), &["init", "-q"]);
+                    write(m, "build/lib/work.txt", "machine work\n");
+                },
+                Some("build/lib"),
+            ),
+            (
+                "an ignored link to a folder outside, under which the commit adds a file",
+                "data\n",
+                |s, _| write(s, "data/keep.db", "tracked\n"),
+                |m, t| {
+                    write(t, "outside/keep.db", "outside data\n");
+                    std::os::unix::fs::symlink(t.join("outside"), m.join("data")).unwrap();
+                },
+                Some("data"),
+            ),
+            (
+                "an ignored file in a tracked folder the commit makes a file",
+                "olddir/ign2\n",
+                |s, _| {
+                    fs::remove_dir_all(s.join("olddir")).unwrap();
+                    write(s, "olddir", "a file\n");
+                },
+                |m, _| write(m, "olddir/ign2", "kept beside tracked files\n"),
+                Some("olddir"),
+            ),
+            (
+                "a file added beside an ignored one",
+                "later/\n",
+                |s, _| write(s, "later/inside.txt", "tracked\n"),
+                |m, _| write(m, "later/keep.txt", "untouched\n"),
+                None,
+            ),
+        ];
+        for (n, (layout, ignore, change, keep, named)) in cases.into_iter().enumerate() {
+            let base = tmp.join(format!("case{n}"));
+            let src = base.join("src");
+            fs::create_dir_all(&src).unwrap();
+            g(&src, &["init", "-q"]);
+            write(&src, ".gitignore", ignore);
+            write(&src, "olddir/f", "tracked\n");
+            g(&src, &["add", "-A"]);
+            g(&src, &["commit", "-q", "-m", "old"]);
+            g(&base, &["clone", "-q", "src", "machine"]);
+            let m = base.join("machine");
+            g(&m, &["checkout", "-q", "--detach", "HEAD"]);
+            change(&src, &base);
+            g(&src, &["add", "-A", "-f"]);
+            g(&src, &["commit", "-q", "-m", "new"]);
+            let target = g(&src, &["rev-parse", "HEAD"]);
+            let target_tree = g(&src, &["rev-parse", "HEAD^{tree}"]);
+            g(&m, &["fetch", "-q", "origin"]);
+            keep(&m, &base);
+            assert_eq!(
+                g(&m, &["status", "--porcelain", "--untracked-files=all"]),
+                "",
+                "{layout}: the machine's checkout is clean"
+            );
+            let before = snapshot(&m);
+            let first = check_out(&m, "~/c", &target, &target_tree);
+            match named {
+                Some(path) => {
+                    let e = first.clone().unwrap_err();
+                    assert!(
+                        e.contains("would overwrite or remove") && e.ends_with(path),
+                        "{layout}: {e}"
+                    );
+                    assert_eq!(snapshot(&m), before, "{layout}: nothing changed");
+                    let second = check_out(&m, "~/c", &target, &target_tree);
+                    assert_eq!(second, first, "{layout}: the same answer again");
+                    assert_eq!(snapshot(&m), before, "{layout}: nothing changed");
+                }
+                None => {
+                    assert_eq!(first, Ok(()), "{layout}");
+                    assert_eq!(g(&m, &["rev-parse", "HEAD"]), target);
+                    assert_eq!(
+                        fs::read_to_string(m.join("later/keep.txt")).unwrap(),
+                        "untouched\n"
+                    );
+                }
+            }
+        }
+        assert_eq!(
+            fs::read_to_string(tmp.join("case4/outside/keep.db")).unwrap(),
+            "outside data\n"
+        );
+    }
+
+    /// On a volume that ignores case, `Build` and `build` are one path: a tracked file `Build`
+    /// is in the way of an ignored folder `build`, and a rename of `Foo` to `foo` is a plain
+    /// checkout. Where case matters, both go ahead.
+    #[test]
+    fn case_only_differences_follow_the_volume() {
+        let tmp = tempfile::tempdir().unwrap();
+        let tmp = tmp.path().canonicalize().unwrap();
+        let src = tmp.join("src");
         fs::create_dir_all(&src).unwrap();
         g(&src, &["init", "-q"]);
-        write(
-            &src,
-            ".gitignore",
-            "ign*\ndir/\nlink\nolddir/ign2\nlater/\n",
-        );
-        write(&src, "t.txt", "a\n");
-        write(&src, "olddir/f", "tracked\n");
-        write(
-            &src,
-            "was-file",
-            "tracked file, a folder in the next commit\n",
-        );
+        write(&src, ".gitignore", "build/\n");
+        write(&src, "Foo", "x\n");
         g(&src, &["add", "-A"]);
-        g(&src, &["commit", "-q", "-m", "a"]);
-        let machine = tmp.path().join("machine");
-        g(tmp.path(), &["clone", "-q", "src", "machine"]);
+        g(&src, &["commit", "-q", "-m", "old"]);
+        g(&tmp, &["clone", "-q", "src", "machine"]);
+        let m = tmp.join("machine");
+        g(&m, &["checkout", "-q", "--detach", "HEAD"]);
+        let ignores_case = g(&m, &["config", "--get", "core.ignorecase"]) == "true";
 
-        // The next commit tracks paths where the machine keeps ignored files.
-        write(&src, ".gitignore", "");
-        for (rel, text) in [
-            ("ign1", "tracked now\n"),
-            ("dir", "a file where a folder was\n"),
-            ("link/inner.txt", "under a link\n"),
-            ("t.txt", "b\n"),
-            ("new/ok.txt", "fresh\n"),
-            ("ign3", "not on the machine\n"),
-            ("later/inside.txt", "beside an ignored file\n"),
-        ] {
-            write(&src, rel, text);
-        }
-        fs::remove_dir_all(src.join("olddir")).unwrap();
-        write(&src, "olddir", "a file where a tracked folder was\n");
-        fs::remove_file(src.join("was-file")).unwrap();
-        write(&src, "was-file/x", "inside\n");
-        g(&src, &["add", "-A"]);
-        g(&src, &["commit", "-q", "-m", "b"]);
+        // A case-only rename.
+        g(&src, &["mv", "Foo", "foo.tmp"]);
+        g(&src, &["mv", "foo.tmp", "foo"]);
+        g(&src, &["commit", "-q", "-m", "rename"]);
+        let renamed = g(&src, &["rev-parse", "HEAD"]);
+        g(&m, &["fetch", "-q", "origin"]);
+        let tree = g(&src, &["rev-parse", "HEAD^{tree}"]);
+        assert_eq!(check_out(&m, "~/c", &renamed, &tree), Ok(()));
+        let names: Vec<String> = fs::read_dir(&m)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .filter(|n| n != ".git" && n != ".gitignore")
+            .collect();
+        assert_eq!(names, ["foo"]);
+
+        // A tracked `Build` where the machine keeps an ignored `build/`.
+        write(&src, "Build", "tracked\n");
+        g(&src, &["add", "-f", "Build"]);
+        g(&src, &["commit", "-q", "-m", "Build"]);
         let target = g(&src, &["rev-parse", "HEAD"]);
-        g(&machine, &["fetch", "-q", "origin"]);
+        let tree = g(&src, &["rev-parse", "HEAD^{tree}"]);
+        g(&m, &["fetch", "-q", "origin"]);
+        write(&m, "build/keep.db", "machine data\n");
+        let before = snapshot(&m);
+        let r = check_out(&m, "~/c", &target, &tree);
+        if ignores_case {
+            let e = r.unwrap_err();
+            assert!(e.contains("move them away: Build"), "{e}");
+            assert_eq!(snapshot(&m), before);
+        } else {
+            assert_eq!(r, Ok(()));
+            assert_eq!(
+                fs::read_to_string(m.join("build/keep.db")).unwrap(),
+                "machine data\n"
+            );
+        }
+    }
 
-        write(&machine, "ign1", "machine secret\n");
-        write(&machine, "dir/x.db", "machine data\n");
-        std::os::unix::fs::symlink("/tmp", machine.join("link")).unwrap();
-        write(&machine, "olddir/ign2", "kept beside tracked files\n");
-        write(
-            &machine,
-            "later/keep.txt",
-            "untouched: the commit only adds beside it\n",
+    /// A commit that stops ignoring a file the machine keeps: the checkout goes ahead, the files
+    /// are not the commit's tree, and the checkout goes back to where it was (also when it had
+    /// no commit yet), so the next try gives the same answer.
+    #[test]
+    fn files_no_longer_ignored_send_the_checkout_back() {
+        let tmp = tempfile::tempdir().unwrap();
+        let tmp = tmp.path().canonicalize().unwrap();
+        let src = tmp.join("src");
+        fs::create_dir_all(&src).unwrap();
+        g(&src, &["init", "-q"]);
+        write(&src, ".gitignore", "stray.txt\n");
+        write(&src, "a.txt", "a\n");
+        g(&src, &["add", "-A"]);
+        g(&src, &["commit", "-q", "-m", "old"]);
+        g(&tmp, &["clone", "-q", "src", "machine"]);
+        let m = tmp.join("machine");
+        g(&m, &["checkout", "-q", "--detach", "HEAD"]);
+        write(&src, ".gitignore", "!stray.txt\n");
+        write(&src, "a.txt", "b\n");
+        g(&src, &["commit", "-q", "-a", "-m", "new"]);
+        let target = g(&src, &["rev-parse", "HEAD"]);
+        let tree = g(&src, &["rev-parse", "HEAD^{tree}"]);
+        g(&m, &["fetch", "-q", "origin"]);
+        write(&m, "stray.txt", "the machine's\n");
+        let before = snapshot(&m);
+        let first = check_out(&m, "~/c", &target, &tree);
+        let e = first.clone().unwrap_err();
+        assert!(
+            e.contains("are not the commit's")
+                && e.contains("the checkout is back at")
+                && e.ends_with("?? stray.txt"),
+            "{e}"
         );
-        assert_eq!(
-            g(
-                &machine,
-                &["status", "--porcelain", "--untracked-files=all"]
-            ),
-            ""
-        );
-        assert_eq!(
-            checkout_obstructions(&machine, &target).unwrap(),
-            ["dir", "ign1", "link", "olddir/ign2"]
-        );
+        assert_eq!(snapshot(&m), before);
+        assert_eq!(check_out(&m, "~/c", &target, &tree), first);
+        assert_eq!(snapshot(&m), before);
 
-        // A checkout without a commit yet: every path of the target counts.
-        let fresh = tmp.path().join("fresh");
+        // No commit yet: back to no commit, the branch `HEAD` named, and an empty index.
+        let fresh = tmp.join("fresh");
         fs::create_dir_all(&fresh).unwrap();
         g(&fresh, &["init", "-q"]);
-        write(&fresh, ".git/info/exclude", "ign1\n");
-        write(&fresh, "ign1", "machine secret\n");
+        write(&fresh, ".git/info/exclude", "stray.txt\n");
+        write(&fresh, "stray.txt", "the machine's\n");
         g(&fresh, &["fetch", "-q", src.to_str().unwrap()]);
-        assert_eq!(checkout_obstructions(&fresh, &target).unwrap(), ["ign1"]);
+        let before = snapshot(&fresh);
+        let e = check_out(&fresh, "~/c", &target, &tree).unwrap_err();
+        assert!(e.contains("the checkout is back at no commit"), "{e}");
+        assert_eq!(snapshot(&fresh), before);
     }
 
     fn fake_install(dir: &Path, identity: &str) {

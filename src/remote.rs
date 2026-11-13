@@ -10,10 +10,11 @@
 //!    `refs/atelier/test`. Nothing goes to GitHub.
 //! 3. **Session**: `ssh -tt` runs `remote-run run`, with `PATH` set to exactly the machine's
 //!    `path`. It takes the machine lock, requires a clean checkout (unknown files are listed,
-//!    never deleted) and no git-ignored file in the checkout's way, checks the commit out,
-//!    requires the files to be exactly the commit's tree, runs the machine preflight (the
-//!    prerequisites of `check`) on them, and runs the job. Its input is the terminal: when the connection goes, the session
-//!    gets a hang-up and the remote atelier also sees end-of-input; either way it stops its
+//!    never deleted), checks the commit out with git refusing to overwrite any file it does not
+//!    track (ignored ones included), requires the files to be exactly the commit's tree, runs the
+//!    machine preflight (the prerequisites of `check`) on them, and runs the job. Any of these
+//!    failing makes the machine `not ready` for this run, and the next machine is tried. Its
+//!    input is the terminal: when the connection goes, the session gets a hang-up and the remote atelier also sees end-of-input; either way it stops its
 //!    group and writes `connection lost`. ssh runs with `ServerAliveInterval=5` and
 //!    `ServerAliveCountMax=3`, so a connection that dies silently is noticed here in about 15 s.
 //!    The terminal carries the logs and the protocol lines, each marked with a per-session
@@ -687,7 +688,6 @@ enum Event {
 #[derive(Debug)]
 pub enum Start {
     Taken,
-    Refused(String),
     NotReady(String),
     Busy(String),
     Offline(String),
@@ -703,8 +703,6 @@ impl Session {
             Event::Status(s) => {
                 if s == "taken" {
                     Some(Start::Taken)
-                } else if let Some(r) = s.strip_prefix("refused ") {
-                    Some(Start::Refused(r.to_owned()))
                 } else if let Some(r) = s.strip_prefix("not-ready ") {
                     Some(Start::NotReady(r.to_owned()))
                 } else if let Some(h) = s.strip_prefix("busy") {
@@ -945,7 +943,6 @@ pub fn attempt(
     };
     match session.wait_start() {
         Start::Taken => Attempt::Taken(session),
-        Start::Refused(l) => Attempt::Refused(l),
         Start::NotReady(l) => Attempt::NotReady(l),
         Start::Busy(h) => Attempt::Busy(h),
         Start::Offline(d) => Attempt::Offline(d),

@@ -320,9 +320,6 @@ pub enum Attempt<T> {
     Offline(String),
     NotReady(String),
     Busy(String),
-    /// The machine refuses the run for a reason its owner must fix (files atelier would have to
-    /// delete there): the selection stops and the command exits 4.
-    Refused(String),
 }
 
 /// How machines are tried; the real one connects, the tests' ones are scripted.
@@ -344,8 +341,6 @@ pub trait Prober {
 pub struct Selection<T> {
     pub taken: Option<(Candidate, T)>,
     pub skipped: Vec<(String, Skip)>,
-    /// The machine that refused the run, and why.
-    pub refused: Option<(String, String)>,
 }
 
 /// Tries the candidates in order (DESIGN §2.5). When none takes the run and at least one was
@@ -359,7 +354,6 @@ pub fn select<P: Prober>(
     let mut sel = Selection {
         taken: None,
         skipped: Vec::new(),
-        refused: None,
     };
     let mut busy: Vec<&Candidate> = Vec::new();
     for c in candidates {
@@ -376,10 +370,6 @@ pub fn select<P: Prober>(
         match prober.attempt(c) {
             Attempt::Taken(t) => {
                 sel.taken = Some((c.clone(), t));
-                return sel;
-            }
-            Attempt::Refused(why) => {
-                sel.refused = Some((c.name.clone(), why));
                 return sel;
             }
             Attempt::Offline(d) => sel.skipped.push((c.name.clone(), Skip::Offline(d))),
@@ -404,10 +394,6 @@ pub fn select<P: Prober>(
                 Attempt::Taken(t) => {
                     sel.skipped.retain(|(n, _)| n != &c.name);
                     sel.taken = Some((c.clone(), t));
-                    return sel;
-                }
-                Attempt::Refused(why) => {
-                    sel.refused = Some((c.name.clone(), why));
                     return sel;
                 }
                 Attempt::Busy(d) => {
@@ -669,7 +655,6 @@ priority = 1
                 "take" => Attempt::Taken(c.name.clone()),
                 "offline" => Attempt::Offline("timed out".into()),
                 "busy" => Attempt::Busy(String::new()),
-                "refuse" => Attempt::Refused("ignored files in the way".into()),
                 other => Attempt::NotReady(other.into()),
             }
         }
@@ -824,16 +809,23 @@ priority = 1
     }
 
     #[test]
-    fn a_refusal_ends_the_selection() {
+    fn a_machine_whose_checkout_is_in_the_way_is_passed_over_for_the_next() {
         let c = candidates(&file(LINUX), linux(), &platform(None, false));
-        let mut f = Fake::new(&[("b", &["offline"]), ("c", &["refuse"]), ("a", &["take"])]);
+        let mut f = Fake::new(&[
+            ("b", &["offline"]),
+            ("c", &["ignored files in the way"]),
+            ("a", &["take"]),
+        ]);
         let s = select(&c, &mut f);
-        assert!(s.taken.is_none());
+        assert_eq!(s.taken.map(|t| t.1), Some("a".to_owned()));
         assert_eq!(
-            s.refused,
-            Some(("c".to_owned(), "ignored files in the way".to_owned()))
+            s.skipped[1],
+            (
+                "c".to_owned(),
+                Skip::NotReady("ignored files in the way".to_owned())
+            )
         );
-        assert_eq!(f.tried, ["b", "c"]);
+        assert_eq!(f.tried, ["b", "c", "a"]);
     }
 
     #[test]

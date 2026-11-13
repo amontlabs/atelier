@@ -12,7 +12,8 @@
 //! whose results must record this commit and its tree. The final line says, per platform,
 //! where it ran and which machines were skipped and why; it is printed even when a platform
 //! ends in an error. Exit 0 pass, 1 fail, 3 no machine available (or the connection lost), 4
-//! refused.
+//! refused (the caller's tree: uncommitted changes, a folder not in the commit). A machine whose
+//! checkout is in the way is not ready, and the next machine is tried.
 
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
@@ -46,8 +47,6 @@ enum Ended {
     NoMachine,
     ConnectionLost,
     Interrupted,
-    /// A machine refused the run (files there the owner must move).
-    Refused,
     /// The platform could not run; the error was printed, with its exit code.
     Error(Exit),
 }
@@ -78,7 +77,6 @@ impl PlatformReport {
             Ended::Interrupted => "INTERRUPTED",
             Ended::ConnectionLost => "connection lost",
             Ended::NoMachine => "no machine available",
-            Ended::Refused => "REFUSED",
             Ended::Error(_) => "ERROR",
         };
         format!("{}: {word}{on}{skips}", self.platform)
@@ -179,8 +177,6 @@ pub fn test(
             Exit::Fail
         } else if let Some(e) = error {
             e
-        } else if ended(&[Ended::Refused]) {
-            Exit::Refused
         } else if ended(&[Ended::NoMachine, Ended::ConnectionLost]) {
             Exit::NoMachine
         } else {
@@ -300,7 +296,6 @@ impl Prober for RealProber<'_> {
                 Attempt::Offline(d) => Attempt::Offline(d),
                 Attempt::NotReady(l) => Attempt::NotReady(l),
                 Attempt::Busy(h) => Attempt::Busy(h),
-                Attempt::Refused(l) => Attempt::Refused(l),
             }
         }
     }
@@ -375,17 +370,6 @@ fn run_platform(
     let run_dir = run.dir().to_path_buf();
     let id = run.id().to_owned();
 
-    if let Some((name, why)) = selection.refused {
-        run.fail(format!("{name}: {why}"));
-        run.finish(false)?;
-        eprintln!("{}: refused by {name}: {why}", job.platform);
-        return Ok(PlatformReport {
-            platform: job.platform,
-            ended: Ended::Refused,
-            machine: Some((name, false)),
-            skipped,
-        });
-    }
     let Some((chosen, taken)) = selection.taken else {
         let details = if skipped.is_empty() {
             format!("no machine of {} in machines.toml", job.platform)
