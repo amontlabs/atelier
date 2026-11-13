@@ -184,15 +184,13 @@ fn stub_commands_preflight_then_exit_2() {
     repo.install_self(VERSION);
     repo.write_settings(VERSION);
     repo.commit_all("pin");
-    for (args, module) in [(&["status"][..], "3.8")] {
-        let out = repo.atelier(args);
-        assert_eq!(code(&out), 2, "{args:?}: {}", stderr(&out));
-        assert!(
-            stderr(&out).contains(&format!("not built yet (module {module})")),
-            "{args:?}: {}",
-            stderr(&out)
-        );
-    }
+    let out = repo.atelier(&["status"]);
+    assert_eq!(code(&out), 2, "{}", stderr(&out));
+    assert!(
+        stderr(&out).contains("not built yet (module 3.8)"),
+        "{}",
+        stderr(&out)
+    );
 }
 
 #[test]
