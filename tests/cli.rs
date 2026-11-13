@@ -184,12 +184,7 @@ fn stub_commands_preflight_then_exit_2() {
     repo.install_self(VERSION);
     repo.write_settings(VERSION);
     repo.commit_all("pin");
-    for (args, module) in [
-        (&["approve", "a", "abc"][..], "3.4"),
-        (&["merge", "a", "b"], "3.4"),
-        (&["promote"], "3.4"),
-        (&["status"], "3.8"),
-    ] {
+    for (args, module) in [(&["status"][..], "3.8")] {
         let out = repo.atelier(args);
         assert_eq!(code(&out), 2, "{args:?}: {}", stderr(&out));
         assert!(
@@ -301,7 +296,12 @@ fn versioned_commands_need_the_version_pinned_on_main() {
     git(&repo.root, &["switch", "-q", "main"]);
     git(&repo.root, &["merge", "-q", "--ff-only", "downgrade"]);
     let out = repo.atelier(&["approve", "a", "abc"]);
-    assert_eq!(code(&out), 2, "{}", stderr(&out));
+    assert_eq!(code(&out), 4, "{}", stderr(&out));
+    assert!(
+        stderr(&out).contains("a was not started by atelier"),
+        "{}",
+        stderr(&out)
+    );
     assert_eq!(
         fs::read_to_string(repo.root.join(".git/atelier/versioned/format")).unwrap(),
         "1\n"
@@ -432,9 +432,15 @@ fn versioned_commands_run_only_in_the_main_checkout_on_its_integration_branch() 
     assert!(stderr(&out).contains("detached"), "{}", stderr(&out));
     assert!(!repo.root.join(".git/atelier/versioned").exists());
 
-    // On main, in the main checkout: the preflight passes (the command is a stub, exit 2).
+    // On main, in the main checkout: the preflight passes (then `a` is no branch atelier
+    // started).
     git(&repo.root, &["switch", "-q", "main"]);
     let out = repo.atelier(&["approve", "a", "abc"]);
-    assert_eq!(code(&out), 2, "{}", stderr(&out));
+    assert_eq!(code(&out), 4, "{}", stderr(&out));
+    assert!(
+        stderr(&out).contains("a was not started by atelier"),
+        "{}",
+        stderr(&out)
+    );
     assert!(repo.root.join(".git/atelier/versioned/format").is_file());
 }

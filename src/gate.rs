@@ -407,9 +407,19 @@ pub fn gate(
     let regen = regenerated_paths(&ctx.settings);
     for (i, item) in items.iter().enumerate() {
         match merge_one(&gate.root, item, &regen) {
-            Ok(Merged::Clean) => println!("  merged {} {}", item.name, short(&root, &item.commit)),
+            Ok(Merged::Clean) => {
+                println!(
+                    "  in the gate: {} {}",
+                    item.name,
+                    short(&root, &item.commit)
+                )
+            }
             Ok(Merged::Settled(paths)) => {
-                println!("  merged {} {}", item.name, short(&root, &item.commit));
+                println!(
+                    "  in the gate: {} {}",
+                    item.name,
+                    short(&root, &item.commit)
+                );
                 for p in paths {
                     println!(
                         "    conflict in {p} settled with {}'s side: a merge.after hook regenerates it",
@@ -908,7 +918,7 @@ pub fn unclean_paths(dir: &Path) -> Result<Vec<String>> {
     while let Some(f) = fields.next() {
         let text = String::from_utf8_lossy(f).into_owned();
         let (xy, path) = text.split_at(text.len().min(3));
-        let xy = xy.trim_end();
+        let xy = xy.trim();
         if xy.starts_with('R') || xy.starts_with('C') {
             fields.next();
         }

@@ -465,7 +465,16 @@ pub fn promote(
     let mut tries = 0u32;
     loop {
         match facts(&root, &rec)? {
-            Facts::Promoted => return finish(ctx, v, &rec),
+            Facts::Promoted => {
+                if tries == 0 {
+                    println!(
+                        "the promotion of {} (run {}) happened; recording it",
+                        short(&root, &rec.m),
+                        rec.run
+                    );
+                }
+                return finish(ctx, v, &rec);
+            }
             Facts::Moved(to) => {
                 Promotion::remove(v)?;
                 return Err(moved(&root, &rec, &to));
