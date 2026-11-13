@@ -292,6 +292,7 @@ fn versioned_commands_need_the_version_pinned_on_main() {
         ".atelier/atelier.toml",
         "atelier = \"9.9.9\"\n[platforms.macos-aarch64]\nrun = \"check\"\n",
     );
+    repo.write_rules();
     repo.commit_all("pin 9.9.9 on main");
     git(&repo.root, &["switch", "-q", "-c", "downgrade"]);
     repo.write_settings(VERSION);
@@ -411,6 +412,7 @@ fn versioned_commands_run_only_in_the_main_checkout_on_its_integration_branch() 
 
     // With main pinning this version, a linked worktree is still refused.
     repo.write(".atelier/atelier.toml", &settings("main"));
+    repo.write_rules();
     repo.commit_all("pin this version on main");
     let out = repo.atelier_in(&wt, &["approve", "a", "abc"]);
     assert_eq!(code(&out), 4, "{}", stderr(&out));

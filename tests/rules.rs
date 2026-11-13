@@ -281,10 +281,12 @@ fn start_branch(repo: &Repo, name: &str, lower: &str) -> std::path::PathBuf {
         name: name.to_owned(),
         lifetime: new_lifetime_id().unwrap(),
         lower: lower.to_owned(),
+        lower_is_integration: true,
         lower_lifetime: None,
         base,
         state: BranchState::Active,
         pending: None,
+        later: Default::default(),
     }
     .write(&state)
     .unwrap();

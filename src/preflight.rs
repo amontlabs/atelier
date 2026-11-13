@@ -70,11 +70,13 @@ pub fn run(cwd: &Path, command: &str, needs: Needs) -> Result<Context> {
     let state = State::open(&checkout)?;
     check_version(&settings::read_pin(&text)?)?;
     let settings = Settings::load(&checkout.root)?;
+    if needs.versioned {
+        require_main_version(&checkout, command)?;
+    }
     if needs.rules {
         rules::verify(&checkout, &settings)?;
     }
     if needs.versioned {
-        require_main_version(&checkout, command)?;
         state.versioned(CURRENT_FORMAT, CONVERTERS)?;
     }
     Ok(Context {
