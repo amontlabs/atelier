@@ -8,7 +8,8 @@
 //!    current, with no merge commit of its own; a lower branch lands only when it is in the
 //!    batch, earlier, approved at a commit that contains the upper branch's base (DESIGN §2.4);
 //!    a branch that changes `.atelier/` or the generated rules merges alone; every platform of
-//!    OLD's committed settings has a machine or is waived.
+//!    the settings the batch produces ([`batch_settings`]) has a machine that can run their pin,
+//!    or is waived.
 //! 2. The gate worktree `<main checkout>.gate` must be clean; atelier deletes nothing there.
 //!    It is checked out at `OLD`, the integration branch's commit.
 //! 3. Each approved commit is merged with `--no-ff`, in order, with no global or system
@@ -1265,7 +1266,7 @@ fn merge_attributes(
 }
 
 /// Refuses (4) a merge in which a path changed on both sides would be merged by a merge
-/// driver other than git's text and binary merges ([`BUILT_IN_DRIVERS`]): `union` or a
+/// driver other than git's text and binary merges (`BUILT_IN_DRIVERS`): `union` or a
 /// configured driver, which `.gitattributes` (either side's) or `info/attributes` assigns or
 /// `merge.default` names, or a built-in name the git configuration redefines. Such a driver
 /// could settle a conflict without a word (DESIGN §8.2: the gate never resolves anything).

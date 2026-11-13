@@ -2450,25 +2450,42 @@ fn r34b_every_local_run_holds_the_machine_lock() {
     let ca = p.ready("a", "a.txt", "a\n");
     p.ready("b", "BROKEN", "b\n");
     p.ready("c", "c.txt", "c\n");
-    // Another atelier holds the lock for a moment: the gate waits for it.
+    // Another atelier holds the lock until the gate says it waits for it.
     let lock_path = p.repo.home.join(".local/state/atelier/machine.lock");
     fs::create_dir_all(lock_path.parent().unwrap()).unwrap();
-    let taken = p.base.join("taken");
+    let (taken, release) = (p.base.join("taken"), p.base.join("release"));
     let mut holder = std::process::Command::new("perl")
         .args([
             "-MFcntl=:flock",
             "-e",
-            "open(my $f, '>>', $ARGV[0]) or die $!; flock($f, LOCK_EX) or die $!; open(my $t, '>', $ARGV[1]); close $t; sleep 3;",
+            "open(my $f, '>>', $ARGV[0]) or die $!; flock($f, LOCK_EX) or die $!; open(my $t, '>', $ARGV[1]); close $t; for (1..600) { last if -e $ARGV[2]; select(undef, undef, undef, 0.1) }",
             lock_path.to_str().unwrap(),
             taken.to_str().unwrap(),
+            release.to_str().unwrap(),
         ])
         .spawn()
         .unwrap();
     wait_for("the other holder", || taken.exists());
-    let out = p.merge(&["a", "b", "c"]);
+    let mut child = p
+        .repo
+        .atelier_cmd(p.main(), &["merge", "a", "b", "c"], &[])
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .unwrap();
+    let mut so = String::new();
+    for line in std::io::BufRead::lines(std::io::BufReader::new(child.stdout.take().unwrap())) {
+        let line = line.unwrap();
+        if line.contains("waiting for this computer's machine lock") {
+            fs::write(&release, "").unwrap();
+        }
+        so.push_str(&line);
+        so.push('\n');
+    }
+    let status = child.wait().unwrap();
+    fs::write(&release, "").unwrap();
     holder.wait().unwrap();
-    assert_eq!(code(&out), 1, "{}", both(&out));
-    let so = stdout(&out);
+    assert_eq!(status.code(), Some(1), "{so}");
     assert!(
         so.contains("waiting for this computer's machine lock"),
         "{so}"
