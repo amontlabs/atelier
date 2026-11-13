@@ -10,7 +10,7 @@ parts the project uses.
 The design is kept outside this repository (`DESIGN.md`, revision 5, with mechanics in
 `DESIGN-r4.md`). The formats every version shares are in [docs/FROZEN-LAYER.md](docs/FROZEN-LAYER.md).
 
-## Status: modules 3.1, 3.2, 3.3 and 3.7
+## Status: modules 3.1, 3.2, 3.3, 3.6 and 3.7
 
 Built so far, with tests on throwaway git repositories:
 

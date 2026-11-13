@@ -165,11 +165,11 @@ fn each_worktree_runs_the_version_its_tree_pins() {
     )
     .unwrap();
 
-    let out = repo.atelier(&["machines"]);
+    let out = repo.atelier(&["status"]);
     assert_eq!(code(&out), 2, "{}", stderr(&out));
-    assert!(stderr(&out).contains("machines: not built yet"));
+    assert!(stderr(&out).contains("status: not built yet"));
 
-    let out = repo.atelier_in(&wt, &["machines"]);
+    let out = repo.atelier_in(&wt, &["status"]);
     assert_eq!(code(&out), 4);
     assert!(stderr(&out).contains("atelier 9.9.9 is not installed"));
 
@@ -296,7 +296,7 @@ fn versioned_commands_need_the_version_pinned_on_main() {
     assert!(stderr(&out).contains("runs only with the atelier version pinned on main (9.9.9)"));
     assert!(!repo.root.join(".git/atelier/versioned").exists());
     // Commands of the frozen layer still run.
-    assert_eq!(code(&repo.atelier(&["machines"])), 2);
+    assert_eq!(code(&repo.atelier(&["tmp", "--", "true"])), 2);
 
     // The version pinned on main creates the layer with its format.
     repo.commit_all("pin back");
