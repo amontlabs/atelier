@@ -206,7 +206,8 @@ fn load_template(root: &Path, name: &str) -> Result<Loaded> {
     })
 }
 
-/// `field=value` or `field=@file` arguments, files read relative to `cwd`.
+/// `field=value` or `field=@file` arguments, files read relative to `cwd`. A value starting with
+/// `@@` is the text after the first `@`. File line breaks become `\n`.
 fn parse_args(cwd: &Path, args: &[String]) -> Result<BTreeMap<String, String>> {
     let mut out = BTreeMap::new();
     for a in args {
@@ -216,15 +217,25 @@ fn parse_args(cwd: &Path, args: &[String]) -> Result<BTreeMap<String, String>> {
         if !template::valid_name(name) {
             return Err(Failure::usage(format!("{name:?} is not a field name")));
         }
-        let value = match value.strip_prefix('@') {
-            Some(file) => {
-                let p = cwd.join(file);
-                fs::read_to_string(&p)
-                    .map_err(|e| Failure::usage(format!("{name}=@{file}: {}: {e}", p.display())))?
-                    .trim_end_matches('\n')
-                    .to_owned()
+        let value = if let Some(literal) = value.strip_prefix("@@") {
+            format!("@{literal}")
+        } else if let Some(file) = value.strip_prefix('@') {
+            let p = cwd.join(file);
+            let fail = |e: &dyn std::fmt::Display| {
+                Failure::usage(format!("{name}=@{file}: {}: {e}", p.display()))
+            };
+            if !fs::metadata(&p).is_ok_and(|m| m.is_file()) {
+                return Err(fail(
+                    &"not a regular file (write @@ for a value starting with @)",
+                ));
             }
-            None => value.to_owned(),
+            fs::read_to_string(&p)
+                .map_err(|e| fail(&e))?
+                .replace("\r\n", "\n")
+                .trim_end_matches('\n')
+                .to_owned()
+        } else {
+            value.to_owned()
         };
         if out.insert(name.to_owned(), value).is_some() {
             return Err(Failure::usage(format!("field {name} is given twice")));
@@ -287,6 +298,9 @@ fn known_values(ctx: &Context, branch: Option<&str>) -> Result<BTreeMap<String, 
     }
     Ok(known)
 }
+
+/// Random bytes in a task id, after the UTC time stamp.
+pub const TASK_ID_RANDOM_BYTES: usize = 8;
 
 /// Names atelier can fill when a branch is given.
 const BRANCH_KNOWN: &[&str] = &[
@@ -367,6 +381,20 @@ pub fn task(
             missing.join(", ")
         ));
     }
+    let empty: Vec<&str> = tpl
+        .header
+        .fields
+        .iter()
+        .map(String::as_str)
+        .filter(|f| given.get(*f).is_some_and(|v| v.trim().is_empty()))
+        .collect();
+    if !empty.is_empty() {
+        problems.push(format!(
+            "empty field(s) for template {}: {}",
+            tpl.name,
+            empty.join(", ")
+        ));
+    }
     for used in tpl.body.names() {
         if declared.contains(used.as_str()) || known.contains_key(&used) {
             continue;
@@ -399,10 +427,10 @@ pub fn task(
     let (y, mo, d, h, mi, s) = fsutil::utc_parts(fsutil::now_secs());
     let id = format!(
         "{y:04}{mo:02}{d:02}T{h:02}{mi:02}{s:02}Z-{}",
-        fsutil::random_hex(4)?
+        fsutil::random_hex(TASK_ID_RANDOM_BYTES)?
     );
     let path = tasks.join(format!("{id}.md"));
-    fsutil::write_atomic(&path, text.as_bytes()).ctx(path.display())?;
+    fsutil::write_atomic_new(&path, text.as_bytes()).ctx(path.display())?;
     Ok(path)
 }
 

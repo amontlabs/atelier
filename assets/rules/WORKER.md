@@ -4,6 +4,7 @@ You build one item, in one worktree, on one branch, named in your task.
 
 ## Checkout
 - Work only in your worktree. Commit as you go. Never push, never open a pull request, never touch another checkout.
+- Commit only your own files, by path, in one step: `git commit -m "…" -- <paths>`. Never `git add -A` or `git commit -a`: another agent may be working in the same worktree.
 - Amend, reorder and squash your own commits as you like (they are the ones above the base `atelier follow` prints). Never rebase below them by hand, and never `git merge` into your branch: newer work comes only through `atelier follow`.
 - Getting newer work: commit, then `atelier follow`. It brings your branch up to date with what it is built on (another item, or `main` once that item is merged). On a conflict it stops with the rebase open: resolve, `git add`, `git rebase --continue`, then `atelier follow` once more.
 {{#rust}}

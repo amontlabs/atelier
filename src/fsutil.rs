@@ -5,10 +5,11 @@ use std::io::{Read, Write};
 use std::path::Path;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-/// Writes `contents` to `path` atomically: a temporary file in the same folder, flushed to disk,
-/// renamed over `path`, then the folder flushed. A reader sees the old file or the new one,
-/// never a partial one.
-pub fn write_atomic(path: &Path, contents: &[u8]) -> std::io::Result<()> {
+/// A fresh temporary file next to `path`, holding `contents`, flushed to disk.
+fn write_temp<'a>(
+    path: &'a Path,
+    contents: &[u8],
+) -> std::io::Result<(std::path::PathBuf, &'a Path)> {
     let dir = path
         .parent()
         .ok_or_else(|| std::io::Error::other(format!("{} has no parent folder", path.display())))?;
@@ -21,10 +22,24 @@ pub fn write_atomic(path: &Path, contents: &[u8]) -> std::io::Result<()> {
         std::process::id(),
         random_hex(4)?
     ));
-    let result = (|| {
+    let written = (|| {
         let mut f = OpenOptions::new().write(true).create_new(true).open(&tmp)?;
         f.write_all(contents)?;
-        f.sync_all()?;
+        f.sync_all()
+    })();
+    if let Err(e) = written {
+        let _ = fs::remove_file(&tmp);
+        return Err(e);
+    }
+    Ok((tmp, dir))
+}
+
+/// Writes `contents` to `path` atomically: a temporary file in the same folder, flushed to disk,
+/// renamed over `path`, then the folder flushed. A reader sees the old file or the new one,
+/// never a partial one.
+pub fn write_atomic(path: &Path, contents: &[u8]) -> std::io::Result<()> {
+    let (tmp, dir) = write_temp(path, contents)?;
+    let result = (|| {
         fs::rename(&tmp, path)?;
         File::open(dir)?.sync_all()
     })();
@@ -32,6 +47,60 @@ pub fn write_atomic(path: &Path, contents: &[u8]) -> std::io::Result<()> {
         let _ = fs::remove_file(&tmp);
     }
     result
+}
+
+/// Like [`write_atomic`], but fails with `AlreadyExists` instead of replacing a file at `path`.
+pub fn write_atomic_new(path: &Path, contents: &[u8]) -> std::io::Result<()> {
+    let (tmp, dir) = write_temp(path, contents)?;
+    let result = fs::hard_link(&tmp, path);
+    let _ = fs::remove_file(&tmp);
+    result?;
+    File::open(dir)?.sync_all()
+}
+
+/// Where a write to `path` lands: `path` itself, or the end of the symbolic link chain that
+/// starts there (a link to a missing file resolves to that file's path).
+pub fn resolve_link(path: &Path) -> std::io::Result<std::path::PathBuf> {
+    let mut current = path.to_path_buf();
+    for _ in 0..40 {
+        match fs::symlink_metadata(&current) {
+            Ok(m) if m.file_type().is_symlink() => {
+                let target = fs::read_link(&current)?;
+                current = if target.is_absolute() {
+                    target
+                } else {
+                    current.parent().unwrap_or(Path::new("")).join(target)
+                };
+            }
+            Ok(_) => return Ok(current),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(current),
+            Err(e) => return Err(e),
+        }
+    }
+    Err(std::io::Error::other(format!(
+        "{}: too many levels of symbolic links",
+        path.display()
+    )))
+}
+
+/// Writes `contents` where `path` resolves to (see [`resolve_link`]), atomically: a symbolic
+/// link at `path` stays a link.
+pub fn write_through(path: &Path, contents: &[u8]) -> std::io::Result<()> {
+    write_atomic(&resolve_link(path)?, contents)
+}
+
+/// Whether two paths are the same file: the same resolved path, or the same device and inode.
+pub fn same_file(a: &Path, b: &Path) -> bool {
+    use std::os::unix::fs::MetadataExt;
+    if let (Ok(ra), Ok(rb)) = (resolve_link(a), resolve_link(b))
+        && ra == rb
+    {
+        return true;
+    }
+    match (fs::metadata(a), fs::metadata(b)) {
+        (Ok(x), Ok(y)) => x.dev() == y.dev() && x.ino() == y.ino(),
+        _ => false,
+    }
 }
 
 /// `n` random bytes from the system, as lowercase hex.
@@ -102,6 +171,52 @@ mod tests {
             .map(|e| e.unwrap().file_name())
             .collect();
         assert_eq!(names, vec![std::ffi::OsString::from("result")]);
+    }
+
+    #[test]
+    fn atomic_new_refuses_to_replace() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("result");
+        write_atomic_new(&p, b"one").unwrap();
+        let e = write_atomic_new(&p, b"two").unwrap_err();
+        assert_eq!(e.kind(), std::io::ErrorKind::AlreadyExists);
+        assert_eq!(fs::read(&p).unwrap(), b"one");
+        assert_eq!(fs::read_dir(dir.path()).unwrap().count(), 1);
+    }
+
+    #[test]
+    fn writes_go_through_links_and_keep_them() {
+        use std::os::unix::fs::symlink;
+        let dir = tempfile::tempdir().unwrap();
+        let base = fs::canonicalize(dir.path()).unwrap();
+        fs::create_dir(base.join("sub")).unwrap();
+        fs::write(base.join("sub/real"), "old").unwrap();
+        symlink("sub/real", base.join("link")).unwrap();
+        symlink("link", base.join("link2")).unwrap();
+        write_through(&base.join("link2"), b"new").unwrap();
+        assert_eq!(fs::read(base.join("sub/real")).unwrap(), b"new");
+        assert!(
+            fs::symlink_metadata(base.join("link2"))
+                .unwrap()
+                .is_symlink()
+        );
+        assert!(
+            fs::symlink_metadata(base.join("link"))
+                .unwrap()
+                .is_symlink()
+        );
+        assert!(same_file(&base.join("link2"), &base.join("sub/real")));
+        assert!(!same_file(&base.join("link2"), &base.join("sub")));
+        // A link to a missing file: the file is created at its target.
+        symlink("sub/made", base.join("dangling")).unwrap();
+        assert!(same_file(&base.join("dangling"), &base.join("sub/made")));
+        write_through(&base.join("dangling"), b"x").unwrap();
+        assert_eq!(fs::read(base.join("sub/made")).unwrap(), b"x");
+        assert!(
+            fs::symlink_metadata(base.join("dangling"))
+                .unwrap()
+                .is_symlink()
+        );
     }
 
     #[test]

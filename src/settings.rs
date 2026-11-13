@@ -225,6 +225,41 @@ pub fn validate_version(v: &str) -> std::result::Result<(), String> {
     }
 }
 
+/// Why `name` cannot be a `rules.import_into` file in `root`, if it cannot: it must be one plain
+/// file name that is neither under `.git` nor `AGENTS.md` itself (the same name in other letters
+/// on a volume that ignores case, or another name for the same file; a symbolic link to
+/// `AGENTS.md` is fine).
+fn import_into_problem(root: &Path, name: &str) -> Option<&'static str> {
+    let mut parts = Path::new(name).components();
+    let single = matches!(
+        (parts.next(), parts.next()),
+        (Some(Component::Normal(_)), None)
+    );
+    if !single || name.contains(['/', '\\']) {
+        return Some(
+            "must be one file name in the checkout root (no folders, absolute paths, `.` or `..`)",
+        );
+    }
+    if name.eq_ignore_ascii_case(".git") {
+        return Some("must not be .git: it belongs to git");
+    }
+    if name == "AGENTS.md" {
+        return Some("must be a file other than AGENTS.md");
+    }
+    let alias = name.eq_ignore_ascii_case("AGENTS.md")
+        && root.join(".git").exists()
+        && root.join(".GIT").exists();
+    let path = root.join(name);
+    let is_link = |p: &Path| std::fs::symlink_metadata(p).is_ok_and(|m| m.file_type().is_symlink());
+    let agents = root.join("AGENTS.md");
+    let hard_alias =
+        !is_link(&path) && !is_link(&agents) && crate::fsutil::same_file(&path, &agents);
+    if alias || hard_alias {
+        return Some("must be a file other than AGENTS.md (it is the same file on this volume)");
+    }
+    None
+}
+
 impl Settings {
     /// Parses settings text: syntax and unknown keys only.
     pub fn parse(text: &str) -> Result<Settings> {
@@ -257,10 +292,8 @@ impl Settings {
         }
 
         for f in &self.rules.import_into {
-            if f.is_empty() || f.contains('/') || f == "." || f == ".." || f == "AGENTS.md" {
-                problems.push(format!(
-                    "rules.import_into: {f:?} must be a file name in the checkout root other than AGENTS.md"
-                ));
+            if let Some(why) = import_into_problem(root, f) {
+                problems.push(format!("rules.import_into: {f:?} {why}"));
             }
         }
 

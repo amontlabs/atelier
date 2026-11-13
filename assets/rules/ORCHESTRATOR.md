@@ -12,9 +12,15 @@
    - "gate worktree has unknown files": look at each, keep what someone saved, remove the rest, merge again.
    - "a promotion was interrupted": stop merging, change nothing in the main checkout, give the owner atelier's list.
    - "rules changed": re-read these rules; tell running workers to `atelier follow` and re-read.
+{{#multi_platform}}
    - Exit 3, no machine for a platform: waive it (`--waive <platform>`) only on the owner's word, quoted in `--reason`.
+{{/multi_platform}}
+4b. Worktrees are the default, not a requirement; you decide.
+   - Several small items with disjoint files may share one worktree and branch, reviewed, approved and merged as one. Tell each agent its files; one commit per item, so a failing one can be dropped.
+   - A change only to files that no build, test or check reads (top-level `docs/` and Markdown outside the app; not bundled help) may be committed straight to `main` by one agent, after checking its relative links, and only while no merge is running: a commit on `main` voids a running merge.
+   - Anything else goes through `atelier merge`, however small.
 5. A test that `atelier status` lists as flaky (failed, then passed on the same tree and platform in full runs) is a fix item with the failing output, before anything else.
 6. After each merge: `atelier clean`, read the plan, then `atelier clean --yes`.
-7. Done when everything is merged, no promotion is pending, and every platform passed on `main` or the owner waived it.
+7. Done when everything is merged{{#single_platform}} and{{/single_platform}}{{#multi_platform}},{{/multi_platform}} no promotion is pending{{#multi_platform}}, and every platform passed on `main` or the owner waived it{{/multi_platform}}.
 
 Choosing agents: by role, from `atelier agents`. Effort per task: low for lookups and mechanical edits; medium for an ordinary item; high for cross-crate, concurrency, migration or security-relevant work and for reviews of risky diffs. Never name models, retries or CI in a task. Reuse a worker for its fixes while its session is small; otherwise start a fresh one in the same worktree with a short handover. A report that is only a pointer ("the report above stands") is lost: ask for it in full.
