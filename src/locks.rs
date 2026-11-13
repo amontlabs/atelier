@@ -228,6 +228,11 @@ impl Record {
 }
 
 /// A lock held by this process, released when dropped (or when the process ends).
+///
+/// The lock is free once its file is closed in every process. On Linux a child that another
+/// thread is spawning holds a copy of the descriptor until it execs, so a lock released while
+/// another thread spawns can look held for a moment. atelier spawns from one thread, and a spawn
+/// returns only once the child has exec'd.
 #[derive(Debug)]
 pub struct HeldLock {
     key: LockKey,
@@ -427,6 +432,24 @@ mod tests {
         assert_eq!(Record::parse("\n\n").unwrap(), Record::default());
     }
 
+    /// `HeldLock::acquire` after this test released the lock: retried for a moment while it looks
+    /// held, because a child another test thread is spawning holds a copy of the descriptor
+    /// until it execs (Linux).
+    fn acquire_after_release(state: &State, key: LockKey) -> HeldLock {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+        loop {
+            match HeldLock::acquire(state, key.clone()) {
+                Err(e)
+                    if e.message.contains("held by another atelier command")
+                        && std::time::Instant::now() < deadline =>
+                {
+                    std::thread::sleep(std::time::Duration::from_millis(10));
+                }
+                other => return other.unwrap(),
+            }
+        }
+    }
+
     fn sleeper_group() -> Child {
         Command::new("/bin/sleep")
             .arg("30")
@@ -462,7 +485,7 @@ mod tests {
         assert!(!e.message.contains("stop them"), "{}", e.message);
         assert_eq!(fs::read_to_string(&path).unwrap(), text);
         stop(child);
-        HeldLock::acquire(&state, LockKey::Gate).unwrap();
+        acquire_after_release(&state, LockKey::Gate);
         assert!(!path.exists());
     }
 
@@ -491,7 +514,7 @@ mod tests {
             format!("group {pgid} {ID} 1000.000000\n"),
         )
         .unwrap();
-        let held = HeldLock::acquire(&state, LockKey::Gate).unwrap();
+        let held = acquire_after_release(&state, LockKey::Gate);
         assert_eq!(held.record(), &Record::default());
         drop(held);
         // The review's probe: a group led by a process this user did not start (a daemon),
@@ -509,7 +532,7 @@ mod tests {
             format!("group {} {ID} 1000.000000\n", other.pid),
         )
         .unwrap();
-        HeldLock::acquire(&state, LockKey::Gate).unwrap();
+        acquire_after_release(&state, LockKey::Gate);
         stop(child);
     }
 
@@ -526,7 +549,7 @@ mod tests {
         assert!(state.locks_dir().join("branch/a%2Fb.lock").is_file());
         assert!(state.locks_dir().join("branch/a%252%46b.lock").is_file());
         drop(held);
-        HeldLock::acquire(&state, LockKey::branch("a/b")).unwrap();
+        acquire_after_release(&state, LockKey::branch("a/b"));
     }
 
     #[test]
@@ -538,7 +561,7 @@ mod tests {
         // A process group id no live process has: pid_max is far below this on both systems.
         held.add_group(9_999_999, ID, None).unwrap();
         drop(held);
-        let held = HeldLock::acquire(&state, LockKey::Gate).unwrap();
+        let held = acquire_after_release(&state, LockKey::Gate);
         assert_eq!(held.record(), &Record::default());
         assert!(!state.locks_dir().join("gate.procs").exists());
     }

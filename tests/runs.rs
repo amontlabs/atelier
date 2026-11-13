@@ -179,6 +179,32 @@ fn probe(mode: &str) -> Command {
 
 // ----- helpers -----
 
+/// `Run::start`, retried for a moment while the lock looks held by another atelier. On Linux a
+/// child that another test thread is spawning holds a copy of every descriptor of this process
+/// until it execs (glibc's `posix_spawn` clones the descriptor table), so a lock this test has
+/// just released can look held for a few milliseconds. atelier itself spawns from one thread,
+/// and that spawn returns only once the child has exec'd.
+fn start_after_release(
+    state: &State,
+    key: LockKey,
+    kind: RunKind,
+    command: &str,
+    worktree: &Path,
+) -> atelier::exit::Result<Run> {
+    let deadline = Instant::now() + Duration::from_secs(3);
+    loop {
+        match Run::start(state, key.clone(), kind.clone(), command, worktree) {
+            Err(e)
+                if e.message.contains("held by another atelier command")
+                    && Instant::now() < deadline =>
+            {
+                sleep(Duration::from_millis(10));
+            }
+            other => return other,
+        }
+    }
+}
+
 fn alive(pid: i32) -> bool {
     // SAFETY: existence check only.
     unsafe { libc::kill(pid, 0) == 0 }
@@ -241,7 +267,7 @@ fn a_step_runs_as_its_own_group_leader_with_the_run_marker() {
     let repo = Repo::new();
     let checkout = repo.checkout();
     let state = State::open(&checkout).unwrap();
-    let mut run = Run::start(
+    let mut run = start_after_release(
         &state,
         LockKey::worktree(&checkout),
         RunKind::Check,
@@ -299,7 +325,7 @@ fn a_step_runs_as_its_own_group_leader_with_the_run_marker() {
 fn a_failing_or_missing_program_fails_the_run() {
     let repo = Repo::new();
     let state = State::open(&repo.checkout()).unwrap();
-    let mut run = Run::start(
+    let mut run = start_after_release(
         &state,
         LockKey::branch("x"),
         RunKind::Check,
@@ -360,7 +386,7 @@ fn a_step_that_leaves_its_group_populated_fails_and_the_group_is_stopped() {
     let repo = Repo::new();
     let state = State::open(&repo.checkout()).unwrap();
     let pidfile = repo.tmp.path().join("bg.pid");
-    let mut run = Run::start(
+    let mut run = start_after_release(
         &state,
         LockKey::branch("x"),
         RunKind::Check,
@@ -407,7 +433,7 @@ fn a_member_that_ignores_term_is_killed() {
     let repo = Repo::new();
     let state = State::open(&repo.checkout()).unwrap();
     let pidfile = repo.tmp.path().join("bg.pid");
-    let run = Run::start(
+    let run = start_after_release(
         &state,
         LockKey::branch("x"),
         RunKind::Check,
@@ -442,7 +468,7 @@ fn a_survivor_that_left_its_group_makes_the_run_red_and_blocks_the_next_run() {
     let state = State::open(&repo.checkout()).unwrap();
     let pidfile = repo.tmp.path().join("sleeper.pid");
     let me = std::env::current_exe().unwrap();
-    let mut run = Run::start(
+    let mut run = start_after_release(
         &state,
         LockKey::branch("x"),
         RunKind::Check,
@@ -488,7 +514,7 @@ fn a_survivor_that_left_its_group_makes_the_run_red_and_blocks_the_next_run() {
     assert!(alive(sleeper));
 
     // The next command under the same lock refuses while it lives.
-    let e = Run::start(
+    let e = start_after_release(
         &state,
         LockKey::branch("x"),
         RunKind::Check,
@@ -504,7 +530,7 @@ fn a_survivor_that_left_its_group_makes_the_run_red_and_blocks_the_next_run() {
         e.message
     );
     // Another lock is not affected.
-    Run::start(
+    start_after_release(
         &state,
         LockKey::branch("y"),
         RunKind::Check,
@@ -516,7 +542,7 @@ fn a_survivor_that_left_its_group_makes_the_run_red_and_blocks_the_next_run() {
     .unwrap();
 
     kill_and_wait(sleeper, false);
-    let run = Run::start(
+    let run = start_after_release(
         &state,
         LockKey::branch("x"),
         RunKind::Check,
@@ -577,7 +603,7 @@ fn a_killed_atelier_leaves_a_live_group_and_the_next_run_refuses() {
         "{record}"
     );
 
-    let e = Run::start(
+    let e = start_after_release(
         &state,
         LockKey::branch("probe/branch"),
         RunKind::Check,
@@ -597,7 +623,7 @@ fn a_killed_atelier_leaves_a_live_group_and_the_next_run_refuses() {
     assert!(alive(step));
 
     kill_and_wait(step, true);
-    let run = Run::start(
+    let run = start_after_release(
         &state,
         LockKey::branch("probe/branch"),
         RunKind::Check,
@@ -655,7 +681,7 @@ fn stop_signals_stop_the_group_and_write_a_result() {
             result.steps[0].left
         );
         // Nothing stays recorded, so the next run starts.
-        let run = Run::start(
+        let run = start_after_release(
             &state,
             LockKey::branch("probe/branch"),
             RunKind::Check,
@@ -706,7 +732,7 @@ fn escape_argv() -> Vec<String> {
 fn run_files_name_the_kind_the_lock_key_and_where_the_run_ran() {
     let repo = Repo::new();
     let state = State::open(&repo.checkout()).unwrap();
-    let mut run = Run::start(
+    let mut run = start_after_release(
         &state,
         LockKey::branch("a/b"),
         RunKind::TestNarrow,
@@ -771,7 +797,7 @@ fn run_files_name_the_kind_the_lock_key_and_where_the_run_ran() {
 fn a_step_environment_cannot_replace_the_run_markers() {
     let repo = Repo::new();
     let state = State::open(&repo.checkout()).unwrap();
-    let mut run = Run::start(
+    let mut run = start_after_release(
         &state,
         LockKey::branch("x"),
         RunKind::Check,
@@ -813,7 +839,7 @@ fn a_step_environment_cannot_replace_the_run_markers() {
 fn a_program_name_starting_with_a_dash_is_refused() {
     let repo = Repo::new();
     let state = State::open(&repo.checkout()).unwrap();
-    let mut run = Run::start(
+    let mut run = start_after_release(
         &state,
         LockKey::branch("x"),
         RunKind::Check,
@@ -838,7 +864,8 @@ fn an_outer_run_finds_what_a_nested_atelier_left_behind() {
     let state = State::open(&repo.checkout()).unwrap();
     let pidfile = repo.tmp.path().join("sleeper.pid");
     let inner_file = repo.tmp.path().join("inner");
-    let mut run = Run::start(&state, LockKey::Gate, RunKind::Gate, "outer", &repo.root).unwrap();
+    let mut run =
+        start_after_release(&state, LockKey::Gate, RunKind::Gate, "outer", &repo.root).unwrap();
     let outer = run.id().to_owned();
     let step = run
         .step(
@@ -892,7 +919,8 @@ fn an_outer_run_finds_what_a_nested_atelier_left_behind() {
     );
     // Both locks refuse while it lives.
     for key in [LockKey::Gate, LockKey::branch("inner")] {
-        let e = Run::start(&state, key.clone(), RunKind::Check, "probe", &repo.root).unwrap_err();
+        let e = start_after_release(&state, key.clone(), RunKind::Check, "probe", &repo.root)
+            .unwrap_err();
         assert!(
             e.message.contains(&format!("{sleeper} ")),
             "{key:?}: {}",
@@ -900,7 +928,7 @@ fn an_outer_run_finds_what_a_nested_atelier_left_behind() {
         );
     }
     kill_and_wait(sleeper, false);
-    Run::start(&state, LockKey::Gate, RunKind::Gate, "probe", &repo.root)
+    start_after_release(&state, LockKey::Gate, RunKind::Gate, "probe", &repo.root)
         .unwrap()
         .finish(true)
         .unwrap();
@@ -914,7 +942,7 @@ fn failing_scan(_: &[String]) -> std::io::Result<Vec<(atelier::procs::ProcInfo, 
 fn a_failed_survivor_scan_keeps_the_run_recorded() {
     let repo = Repo::new();
     let state = State::open(&repo.checkout()).unwrap();
-    let run = Run::start(
+    let run = start_after_release(
         &state,
         LockKey::branch("x"),
         RunKind::Check,
@@ -937,7 +965,7 @@ fn a_failed_survivor_scan_keeps_the_run_recorded() {
     let record = fs::read_to_string(state.locks_dir().join("branch/x.procs")).unwrap();
     assert!(record.contains(&format!("run {id}")), "{record}");
     // The next taker scans for it (nothing is left) and clears it.
-    Run::start(
+    start_after_release(
         &state,
         LockKey::branch("x"),
         RunKind::Check,
