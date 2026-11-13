@@ -10,7 +10,7 @@ parts the project uses.
 The design is kept outside this repository (`DESIGN.md`, revision 5, with mechanics in
 `DESIGN-r4.md`). The formats every version shares are in [docs/FROZEN-LAYER.md](docs/FROZEN-LAYER.md).
 
-## Status: modules 3.1 to 3.8
+## Status: modules 3.1 to 3.8 and 3.10
 
 Built so far, with tests on throwaway git repositories:
 
@@ -70,6 +70,29 @@ record, flaky tests, and the conflict forecast (`git merge-tree` for every pair 
 and each against `main`, touching no file). `merge` prints the forecast's pairs that involve the
 batch as warnings and refuses nothing.
 
+Module 3.10, launchd steps and the stop hook ([docs/HOOKS.md](docs/HOOKS.md) for the hook):
+
+- On macOS every step of a run is a launchd job (`launchctl bootstrap` of a generated plist with a
+  unique label, `ProcessType = Interactive`, `AbandonProcessGroup = true`; `gui/<uid>`, or
+  `user/<uid>` with `LimitLoadToSessionType = Background` without a GUI login). atelier itself is
+  the job's shim: it sets exactly the step's environment, restores the caller's open-file limit
+  and umask, and runs the program only once the step is recorded under the lock. The job's
+  resource coalition replaces the marker scan: what a step leaves behind (after `setsid`, a double
+  fork, `env -i`, as a system program) is found by coalition when the step ends, stopped (TERM,
+  the grace, KILL, the coalition re-checked before each signal) and makes the run RED; `launchctl
+  bootout` comes last. The exit status is read from `launchctl print`. Before the first run on a
+  macOS version, the preflight runs the `setsid` case once per user and refuses (4) if the
+  coalition misses it; there is no fallback to the weaker scan. Linux keeps process groups and the
+  marker scan. Not caught on either system: work handed to an already-running service (launchd
+  agents, a daemon), as r4 §3.1 says.
+- `atelier hook stop`, registered by `init` and `rules` in `.claude/settings.json` and
+  `.codex/hooks.json` (merged into what they hold): Claude Code's and Codex's Stop and
+  SubagentStop hook. In a worktree on a branch atelier started it blocks the end of a turn while
+  a rebase is open, the tree has uncommitted changes, a background task the input lists runs, or
+  the last message has no line starting `compile:` (for a subagent, the message only). **Codex
+  runs a project's hooks only after the owner trusts them once** (`/hooks` in Codex, in that
+  project); atelier cannot grant that.
+
 ## Layout
 
 | Module | What it does |
@@ -83,6 +106,8 @@ batch as warnings and refuses nothing.
 | `records` | frozen-layer branch records and temp-folder registry entries |
 | `locks` | `flock` locks and their process records |
 | `procs` | process groups, stopping a group, the `ATELIER_RUN` marker scan |
+| `coalition`, `launchd` | macOS: coalition scan and stop, the probe and its record; steps as launchd jobs and the shim |
+| `hook` | `atelier hook stop` and the hook files' merge |
 | `runs`, `signals` | run ids, folders, steps, atomic results; TERM/INT/HUP |
 | `tree` | tree id via a temporary index; submodule refusal |
 | `refs`, `names`, `git` | plain refs and `--no-deref` updates; branch names and file keys; running git |
@@ -103,11 +128,16 @@ batch as warnings and refuses nothing.
 
 ## Dependencies
 
-clap, serde, serde_json (cargo metadata, nextest output) and toml handle the command line and the files; tempfile is used by tests only.
+clap, serde, serde_json (cargo metadata, nextest output, hook input and the harnesses' hook files)
+and toml handle the command line and the files; tempfile is used by tests only. serde_json's
+`preserve_order` feature (indexmap) keeps the order of the keys in `.claude/settings.json` when
+the hook is merged into it.
 Locks use the standard library's `File::lock` (`flock`, stable since Rust 1.89), so fs2 and
 rustix are not needed. Two more crates:
 
-- `libc`: `kill` on process groups, `setsid` in tests, and `sysctl(KERN_PROCARGS2)`, the source
+- `libc`: `kill` on process groups, `setsid` in tests, `proc_listallpids` and
+  `proc_pidinfo(PROC_PIDCOALITIONINFO)` (the coalition scan), `kqueue` (a job's exit), and
+  `sysctl(KERN_PROCARGS2)`, the source
   `ps -E` reads on macOS. With it, the survivor scan compares each environment entry exactly,
   where a command line that happens to contain the marker text would match `ps -E` output.
 - `signal-hook`: installs the TERM, INT and HUP handlers safely. During a run the handler only

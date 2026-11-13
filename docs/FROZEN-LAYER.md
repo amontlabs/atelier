@@ -27,6 +27,9 @@ runs its pinned version beside the orchestrator's. These rules keep that safe.
 | `runs/<run id>/run.toml` | written when a run starts |
 | `runs/<run id>/result` | written atomically when a run ends; absent for a run that was killed |
 | `runs/<run id>/<step key>.log` | a step's output |
+| `runs/<run id>/coalitions` | macOS: one line per step job of the run and of every run nested in it (below) |
+| `runs/<run id>/jobs/<n>/` | macOS: a step job's spec, plist and FIFOs while it runs; removed with the job |
+| `probes/coalition-<uid>.toml` | macOS: the macOS version on which the coalition probe passed for this user (below) |
 | `branches/<key>.toml` | one record per branch |
 | `tmp/<lifetime id>/<entry id>.toml` | one registered temp folder |
 | `versioned/` | the versioned layer, with its format number in `versioned/format`; only the version pinned on the integration branch uses it |
@@ -57,13 +60,41 @@ A process belongs to run `X` when `ATELIER_RUN=X`, or when `X` is an element of 
 So an outer run, the gate for one, finds what an inner atelier left behind. A step cannot set
 either variable (refused, 2).
 
+## Coalitions (macOS)
+
+On macOS each step is a launchd job (DESIGN §8.4) with its own resource coalition, which every
+process the step starts keeps (after `setsid`, a double fork or `env -i` too). There a process
+belongs to run `X` when its coalition is listed in `runs/X/coalitions`; the markers are still set,
+but this version does not look for them in its own runs. A coalition is written
+`<coalition id>@<boot session uuid>` (`kern.bootsessionuuid`): coalition ids only grow within a
+boot, and a coalition of another boot has no members.
+
+`runs/<run id>/coalitions` is text, one line per job, fields separated by one space:
+
+```text
+<coalition> <launchd label> [<later fields>...]
+```
+
+A step's line is appended before its program runs, to its run's file and to the file of every run
+named in its `ATELIER_RUNS` whose folder is in the same state, so an outer run also finds what a
+nested atelier left when that atelier died. The label is `atelier.<run id>.<n>` in `gui/<uid>` or
+`user/<uid>`; a job still loaded when the lock's next taker finds nothing alive is booted out.
+Lines this version cannot read are skipped. A run without the file (Linux, or an older version)
+is looked for by its markers.
+
+`probes/coalition-<uid>.toml`: `macos` (`<product version> (<build>)`), `passed` (RFC 3339 UTC),
+`atelier_version`. Written when the probe (a job that starts a sleeper with `setsid` and a double
+fork, then exits 3) found the sleeper by coalition, stopped it, and read exit status 3 from
+`launchctl print`. A record of another macOS version, or none, makes the next run probe again; a
+failed probe refuses (4) and writes nothing.
+
 ## Lock records
 
 `<name>.procs` is text. Each line is fields separated by one space, with no other whitespace:
 
 ```text
 run <run id> [<later fields>...]
-group <pgid> <run id> <leader start time> [<later fields>...]
+group <pgid> <run id> <leader start time> [<coalition> [<later fields>...]]
 ```
 
 - `run`: a run that holds, or held, the lock. It stays while processes carrying its marker may
@@ -74,6 +105,9 @@ group <pgid> <run id> <leader start time> [<later fields>...]
   - macOS: `<seconds>.<microseconds>` of `p_starttime` (`sysctl` `KERN_PROC_PID`);
   - Linux: `<start time in clock ticks after boot>@<boot id>`: field 22 of `/proc/<pid>/stat` and
     `/proc/sys/kernel/random/boot_id`.
+  - `<coalition>` (fifth field, macOS): the step job's coalition, `<id>@<boot session uuid>`
+    (above). The group's pgid is the job's pid. A line without it, or whose fifth field is not a
+    coalition, is a plain process group.
 - Empty lines are ignored. Any other line makes the record unreadable: the lock refuses (4), and
   the file is left as it is.
 
@@ -88,6 +122,8 @@ and writing it back under `locks/update/…/<same name>.lock`.
   pgid is not reallocated while its group has members). On Linux, a recorded boot id other than
   the current one means the group is gone.
 - A process is marked with a recorded run id (`run` lines and the run ids of `group` lines).
+- macOS: a `group` line with a coalition lives while that coalition has a live member; a recorded
+  run with a coalitions file lives while any coalition listed there has one.
 
 When nothing lives, the record is removed.
 
@@ -121,7 +157,7 @@ When nothing lives, the record is removed.
 | `ended` | string | RFC 3339 UTC |
 | `signal` | string, optional | `SIGTERM`, `SIGINT` or `SIGHUP` when a stop signal ended the run |
 | `failures` | array of strings | why the run failed |
-| `survivors` | array of strings | processes carrying the run's marker at its end |
+| `survivors` | array of strings | processes carrying the run's marker at its end (Linux; never signalled), or live members of its coalitions (macOS; stopped) |
 | `test_results` | string, optional | the per-test results, relative to the run folder |
 | `tests` | table, optional | `passed`, `failed`, `flaky` (failed, then passed when retried), `skipped`, `excluded` |
 | `steps` | array of tables | `name`, `status` (`passed`, `failed`, `left-processes`, `interrupted`, `not-started`), `exit`, `signal`, `log`, `left`, `unstoppable` |

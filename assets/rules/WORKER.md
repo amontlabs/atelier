@@ -26,6 +26,7 @@ You build one item, in one worktree, on one branch, named in your task.
 - Run long commands in the foreground. Stop every background command before your final report.
 
 ## Report (your final message, at most 400 words)
+When you end your turn, atelier's stop hook sends you back while a rebase is open, something is uncommitted, a background task is running, or your last message has no line starting `compile:`. Fix what it names, then report.
 1. Branch and last commit.
 2. What you built, in plain words.
 3. Tests you ran and their results; the `compile:` line.

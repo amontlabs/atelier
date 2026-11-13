@@ -17,8 +17,12 @@
 //!
 //! ```text
 //! run <run id> [<later fields>...]
-//! group <pgid> <run id> <leader start time, or -> [<later fields>...]
+//! group <pgid> <run id> <leader start time, or -> [<coalition> [<later fields>...]]
 //! ```
+//!
+//! On macOS a step is a launchd job: its group line carries the job's coalition, and the group
+//! lives while the coalition has a live member; a recorded run that has a coalitions file
+//! (`runs/<id>/coalitions`) is looked for by those coalitions instead of its marker.
 //!
 //! Later versions may append fields; this version keeps them when it rewrites the file. Any other
 //! non-empty line makes the record unreadable: taking the lock refuses (4) and names the file,

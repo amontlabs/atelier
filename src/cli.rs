@@ -325,6 +325,10 @@ pub fn run(cmd: Cmd, cwd: &Path) -> Result<Exit> {
             for line in changed {
                 println!("  {line}");
             }
+            println!(
+                "Codex runs the project's hooks ({}) only once you trust them: run /hooks in Codex in this project once.",
+                crate::hook::CODEX_HOOKS
+            );
             return Ok(Exit::Ok);
         }
         Cmd::Rules => {
