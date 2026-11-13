@@ -1,4 +1,4 @@
-//! The command line (DESIGN §3). Every command is declared; those outside module 3.1 run their
+//! The command line (DESIGN §3). Every command is declared; those not built yet run their
 //! preflight and then exit 2 with `not built yet`.
 
 use std::ffi::OsString;
@@ -280,6 +280,14 @@ pub fn run(cmd: Cmd, cwd: &Path) -> Result<Exit> {
         Cmd::Check { compile_only } => {
             let context = preflight::run(cwd, cmd.name(), cmd.needs())?;
             return crate::check::run(&context, *compile_only);
+        }
+        Cmd::Start { branch, on, path } => {
+            let ctx = preflight::run(cwd, cmd.name(), cmd.needs())?;
+            return crate::start::run(&ctx, cwd, branch, on.as_deref(), path.as_deref());
+        }
+        Cmd::Follow => {
+            let ctx = preflight::run(cwd, cmd.name(), cmd.needs())?;
+            return crate::follow::run(&ctx);
         }
         _ => {
             let _context = preflight::run(cwd, cmd.name(), cmd.needs())?;

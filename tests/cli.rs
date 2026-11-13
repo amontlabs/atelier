@@ -185,9 +185,7 @@ fn stub_commands_preflight_then_exit_2() {
     repo.write_settings(VERSION);
     repo.commit_all("pin");
     for (args, module) in [
-        (&["start", "a/b"][..], "3.3"),
-        (&["follow"], "3.3"),
-        (&["approve", "a", "abc"], "3.4"),
+        (&["approve", "a", "abc"][..], "3.4"),
         (&["merge", "a", "b"], "3.4"),
         (&["promote"], "3.4"),
         (&["tmp", "--", "true"], "3.5"),
