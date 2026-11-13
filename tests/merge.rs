@@ -2387,3 +2387,249 @@ fn a_red_on_another_machine_is_bisected_on_that_machine() {
         "everything ran on box"
     );
 }
+
+// ---------------------------------------------------------------------------------------------
+// 3.4 review, round 2
+
+#[test]
+fn r34b_a_rules_item_removing_a_platform_without_machine_merges() {
+    // OLD has a platform with no machine (no machines file); x deletes it. With or without a
+    // waiver for it, x merges: step 1 judges the settings the batch produces.
+    let other = other_platform();
+    let block = format!("\n[platforms.{other}]\nrun = [\"sh\", \"-c\", \"true\"]\n");
+    for waive in [true, false] {
+        let p = Proj::with_settings(&block);
+        let x = p.start("x", None);
+        let text = settings_text(&x).replace(&block, "");
+        let cx = commit_settings(&p, &x, &text, "drop a platform");
+        p.approve("x", &cx);
+        let out = if waive {
+            p.run(&["merge", "x", "--waive", other, "--reason", "gone"])
+        } else {
+            p.merge(&["x"])
+        };
+        assert_eq!(code(&out), 0, "waive {waive}: {}", both(&out));
+        if waive {
+            assert!(
+                stdout(&out).contains(&format!(
+                    "{other}: WAIVED (gone); the merged settings no longer have it"
+                )),
+                "{}",
+                both(&out)
+            );
+        }
+        p.assert_merged("x", &cx);
+    }
+    // A waiver for a platform of neither OLD's settings nor the merged ones is refused.
+    let p = Proj::new();
+    p.ready("feat", "a.txt", "a\n");
+    let out = p.run(&["merge", "feat", "--waive", other, "--reason", "no"]);
+    assert_eq!(code(&out), 4, "{}", both(&out));
+    assert!(
+        stderr(&out).contains(&format!("--waive {other}: not a platform of this project")),
+        "{}",
+        both(&out)
+    );
+}
+
+/// A `check.prepare` hook that appends `held` or `free` to `log`: whether this computer's machine
+/// lock is held while the check runs (flock, as atelier takes it).
+fn lock_probe(log: &Path) -> String {
+    format!(
+        "[[check.prepare]]\nname = \"lock\"\nrun = [\"perl\", \"-MFcntl=:flock\", \"-e\", \"open(my $f, '>>', \\\"$ENV{{HOME}}/.local/state/atelier/machine.lock\\\") or die $!; open(my $l, '>>', '{}') or die $!; print $l (flock($f, LOCK_EX | LOCK_NB) ? 'free' : 'held'), qq(\\\\n);\"]\n",
+        log.display()
+    )
+}
+
+#[test]
+fn r34b_every_local_run_holds_the_machine_lock() {
+    // No machines file: the gate and bisection's re-runs on this computer.
+    let log_dir = tempfile::tempdir().unwrap();
+    let log = log_dir.path().join("lock.log");
+    let p = Proj::with_settings(&lock_probe(&log));
+    let ca = p.ready("a", "a.txt", "a\n");
+    p.ready("b", "BROKEN", "b\n");
+    p.ready("c", "c.txt", "c\n");
+    // Another atelier holds the lock for a moment: the gate waits for it.
+    let lock_path = p.repo.home.join(".local/state/atelier/machine.lock");
+    fs::create_dir_all(lock_path.parent().unwrap()).unwrap();
+    let taken = p.base.join("taken");
+    let mut holder = std::process::Command::new("perl")
+        .args([
+            "-MFcntl=:flock",
+            "-e",
+            "open(my $f, '>>', $ARGV[0]) or die $!; flock($f, LOCK_EX) or die $!; open(my $t, '>', $ARGV[1]); close $t; sleep 3;",
+            lock_path.to_str().unwrap(),
+            taken.to_str().unwrap(),
+        ])
+        .spawn()
+        .unwrap();
+    wait_for("the other holder", || taken.exists());
+    let out = p.merge(&["a", "b", "c"]);
+    holder.wait().unwrap();
+    assert_eq!(code(&out), 1, "{}", both(&out));
+    let so = stdout(&out);
+    assert!(
+        so.contains("waiting for this computer's machine lock"),
+        "{so}"
+    );
+    assert!(so.contains("merged a"), "{so}");
+    p.assert_merged("a", &ca);
+    let lines: Vec<String> = fs::read_to_string(&log)
+        .unwrap()
+        .lines()
+        .map(str::to_owned)
+        .collect();
+    // The gate, prefixes a, b and a, the full gate of a.
+    assert_eq!(lines, ["held"; 4], "{so}");
+}
+
+/// x, approved: a rules item that pins atelier `pin`.
+fn pin_item(p: &Proj, pin: &str) -> String {
+    let x = p.start("x", None);
+    let text = settings_text(&x).replace(
+        &format!("atelier = \"{VERSION}\""),
+        &format!("atelier = \"{pin}\""),
+    );
+    let cx = commit(&x, ".atelier/atelier.toml", &text, &format!("pin {pin}"));
+    p.approve("x", &cx);
+    cx
+}
+
+#[test]
+fn r34b_a_pin_change_runs_the_new_pin_on_the_machine_and_is_checked_at_step_1() {
+    let p = Proj::new();
+    let env = with_box(&p);
+    pin_item(&p, "0.1.99");
+    let old = p.main_tip();
+    let here = this_platform();
+    // box has only this version: not ready, found at step 1, before anything merges.
+    let out = run_env(&p, &["merge", "x"], &env);
+    assert_eq!(code(&out), 3, "{}", both(&out));
+    assert!(
+        stderr(&out).contains(&format!(
+            "{here}: box not ready: atelier 0.1.99 is not installed there: run atelier machines init box with atelier 0.1.99"
+        )),
+        "{}",
+        both(&out)
+    );
+    assert!(runs_of_kind(&p, "gate").is_empty(), "nothing merged or ran");
+    assert_eq!(p.main_tip(), old);
+
+    // box gets 0.1.99 (a stand-in that reports that version); this computer does not have it,
+    // and needs it only for a platform it runs itself: box runs M's pin.
+    let bin = p
+        .base
+        .join("machines/box/.local/share/atelier/0.1.99/bin/atelier");
+    fs::create_dir_all(bin.parent().unwrap()).unwrap();
+    let used = p.base.join("pin-0.1.99-used");
+    fs::write(
+        &bin,
+        format!(
+            "#!/bin/sh\necho \"$@\" >> {used}\nif [ \"$1\" = remote-run ] && [ \"$2\" = probe ]; then {real} \"$@\" | sed 's/identity {VERSION} /identity 0.1.99 /'; exit 0; fi\nexec {real} \"$@\"\n",
+            used = used.display(),
+            real = atelier_bin().display()
+        ),
+    )
+    .unwrap();
+    use std::os::unix::fs::PermissionsExt;
+    fs::set_permissions(&bin, fs::Permissions::from_mode(0o755)).unwrap();
+    let out = run_env(&p, &["merge", "x"], &env);
+    let all = both(&out);
+    assert!(!all.contains("is not installed"), "{all}");
+    assert!(
+        stdout(&out).contains("  in the gate: x"),
+        "step 1 passed: {all}"
+    );
+    let calls = fs::read_to_string(&used).unwrap();
+    assert!(calls.contains("remote-run probe"), "{calls}");
+    assert!(calls.contains("remote-run run"), "box ran 0.1.99: {calls}");
+    // The stand-in is this version's program, which refuses a checkout pinning another one
+    // when the run starts; a real 0.1.99 runs it.
+    assert_eq!(code(&out), 3, "{all}");
+    assert!(
+        all.contains("box not ready: this checkout pins atelier 0.1.99"),
+        "{all}"
+    );
+}
+
+#[test]
+fn r34b_a_local_failure_cancels_the_other_machines_sessions() {
+    // This computer's platform fails; another platform runs on box, whose run never ends on
+    // its own (a stand-in that waits for its input to close).
+    let other = other_platform();
+    let here = this_platform();
+    let started = tempfile::tempdir().unwrap();
+    let flag = started.path().join("box-taken");
+    let ended = started.path().join("box-ended");
+    let p = Proj::with_settings(&format!(
+        "[[check.prepare]]\nname = \"after-box\"\nrun = [\"sh\", \"-c\", \"i=0; while [ ! -e {} ] && [ $i -lt 300 ]; do sleep 0.1; i=$((i+1)); done\"]\n\n[platforms.{other}]\nrun = [\"sh\", \"-c\", \"true\"]\n",
+        flag.display()
+    ));
+    let machines = p.base.join("machines");
+    let checkout = atelier::git::Checkout::find(p.main()).unwrap().unwrap();
+    let remote_checkout = machines.join(format!(
+        "box/checkouts/{}",
+        atelier::remote::project_id(&checkout)
+    ));
+    fs::create_dir_all(&remote_checkout).unwrap();
+    git(&remote_checkout, &["init", "-q"]);
+    let bin = machines.join(format!("box/.local/share/atelier/{VERSION}/bin/atelier"));
+    fs::create_dir_all(bin.parent().unwrap()).unwrap();
+    fs::write(
+        &bin,
+        format!(
+            "#!/bin/sh\nn=; prev=\nfor a in \"$@\"; do [ \"$prev\" = --nonce ] && n=$a; prev=$a; done\nt=\"atelier-remote-$n: \"\ncase \"$2\" in\nprobe) printf '%s\\n' \"${{t}}identity {id}\" \"${{t}}ready\" ;;\nrun) printf '%s\\n' \"${{t}}taken\" \"${{t}}run 20990101T0000Z-0000000000000001\"; touch {flag}; perl -e 'alarm 60; 1 while <STDIN>'; touch {ended} ;;\nesac\n",
+            id = atelier::source::identity(),
+            flag = flag.display(),
+            ended = ended.display()
+        ),
+    )
+    .unwrap();
+    use std::os::unix::fs::PermissionsExt;
+    fs::set_permissions(&bin, fs::Permissions::from_mode(0o755)).unwrap();
+    let file = p.repo.home.join(".config/atelier/machines.toml");
+    fs::create_dir_all(file.parent().unwrap()).unwrap();
+    fs::write(
+        &file,
+        format!(
+            "[machines.here]\nlocal = true\nplatform = \"{here}\"\npriority = 10\n\n[machines.box]\nssh = \"box\"\nplatform = \"{other}\"\npriority = 10\npath = [\"/usr/bin\", \"/bin\"]\ncheckouts = \"~/checkouts\"\n"
+        ),
+    )
+    .unwrap();
+    let env = vec![
+        (
+            "ATELIER_SSH".to_owned(),
+            Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("tests/fixtures/fake-ssh")
+                .to_string_lossy()
+                .into_owned(),
+        ),
+        (
+            "FAKE_SSH_ROOT".to_owned(),
+            machines.to_string_lossy().into_owned(),
+        ),
+    ];
+    p.ready("feat", "BROKEN", "x\n");
+    let old = p.main_tip();
+    let t = Instant::now();
+    let out = run_env(&p, &["merge", "feat"], &env);
+    let took = t.elapsed();
+    assert_eq!(code(&out), 1, "{}", both(&out));
+    let so = stdout(&out);
+    assert!(so.contains(&format!("  {other}: running on box")), "{so}");
+    assert!(so.contains(&format!("  {here}: FAILED")), "{so}");
+    assert!(
+        so.contains(&format!(
+            "  {other}: cancelled on box, run 20990101T0000Z-0000000000000001: the run on this computer failed"
+        )),
+        "{so}"
+    );
+    assert!(
+        took < Duration::from_secs(40),
+        "returned promptly: {took:?}"
+    );
+    assert_eq!(p.main_tip(), old);
+    // The session was closed: the run on box saw its input end.
+    wait_for("box's run to end", || ended.exists());
+}
