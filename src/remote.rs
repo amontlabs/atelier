@@ -675,19 +675,21 @@ impl Session {
     /// connection, which stops the remote run.
     pub fn finish(mut self) -> SessionEnd {
         let mut stopped = false;
-        loop {
+        let ssh_status = loop {
             while let Ok(ev) = self.events.try_recv() {
                 self.handle(ev);
             }
-            if let Ok(Some(_)) = self.child.try_wait() {
-                break;
+            match self.child.try_wait() {
+                Ok(Some(st)) => break Some(st),
+                Ok(None) => {}
+                Err(_) => break None,
             }
             if !stopped && signals::received().is_some() {
                 self.stop();
                 stopped = true;
             }
             sleep(Duration::from_millis(50));
-        }
+        };
         // The stream ends with the connection; with a stand-in for ssh, when the remote ends.
         let until = Instant::now() + Duration::from_secs(15);
         while !self.eof && Instant::now() < until {
@@ -745,7 +747,7 @@ impl Session {
         } else if let Some(e) = &self.error {
             failures.push(format!("{name}: {e}"));
             Verdict::Failed
-        } else if !self.done {
+        } else if connection_lost(self.done, ssh_status, &results) {
             let why = last_line(ssh_err.as_bytes());
             failures.push(if why.is_empty() {
                 format!("{name}: connection lost")
@@ -767,6 +769,22 @@ impl Session {
             failures,
         }
     }
+}
+
+/// The connection was lost when the session ended without `done`, when ssh itself failed (exit
+/// 255) or was killed, or when a remote run says so.
+fn connection_lost(
+    done: bool,
+    ssh: Option<std::process::ExitStatus>,
+    results: &[Option<RunResult>],
+) -> bool {
+    use std::os::unix::process::ExitStatusExt;
+    let ssh_failed = ssh.is_some_and(|s| s.code() == Some(255) || s.signal().is_some());
+    let remote_says = results.iter().flatten().any(|r| {
+        r.outcome == crate::runs::Outcome::Interrupted
+            && r.failures.iter().any(|f| f == "connection lost")
+    });
+    !done || ssh_failed || remote_says
 }
 
 /// Tries one remote machine for `job` (connect, preflight, push, take): the session, or why not.

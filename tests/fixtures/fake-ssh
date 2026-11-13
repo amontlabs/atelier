@@ -1,0 +1,79 @@
+#!/usr/bin/perl
+# A stand-in for ssh in atelier's tests: runs the remote command on this computer.
+#
+# The destination names a folder under $FAKE_SSH_ROOT, which is that "machine's" HOME; a missing
+# folder is a machine that does not answer (exit 255, as ssh). The command runs as ssh runs it,
+# `sh -c <command>` in HOME with a fresh environment. Its stdin is a pipe that only this process
+# writes, relaying its own stdin: when this process ends (killed included), the remote side reads
+# end-of-input, as when a connection is cut. Its stdout is relayed the same way, so the caller's
+# stream ends with this process. Sessions started with -tt append this process's pid
+# to $FAKE_SSH_ROOT/<destination>.tty-pids.
+use strict;
+use warnings;
+use IO::Select;
+use POSIX ":sys_wait_h";
+
+my $tty = 0;
+my @args = @ARGV;
+while (@args) {
+    my $a = $args[0];
+    if ($a eq '--') { shift @args; last; }
+    if ($a eq '-o') { shift @args; shift @args; next; }
+    if ($a =~ /^-t+$/) { $tty = 1; shift @args; next; }
+    if ($a =~ /^-[qT]$/) { shift @args; next; }
+    last;
+}
+my $dest = shift @args or die "fake-ssh: no destination\n";
+my $command = join(' ', @args);
+my $root = $ENV{FAKE_SSH_ROOT} or die "fake-ssh: FAKE_SSH_ROOT is not set\n";
+my $home = "$root/$dest";
+if (!-d $home) {
+    print STDERR "ssh: connect to host $dest port 22: Operation timed out\n";
+    exit 255;
+}
+if ($tty) {
+    open(my $f, '>>', "$root/$dest.tty-pids") or die;
+    print $f "$$\n";
+    close $f;
+}
+pipe(my $r, my $w) or die "pipe: $!";
+pipe(my $or, my $ow) or die "pipe: $!";
+my $pid = fork();
+die "fork: $!" unless defined $pid;
+if ($pid == 0) {
+    close $w;
+    close $or;
+    open(STDIN, '<&', $r) or die;
+    open(STDOUT, '>&', $ow) or die;
+    chdir $home or die;
+    my @env = ("HOME=$home", "PATH=/usr/bin:/bin:/usr/sbin:/sbin", "USER=" . ($ENV{USER} // ''),
+               "LOGNAME=" . ($ENV{LOGNAME} // ''), "TMPDIR=" . ($ENV{TMPDIR} // '/tmp'),
+               "GIT_CONFIG_NOSYSTEM=1");
+    exec('/usr/bin/env', '-i', @env, '/bin/sh', '-c', $command) or die "exec: $!";
+}
+close $r;
+close $ow;
+$w->autoflush(1);
+$| = 1;
+my $sel = IO::Select->new(\*STDIN, $or);
+my ($in_open, $out_open) = (1, 1);
+my $status;
+while (1) {
+    if (!defined $status) {
+        my $done = waitpid($pid, WNOHANG);
+        $status = $? if $done == $pid;
+    }
+    last if defined $status && !$out_open;
+    for my $fh ($sel->can_read(0.05)) {
+        my $buf;
+        my $n = sysread($fh, $buf, 4096);
+        if ($fh == $or) {
+            if (!$n) { $sel->remove($or); $out_open = 0; }
+            else { print STDOUT $buf; }
+        } else {
+            if (!$n) { $sel->remove(\*STDIN); close $w; $in_open = 0; }
+            else { print $w $buf; }
+        }
+    }
+}
+exit(($status & 127) ? 128 + ($status & 127) : ($status >> 8));

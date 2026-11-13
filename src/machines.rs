@@ -250,13 +250,13 @@ impl Skip {
     }
 }
 
-/// The candidates for `platform`, in the order they are tried, and the machines named by the
-/// project that are not candidates (with why).
+/// The machines for `platform` in the order they are tried: each a candidate, or a machine that
+/// is named but cannot run it (the project names it, or it lacks the GUI the platform asks for).
 pub fn candidates(
     file: &MachinesFile,
     platform: Platform,
     settings: &PlatformSettings,
-) -> (Vec<Candidate>, Vec<(String, Skip)>) {
+) -> Vec<std::result::Result<Candidate, (String, Skip)>> {
     // A machine of another platform is named only when the project named it.
     let consider =
         |name: &str, m: &Machine, named: bool| -> Option<std::result::Result<Candidate, Skip>> {
@@ -290,16 +290,10 @@ pub fn candidates(
             }
         }
     }
-    let mut out = Vec::new();
-    let mut excluded = Vec::new();
-    for (name, v) in verdicts {
-        match v {
-            Some(Ok(c)) => out.push(c),
-            Some(Err(skip)) => excluded.push((name, skip)),
-            None => {}
-        }
-    }
-    (out, excluded)
+    verdicts
+        .into_iter()
+        .filter_map(|(name, v)| v.map(|r| r.map_err(|skip| (name, skip))))
+        .collect()
 }
 
 /// What trying one machine gave.
@@ -331,15 +325,22 @@ pub struct Selection<T> {
 
 /// Tries the candidates in order (DESIGN §2.5). When none takes the run and at least one was
 /// only busy, waits for the first busy one that frees up, trying each again in turn; a busy
-/// machine that is then offline or not ready is dropped. `excluded` starts the list of skips.
+/// machine that is then offline or not ready is dropped. Machines that cannot run the platform
+/// are named in their place.
 pub fn select<P: Prober>(
-    candidates: &[Candidate],
-    excluded: Vec<(String, Skip)>,
+    candidates: &[std::result::Result<Candidate, (String, Skip)>],
     prober: &mut P,
 ) -> Selection<P::Taken> {
-    let mut skipped = excluded;
+    let mut skipped = Vec::new();
     let mut busy: Vec<&Candidate> = Vec::new();
     for c in candidates {
+        let c = match c {
+            Ok(c) => c,
+            Err(skip) => {
+                skipped.push(skip.clone());
+                continue;
+            }
+        };
         match prober.attempt(c) {
             Attempt::Taken(t) => {
                 return Selection {
@@ -558,8 +559,15 @@ priority = 1
         Platform::parse("linux-x86_64").unwrap()
     }
 
-    fn names(c: &[Candidate]) -> Vec<&str> {
-        c.iter().map(|c| c.name.as_str()).collect()
+    type Entries = Vec<std::result::Result<Candidate, (String, Skip)>>;
+
+    fn names(c: &Entries) -> Vec<String> {
+        c.iter()
+            .map(|e| match e {
+                Ok(c) => c.name.clone(),
+                Err((n, s)) => format!("{n} {}", s.reason()),
+            })
+            .collect()
     }
 
     /// Answers each machine from a script, one answer per attempt (the last one repeats), and
@@ -610,52 +618,43 @@ priority = 1
 
     #[test]
     fn candidates_follow_priority_and_leave_out_other_platforms() {
-        let (c, ex) = candidates(&file(LINUX), linux(), &platform(None, false));
+        let c = candidates(&file(LINUX), linux(), &platform(None, false));
         assert_eq!(names(&c), ["b", "c", "a"]);
-        assert!(ex.is_empty());
     }
 
     #[test]
     fn the_projects_order_overrides_priority_and_names_what_it_cannot_use() {
-        let (c, ex) = candidates(
+        let c = candidates(
             &file(LINUX),
             linux(),
             &platform(Some(&["a", "mac", "nope", "b"]), false),
         );
-        assert_eq!(names(&c), ["a", "b"]);
         assert_eq!(
-            ex,
-            vec![
-                ("mac".to_owned(), Skip::Excluded("is macos-aarch64".into())),
-                (
-                    "nope".to_owned(),
-                    Skip::Excluded("is not in machines.toml".into())
-                ),
+            names(&c),
+            [
+                "a",
+                "mac is macos-aarch64",
+                "nope is not in machines.toml",
+                "b"
             ]
         );
     }
 
     #[test]
     fn a_gui_platform_takes_only_machines_with_a_gui() {
-        let (c, ex) = candidates(&file(LINUX), linux(), &platform(None, true));
-        assert_eq!(names(&c), ["c"]);
-        assert_eq!(
-            ex.iter()
-                .map(|(n, s)| format!("{n} {}", s.reason()))
-                .collect::<Vec<_>>(),
-            ["b has no GUI", "a has no GUI"]
-        );
+        let c = candidates(&file(LINUX), linux(), &platform(None, true));
+        assert_eq!(names(&c), ["b has no GUI", "c", "a has no GUI"]);
     }
 
     #[test]
     fn the_first_machine_that_takes_the_run_wins_and_earlier_ones_are_named() {
-        let (c, ex) = candidates(&file(LINUX), linux(), &platform(None, false));
+        let c = candidates(&file(LINUX), linux(), &platform(None, false));
         let mut f = Fake::new(&[
             ("b", &["offline"]),
             ("c", &["node is v22, need v24."]),
             ("a", &["take"]),
         ]);
-        let s = select(&c, ex, &mut f);
+        let s = select(&c, &mut f);
         assert_eq!(s.taken.as_ref().unwrap().1, "a");
         assert_eq!(
             skips_text(&s.skipped),
@@ -666,13 +665,13 @@ priority = 1
 
     #[test]
     fn no_wait_when_nothing_was_only_busy() {
-        let (c, ex) = candidates(&file(LINUX), linux(), &platform(None, false));
+        let c = candidates(&file(LINUX), linux(), &platform(None, false));
         let mut f = Fake::new(&[
             ("b", &["offline"]),
             ("c", &["no checkout"]),
             ("a", &["offline"]),
         ]);
-        let s = select(&c, ex, &mut f);
+        let s = select(&c, &mut f);
         assert!(s.taken.is_none());
         assert_eq!(
             f.pauses, 0,
@@ -693,14 +692,14 @@ priority = 1
 
     #[test]
     fn waits_only_when_a_ready_machine_is_busy_and_takes_the_first_that_frees() {
-        let (c, ex) = candidates(&file(LINUX), linux(), &platform(None, false));
+        let c = candidates(&file(LINUX), linux(), &platform(None, false));
         // b busy twice then free; a busy throughout; c offline. b is retried first each round.
         let mut f = Fake::new(&[
             ("b", &["busy", "busy", "busy", "take"]),
             ("c", &["offline"]),
             ("a", &["busy"]),
         ]);
-        let s = select(&c, ex, &mut f);
+        let s = select(&c, &mut f);
         assert_eq!(s.taken.as_ref().unwrap().0.name, "b");
         assert_eq!(f.pauses, 3);
         assert_eq!(f.tried, ["b", "c", "a", "b", "a", "b", "a", "b"]);
@@ -710,22 +709,22 @@ priority = 1
 
     #[test]
     fn a_later_busy_machine_that_frees_first_is_taken() {
-        let (c, ex) = candidates(&file(LINUX), linux(), &platform(None, false));
+        let c = candidates(&file(LINUX), linux(), &platform(None, false));
         let mut f = Fake::new(&[
             ("b", &["busy"]),
             ("c", &["busy", "take"]),
             ("a", &["offline"]),
         ]);
-        let s = select(&c, ex, &mut f);
+        let s = select(&c, &mut f);
         assert_eq!(s.taken.as_ref().unwrap().0.name, "c");
         assert_eq!(skips_text(&s.skipped), "b busy, a offline");
     }
 
     #[test]
     fn a_busy_machine_that_goes_offline_while_waited_for_ends_the_wait() {
-        let (c, ex) = candidates(&file(LINUX), linux(), &platform(Some(&["b", "a"]), false));
+        let c = candidates(&file(LINUX), linux(), &platform(Some(&["b", "a"]), false));
         let mut f = Fake::new(&[("b", &["busy", "offline"]), ("a", &["busy", "x"])]);
-        let s = select(&c, ex, &mut f);
+        let s = select(&c, &mut f);
         assert!(s.taken.is_none());
         assert_eq!(f.pauses, 1);
         assert_eq!(skips_text(&s.skipped), "b offline, a not ready: x");
@@ -733,10 +732,10 @@ priority = 1
 
     #[test]
     fn a_stop_while_waiting_ends_without_a_machine() {
-        let (c, ex) = candidates(&file(LINUX), linux(), &platform(None, false));
+        let c = candidates(&file(LINUX), linux(), &platform(None, false));
         let mut f = Fake::new(&[("b", &["busy"]), ("c", &["busy"]), ("a", &["busy"])]);
         f.max_pauses = 2;
-        let s = select(&c, ex, &mut f);
+        let s = select(&c, &mut f);
         assert!(s.taken.is_none());
         assert_eq!(f.pauses, 3);
         assert_eq!(skips_text(&s.skipped), "b busy, c busy, a busy");

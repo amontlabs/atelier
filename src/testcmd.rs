@@ -255,7 +255,7 @@ fn run_platform(
     job: &Job,
 ) -> Result<PlatformReport> {
     let ps = jobs::platform_settings(&ctx.settings, job.platform)?;
-    let (cands, excluded) = machines::candidates(file, job.platform, ps);
+    let cands = machines::candidates(file, job.platform, ps);
     let mut run = Run::start(
         &ctx.state,
         LockKey::worktree(&ctx.checkout),
@@ -274,7 +274,7 @@ fn run_platform(
         run_dir: run.dir().to_path_buf(),
         told: false,
     };
-    let selection = machines::select(&cands, excluded, &mut prober);
+    let selection = machines::select(&cands, &mut prober);
     let skipped = selection.skipped;
     let run_dir = run.dir().to_path_buf();
     let id = run.id().to_owned();
