@@ -1472,3 +1472,818 @@ fn bisection_reruns_the_failed_tests_by_name_on_a_rust_workspace() {
     assert_eq!(p.record("a").state, BranchState::Merged);
     assert_eq!(p.record("b").state, BranchState::Active);
 }
+
+// ---------------------------------------------------------------------------------------------
+// 3.4 review, round 1: each probe of atelier-3.4-review.md, and the owner's decisions
+
+fn other_platform() -> &'static str {
+    if this_platform() == "linux-x86_64" {
+        "macos-aarch64"
+    } else {
+        "linux-x86_64"
+    }
+}
+
+/// Writes the settings in a branch's worktree, regenerates the rules there and commits.
+fn commit_settings(p: &Proj, wt: &Path, text: &str, msg: &str) -> String {
+    fs::write(wt.join(".atelier/atelier.toml"), text).unwrap();
+    let out = p.repo.atelier_in(wt, &["rules"]);
+    assert_eq!(code(&out), 0, "rules: {}", both(&out));
+    git(wt, &["add", "-A"]);
+    git(wt, &["commit", "-q", "-m", msg]);
+    git(wt, &["rev-parse", "HEAD"])
+}
+
+fn settings_text(dir: &Path) -> String {
+    fs::read_to_string(dir.join(".atelier/atelier.toml")).unwrap()
+}
+
+/// The ids of the runs of `kind` in the main checkout's state.
+fn runs_of_kind(p: &Proj, kind: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    for e in fs::read_dir(p.main().join(".git/atelier/runs"))
+        .unwrap()
+        .flatten()
+    {
+        if fs::read_to_string(e.path().join("run.toml"))
+            .is_ok_and(|t| t.contains(&format!("kind = \"{kind}\"")))
+        {
+            out.push(e.file_name().to_string_lossy().into_owned());
+        }
+    }
+    out
+}
+
+#[test]
+fn r1_a_merge_driver_other_than_gits_own_for_a_path_both_sides_changed_is_refused() {
+    let p = Proj::with_files(&[("x.txt", "base\n")], "");
+    let attributes = p.main().join(".git/info/attributes");
+    fs::create_dir_all(attributes.parent().unwrap()).unwrap();
+    fs::write(&attributes, "x.txt merge=keepmine\n").unwrap();
+    git(p.main(), &["config", "merge.keepmine.driver", "true"]);
+    p.ready("a", "x.txt", "from a\n");
+    p.ready("b", "x.txt", "from b\n");
+    let old = p.main_tip();
+    // The probe: the driver kept a's side and dropped b's without a word.
+    let out = p.merge(&["a", "b"]);
+    assert_eq!(code(&out), 4, "{}", both(&out));
+    let e = stderr(&out);
+    assert!(
+        e.contains("merging b: paths changed on both sides would be merged by a merge driver other than git's own"),
+        "{e}"
+    );
+    assert!(e.contains("x.txt: merge driver \"keepmine\""), "{e}");
+    assert_eq!(p.main_tip(), old);
+
+    // merge.default naming it, for a path with no merge attribute.
+    fs::write(&attributes, "").unwrap();
+    git(p.main(), &["config", "merge.default", "keepmine"]);
+    let out = p.merge(&["a", "b"]);
+    assert_eq!(code(&out), 4, "{}", both(&out));
+    assert!(
+        stderr(&out).contains("x.txt: merge driver \"keepmine\""),
+        "{}",
+        both(&out)
+    );
+    git(p.main(), &["config", "--unset", "merge.default"]);
+
+    // A built-in name the configuration redefines.
+    fs::write(&attributes, "x.txt merge=union\n").unwrap();
+    git(p.main(), &["config", "merge.union.driver", "true"]);
+    let out = p.merge(&["a", "b"]);
+    assert_eq!(code(&out), 4, "{}", both(&out));
+    assert!(
+        stderr(&out).contains("which the git configuration redefines (merge.union.driver)"),
+        "{}",
+        both(&out)
+    );
+    git(p.main(), &["config", "--unset", "merge.union.driver"]);
+
+    // A global attributes file is not read by the gate: git's own merge conflicts.
+    fs::write(&attributes, "").unwrap();
+    let global = p.base.join("global-attributes");
+    fs::write(&global, "* merge=keepmine\n").unwrap();
+    git(
+        p.main(),
+        &["config", "core.attributesFile", global.to_str().unwrap()],
+    );
+    let out = p.merge(&["a", "b"]);
+    assert_eq!(code(&out), 5, "{}", both(&out));
+    assert!(
+        stderr(&out).contains("conflict: b with a"),
+        "{}",
+        both(&out)
+    );
+    assert_eq!(p.main_tip(), old);
+
+    // git's own union merge is allowed.
+    fs::write(&attributes, "x.txt merge=union\n").unwrap();
+    let out = p.merge(&["a", "b"]);
+    assert_eq!(code(&out), 0, "{}", both(&out));
+    let x = fs::read_to_string(p.main().join("x.txt")).unwrap();
+    assert!(x.contains("from a") && x.contains("from b"), "{x}");
+}
+
+#[test]
+fn r2_a_rules_item_never_has_a_conflict_settled() {
+    // The probe: x removes the regen hook and commits a hand-edited gen.txt while a lands
+    // with gen.txt regenerated; the conflict was settled with x's side and no hook ran.
+    let p = Proj::with_files(&[("parts/0", "zero\n"), ("gen.txt", "zero\n")], REGEN);
+    let x = p.start("x", None);
+    fs::write(x.join("gen.txt"), "zero\nX-HAND\n").unwrap();
+    let without = settings_text(&x).replace(REGEN, "");
+    let cx = commit_settings(&p, &x, &without, "no regen hook, hand edit");
+    p.approve("x", &cx);
+    let a = p.start("a", None);
+    fs::write(a.join("parts/a"), "a\n").unwrap();
+    let ca = commit(&a, "gen.txt", "zero\na\n", "a");
+    p.approve("a", &ca);
+    let out = p.merge(&["a"]);
+    assert_eq!(code(&out), 0, "{}", both(&out));
+    let old = p.main_tip();
+    let out = p.merge(&["x"]);
+    assert_eq!(code(&out), 5, "{}", both(&out));
+    assert!(
+        stderr(&out).contains("conflict: x with main\n  gen.txt"),
+        "{}",
+        both(&out)
+    );
+    assert!(
+        !stdout(&out).contains("settled with x's side"),
+        "{}",
+        both(&out)
+    );
+    assert_eq!(p.main_tip(), old);
+}
+
+#[test]
+fn r2_regenerates_comes_from_the_committed_settings_not_the_main_checkouts_file() {
+    let p = Proj::with_files(&[("parts/0", "zero\n"), ("gen.txt", "zero\n")], "");
+    let a = p.start("a", None);
+    fs::write(a.join("parts/a"), "a\n").unwrap();
+    let ca = commit(&a, "gen.txt", "zero\na\n", "a");
+    let b = p.start("b", None);
+    fs::write(b.join("parts/b"), "b\n").unwrap();
+    let cb = commit(&b, "gen.txt", "zero\nb\n", "b");
+    p.approve("a", &ca);
+    p.approve("b", &cb);
+    // An uncommitted edit in the main checkout names gen.txt.
+    let settings = p.main().join(".atelier/atelier.toml");
+    let mut text = fs::read_to_string(&settings).unwrap();
+    text.push_str(REGEN);
+    fs::write(&settings, text).unwrap();
+    let out = p.merge(&["a", "b"]);
+    assert_eq!(code(&out), 5, "{}", both(&out));
+    assert!(
+        stderr(&out).contains("conflict: b with a (earlier in this batch)\n  gen.txt"),
+        "{}",
+        both(&out)
+    );
+}
+
+#[test]
+fn r2_a_regenerated_path_its_hook_does_not_rewrite_is_red_and_nobody_is_blamed() {
+    // The hook names gen.txt and commits, but never writes it (a generator that skips work):
+    // the incoming side would land as it is.
+    let lazy = "[[merge.after]]\nname = \"regen\"\nrun = [\"true\"]\ncommit = \"Regenerate gen.txt\"\nregenerates = [\"gen.txt\"]\n";
+    let p = Proj::with_files(&[("parts/0", "zero\n"), ("gen.txt", "zero\n")], lazy);
+    let a = p.start("a", None);
+    fs::write(a.join("parts/a"), "a\n").unwrap();
+    let ca = commit(&a, "gen.txt", "zero\na\n", "a");
+    let b = p.start("b", None);
+    fs::write(b.join("parts/b"), "b\n").unwrap();
+    let cb = commit(&b, "gen.txt", "zero\nb\n", "b");
+    p.approve("a", &ca);
+    p.approve("b", &cb);
+    let old = p.main_tip();
+    let out = p.merge(&["a", "b"]);
+    assert_eq!(code(&out), 1, "{}", both(&out));
+    let so = stdout(&out);
+    assert!(
+        so.contains("conflict in gen.txt settled with b's side"),
+        "{so}"
+    );
+    assert!(
+        so.contains("merge.after regen did not regenerate gen.txt as merged"),
+        "{so}"
+    );
+    // Review 6: a RED that is no platform's failure is not searched.
+    assert!(
+        so.contains("merge: no search: the RED is not a platform's failure"),
+        "{so}"
+    );
+    assert!(so.contains("no branch is blamed"), "{so}");
+    assert!(!so.contains("breaks"), "{so}");
+    assert_eq!(p.main_tip(), old);
+    assert!(p.approval("a").is_some() && p.approval("b").is_some());
+    // What atelier removed to run the hook again is back: the gate is clean.
+    assert_eq!(git(&p.gate(), &["status", "--porcelain"]), "");
+}
+
+#[test]
+fn r3_the_promotion_push_runs_no_hook_and_no_signing() {
+    let p = Proj::new();
+    let c = p.ready("feat", "a.txt", "a\n");
+    let hooks = p.main().join(".git/hooks");
+    fs::create_dir_all(&hooks).unwrap();
+    let write_hook = |name: &str, body: &str| {
+        let f = hooks.join(name);
+        fs::write(&f, format!("#!/bin/sh\n{body}\n")).unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&f, fs::Permissions::from_mode(0o755)).unwrap();
+    };
+    // A pre-push hook that edits a tracked file and fails; receive hooks that refuse; a
+    // reference-transaction hook that rejects main.
+    write_hook("pre-push", "echo PRE-PUSH-RAN >> README\nexit 1");
+    write_hook("pre-receive", "exit 1");
+    write_hook("update", "exit 1");
+    write_hook(
+        "reference-transaction",
+        "[ \"$1\" = prepared ] || exit 0\nif grep -q ' refs/heads/main$'; then exit 1; fi\nexit 0",
+    );
+    git(p.main(), &["config", "push.gpgSign", "true"]);
+    let out = p.merge(&["feat"]);
+    assert_eq!(code(&out), 0, "{}", both(&out));
+    p.assert_merged("feat", &c);
+    assert_eq!(
+        fs::read_to_string(p.main().join("README")).unwrap(),
+        "hello\n"
+    );
+    assert_eq!(git(p.main(), &["status", "--porcelain"]), "");
+}
+
+#[test]
+fn r3_the_empty_hooks_folder_must_stay_empty() {
+    let p = Proj::new();
+    let c = p.ready("feat", "a.txt", "a\n");
+    let empty = p.main().join(".git/atelier/empty-hooks");
+    fs::create_dir_all(&empty).unwrap();
+    fs::write(empty.join("pre-receive"), "#!/bin/sh\nexit 1\n").unwrap();
+    let out = p.merge(&["feat"]);
+    assert_eq!(code(&out), 4, "{}", both(&out));
+    assert!(
+        stderr(&out).contains("must stay empty") && stderr(&out).contains("pre-receive"),
+        "{}",
+        both(&out)
+    );
+    let r = p.promotion().expect("the record is kept");
+    assert!(r.push_started.is_none(), "no push started");
+    fs::remove_file(empty.join("pre-receive")).unwrap();
+    let out = p.run(&["promote"]);
+    assert_eq!(code(&out), 0, "{}", both(&out));
+    p.assert_merged("feat", &c);
+}
+
+/// A branch whose commit replaces OLD's tracked paths as `change` does, merged alone; returns
+/// the merge's output.
+fn replace_and_merge(p: &Proj, change: impl FnOnce(&Path)) -> (Output, String) {
+    let wt = p.start("feat", None);
+    change(&wt);
+    git(&wt, &["add", "-A"]);
+    git(&wt, &["commit", "-q", "-m", "replace"]);
+    let c = git(&wt, &["rev-parse", "HEAD"]);
+    p.approve("feat", &c);
+    (p.merge(&["feat"]), c)
+}
+
+#[test]
+fn r4_a_file_that_becomes_a_folder_is_promoted() {
+    let p = Proj::with_files(&[("foo", "file\n")], "");
+    let (out, c) = replace_and_merge(&p, |wt| {
+        fs::remove_file(wt.join("foo")).unwrap();
+        fs::create_dir_all(wt.join("foo")).unwrap();
+        fs::write(wt.join("foo/bar"), "bar\n").unwrap();
+    });
+    assert_eq!(code(&out), 0, "{}", both(&out));
+    p.assert_merged("feat", &c);
+    assert_eq!(
+        fs::read_to_string(p.main().join("foo/bar")).unwrap(),
+        "bar\n"
+    );
+    assert_eq!(git(p.main(), &["status", "--porcelain"]), "");
+}
+
+#[test]
+fn r4_a_folder_that_becomes_a_file_is_promoted() {
+    let p = Proj::with_files(&[("d/x", "x\n"), ("d/y/z", "z\n")], "");
+    let (out, c) = replace_and_merge(&p, |wt| {
+        fs::remove_dir_all(wt.join("d")).unwrap();
+        fs::write(wt.join("d"), "now a file\n").unwrap();
+    });
+    assert_eq!(code(&out), 0, "{}", both(&out));
+    p.assert_merged("feat", &c);
+    assert_eq!(
+        fs::read_to_string(p.main().join("d")).unwrap(),
+        "now a file\n"
+    );
+    assert_eq!(git(p.main(), &["status", "--porcelain"]), "");
+}
+
+#[test]
+fn r4_a_folder_that_becomes_a_file_waits_while_it_holds_an_ignored_file() {
+    let p = Proj::with_files(&[("d/x", "x\n")], "");
+    fs::write(p.main().join("d/keep.ignored"), "mine\n").unwrap();
+    let (out, _) = replace_and_merge(&p, |wt| {
+        fs::remove_dir_all(wt.join("d")).unwrap();
+        fs::write(wt.join("d"), "now a file\n").unwrap();
+    });
+    assert_eq!(code(&out), 7, "{}", both(&out));
+    assert!(
+        stdout(&out)
+            .contains("d: a folder is there, where the merge adds a file, holding d/keep.ignored"),
+        "{}",
+        both(&out)
+    );
+    assert_eq!(
+        fs::read_to_string(p.main().join("d/keep.ignored")).unwrap(),
+        "mine\n",
+        "kept"
+    );
+}
+
+#[test]
+fn r4_a_case_only_rename_is_promoted() {
+    let p = Proj::with_files(&[("Readme.md", "r\n")], "");
+    let fold = fs::symlink_metadata(p.main().join(".GIT")).is_ok();
+    if !fold {
+        // On a volume that tells case apart, the two names are two files and nothing obstructs.
+        eprintln!("this volume tells case apart: the rename is two paths");
+    }
+    let (out, c) = replace_and_merge(&p, |wt| {
+        git(wt, &["mv", "Readme.md", "README.md"]);
+    });
+    assert_eq!(code(&out), 0, "{}", both(&out));
+    p.assert_merged("feat", &c);
+    let names: Vec<String> = fs::read_dir(p.main())
+        .unwrap()
+        .flatten()
+        .map(|e| e.file_name().to_string_lossy().into_owned())
+        .collect();
+    assert!(names.iter().any(|n| n == "README.md"), "{names:?}");
+    assert!(!names.iter().any(|n| n == "Readme.md"), "{names:?}");
+    assert_eq!(git(p.main(), &["status", "--porcelain"]), "");
+}
+
+#[test]
+fn r5_a_prefix_that_leaves_the_gate_unclean_stops_the_search() {
+    // The hook writes stray.txt only on the prefix a, b.
+    let p = Proj::with_settings(
+        "[[merge.after]]\nname = \"scribble\"\nrun = [\"sh\", \"-c\", \"if [ -e b.txt ] && [ ! -e BROKEN ]; then echo x > stray.txt; fi\"]\n",
+    );
+    p.ready("a", "a.txt", "a\n");
+    p.ready("b", "b.txt", "b\n");
+    p.ready("c", "BROKEN", "c\n");
+    let old = p.main_tip();
+    let out = p.merge(&["a", "b", "c"]);
+    assert_eq!(code(&out), 1, "{}", both(&out));
+    let so = stdout(&out);
+    assert!(so.contains("merge: RED"), "{so}");
+    assert!(
+        so.contains("the search stopped (prefix a, b: the gate is not clean after its merge.after hooks: stray.txt (untracked)"),
+        "{so}"
+    );
+    assert!(so.contains("the RED verdict stands"), "{so}");
+    assert!(!so.contains("prefix a:"), "no shorter prefix: {so}");
+    assert!(!so.contains(" breaks: "), "nobody blamed: {so}");
+    assert_eq!(p.main_tip(), old);
+    assert!(
+        p.gate().join("stray.txt").is_file(),
+        "atelier deletes nothing"
+    );
+}
+
+#[test]
+fn r7_no_recorded_push_group_means_git_never_ran() {
+    let p = Proj::new();
+    let (c, rec) = pending(&p);
+    let mut r = rec.clone();
+    r.push_started = Some("2026-11-13T10:00:00Z".into());
+    r.push_pgid = None;
+    r.push_ended = None;
+    p.write_promotion(&r);
+    // The owner's edit, which once read as an interrupted promotion.
+    fs::write(p.main().join("README"), "owner\n").unwrap();
+    let out = p.run(&["promote"]);
+    assert_eq!(code(&out), 7, "{}", both(&out));
+    assert!(
+        !stderr(&out).contains("interrupted"),
+        "not an interruption: {}",
+        both(&out)
+    );
+    assert!(
+        stdout(&out).contains("main checkout has changes: README"),
+        "{}",
+        both(&out)
+    );
+    assert_eq!(
+        fs::read_to_string(p.main().join("README")).unwrap(),
+        "owner\n"
+    );
+    git(p.main(), &["checkout", "--", "README"]);
+    let out = p.run(&["promote"]);
+    assert_eq!(code(&out), 0, "{}", both(&out));
+    p.assert_merged("feat", &c);
+}
+
+#[test]
+fn r7_a_clean_refusal_by_git_ends_the_push_even_when_the_checkout_changed() {
+    let p = Proj::new();
+    let (c, _) = pending(&p);
+    // A `git` whose first `read-tree` (the push writing the files) edits a tracked file and
+    // fails: git refuses the ref, and the checkout changed meanwhile.
+    let real = git(p.main(), &["--exec-path"]);
+    let shim = p.base.join("shim");
+    fs::create_dir_all(&shim).unwrap();
+    let mark = p.base.join("refused-once");
+    let readme = p.main().join("README");
+    let script = format!(
+        "#!/bin/sh\nfor a in \"$@\"; do if [ \"$a\" = read-tree ] && [ ! -e {mark} ]; then touch {mark}; echo owner > {readme}; exit 1; fi; done\nexec {real}/git \"$@\"\n",
+        mark = mark.display(),
+        readme = readme.display()
+    );
+    fs::write(shim.join("git"), script).unwrap();
+    use std::os::unix::fs::PermissionsExt;
+    fs::set_permissions(shim.join("git"), fs::Permissions::from_mode(0o755)).unwrap();
+    let out = p.repo.atelier_env(
+        p.main(),
+        &["promote"],
+        &[("GIT_EXEC_PATH", shim.to_str().unwrap())],
+    );
+    assert_eq!(code(&out), 7, "{}", both(&out));
+    assert!(mark.exists(), "git refused once");
+    assert!(
+        !stderr(&out).contains("interrupted"),
+        "a refusal is not an interruption: {}",
+        both(&out)
+    );
+    let r = p.promotion().unwrap();
+    assert!(r.push_ended.is_some(), "the push ended: {r:?}");
+    git(p.main(), &["checkout", "--", "README"]);
+    let out = p.run(&["promote"]);
+    assert_eq!(code(&out), 0, "{}", both(&out));
+    p.assert_merged("feat", &c);
+}
+
+#[test]
+fn r8_a_branch_that_moved_during_the_gate_stays_active_and_says_so() {
+    // The hook, once, adds a commit to feat in its worktree while the gate runs.
+    let p = Proj::with_settings(
+        "[[merge.after]]\nname = \"meanwhile\"\nrun = [\"sh\", \"-c\", \"[ -e ../moved ] && exit 0; touch ../moved; echo later > ../wt-feat/later.txt; git -C ../wt-feat add later.txt; git -C ../wt-feat -c core.hooksPath=/dev/null commit -q -m later\"]\n",
+    );
+    let c = p.ready("feat", "a.txt", "a\n");
+    let out = p.merge(&["feat"]);
+    assert_eq!(code(&out), 0, "{}", both(&out));
+    let so = stdout(&out);
+    let tip = git(&p.wt("feat"), &["rev-parse", "HEAD"]);
+    assert_ne!(tip, c);
+    assert!(
+        so.contains(&format!("merged feat {}", short(p.main(), &c))),
+        "{so}"
+    );
+    assert!(
+        so.contains(&format!(
+            "feat moved to {} after its approval at {}: its later commits are not merged; it stays active",
+            short(p.main(), &tip),
+            short(p.main(), &c)
+        )),
+        "{so}"
+    );
+    let rec = p.record("feat");
+    assert_eq!(rec.state, BranchState::Active);
+    assert!(
+        MergeFacts::read(&rec).unwrap().is_none(),
+        "clean trusts nothing"
+    );
+    assert!(
+        p.merge_lines()
+            .iter()
+            .any(|l| l.branch == "feat" && l.commit == c)
+    );
+    assert!(p.approval("feat").is_none(), "the approval of {c} is used");
+    assert!(git(p.main(), &["merge-base", "--is-ancestor", &c, "main"]).is_empty());
+
+    // The branch stays usable: follow, approve, merge.
+    let out = p.repo.atelier_in(&p.wt("feat"), &["follow"]);
+    assert_eq!(code(&out), 0, "follow: {}", both(&out));
+    let t2 = git(&p.wt("feat"), &["rev-parse", "HEAD"]);
+    p.approve("feat", &t2);
+    let out = p.merge(&["feat"]);
+    assert_eq!(code(&out), 0, "{}", both(&out));
+    p.assert_merged("feat", &t2);
+    assert!(p.main().join("later.txt").is_file());
+}
+
+#[test]
+fn r9_the_inner_check_is_the_run_the_gate_named_not_a_nested_one() {
+    // A check.prepare hook runs atelier itself, under a run id that sorts first.
+    let bin = atelier_bin();
+    let p = Proj::with_settings(&format!(
+        "[[check.prepare]]\nname = \"nested\"\nrun = [\"sh\", \"-c\", \"cd ../repo && ATELIER_RUN_ID=20000101T0000Z-0000000000000000 {} check --compile-only >/dev/null 2>&1; true\"]\n",
+        bin.display()
+    ));
+    p.ready("feat", "a.txt", "a\n");
+    let out = p.merge(&["feat"]);
+    assert_eq!(code(&out), 0, "{}", both(&out));
+    let so = stdout(&out);
+    assert!(
+        p.main()
+            .join(".git/atelier/runs/20000101T0000Z-0000000000000000")
+            .is_dir(),
+        "the nested run took the id: {so}"
+    );
+    let line = so
+        .lines()
+        .find(|l| l.contains("PASS on this computer (check run "))
+        .expect("the platform line");
+    let id = line
+        .rsplit("check run ")
+        .next()
+        .unwrap()
+        .trim_end_matches(')');
+    assert_ne!(id, "20000101T0000Z-0000000000000000", "{so}");
+    assert!(runs_of_kind(&p, "check").contains(&id.to_owned()), "{so}");
+}
+
+#[test]
+fn r10_a_platform_the_merged_settings_add_is_checked_for_a_machine_before_the_check() {
+    let other = other_platform();
+    let p = Proj::new();
+    let x = p.start("x", None);
+    let mut text = settings_text(&x);
+    text.push_str(&format!(
+        "\n[platforms.{other}]\nrun = [\"sh\", \"-c\", \"true\"]\n"
+    ));
+    let cx = commit_settings(&p, &x, &text, "another platform");
+    p.approve("x", &cx);
+    let old = p.main_tip();
+    let out = p.merge(&["x"]);
+    assert_eq!(code(&out), 3, "{}", both(&out));
+    assert!(
+        stderr(&out).contains(&format!("{other}: no machine")),
+        "{}",
+        both(&out)
+    );
+    assert!(runs_of_kind(&p, "check").is_empty(), "no check ran");
+    assert_eq!(p.main_tip(), old);
+    // Its waiver is accepted: the merged settings name the platform.
+    let out = p.run(&["merge", "x", "--waive", other, "--reason", "away"]);
+    assert_eq!(code(&out), 0, "{}", both(&out));
+    assert!(stdout(&out).contains("rules changed"), "{}", both(&out));
+}
+
+#[test]
+fn r10_waivers_repeat_each_with_its_reason() {
+    let others: Vec<&str> = ["linux-x86_64", "linux-aarch64", "macos-x86_64"]
+        .into_iter()
+        .filter(|p| *p != this_platform())
+        .take(2)
+        .collect();
+    let p = Proj::with_settings(&format!(
+        "\n[platforms.{}]\nrun = [\"sh\", \"-c\", \"true\"]\n\n[platforms.{}]\nrun = [\"sh\", \"-c\", \"true\"]\n",
+        others[0], others[1]
+    ));
+    let c = p.ready("feat", "a.txt", "a\n");
+    let out = p.run(&["merge", "feat", "--waive", others[0], "--reason", "one"]);
+    assert_eq!(code(&out), 3, "{}", both(&out));
+    let out = p.run(&[
+        "merge", "feat", "--waive", others[0], "--waive", others[1], "--reason", "one",
+    ]);
+    assert_eq!(code(&out), 2, "{}", both(&out));
+    let out = p.run(&[
+        "merge", "feat", "--waive", others[0], "--reason", "one", "--waive", others[1], "--reason",
+        "two",
+    ]);
+    assert_eq!(code(&out), 0, "{}", both(&out));
+    let so = stdout(&out);
+    assert!(so.contains(&format!("{} WAIVED (one)", others[0])), "{so}");
+    assert!(so.contains(&format!("{} WAIVED (two)", others[1])), "{so}");
+    p.assert_merged("feat", &c);
+}
+
+#[test]
+fn r10_a_tmp_in_the_branchs_worktree_does_not_hold_up_the_merge() {
+    let p = Proj::new();
+    let c = p.ready("feat", "a.txt", "a\n");
+    let started = p.base.join("tmp-started");
+    let mut child = p
+        .repo
+        .atelier_cmd(
+            &p.wt("feat"),
+            &[
+                "tmp",
+                "--",
+                "sh",
+                "-c",
+                &format!("touch {}; sleep 20", started.display()),
+            ],
+            &[],
+        )
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .unwrap();
+    wait_for("tmp to start", || started.exists());
+    let t = Instant::now();
+    let out = p.merge(&["feat"]);
+    let took = t.elapsed();
+    let _ = child.kill();
+    let _ = child.wait();
+    assert_eq!(code(&out), 0, "{}", both(&out));
+    p.assert_merged("feat", &c);
+    assert!(
+        took < Duration::from_secs(10),
+        "no wait for the lock: {took:?}"
+    );
+}
+
+#[test]
+fn a_merged_commit_whose_pinned_atelier_is_not_installed_is_refused() {
+    let p = Proj::new();
+    let x = p.start("x", None);
+    let text =
+        settings_text(&x).replace(&format!("atelier = \"{VERSION}\""), "atelier = \"0.1.99\"");
+    // Its rules cannot be regenerated here: 0.1.99 is not installed.
+    fs::write(x.join(".atelier/atelier.toml"), &text).unwrap();
+    let cx = commit(&x, ".atelier/atelier.toml", &text, "pin 0.1.99");
+    p.approve("x", &cx);
+    let old = p.main_tip();
+    let out = p.merge(&["x"]);
+    assert_eq!(code(&out), 4, "{}", both(&out));
+    assert!(
+        stderr(&out).contains("atelier 0.1.99, pinned by the merged commit"),
+        "{}",
+        both(&out)
+    );
+    assert!(stderr(&out).contains("is not installed"), "{}", both(&out));
+    assert_eq!(p.main_tip(), old);
+}
+
+#[test]
+fn follow_settles_a_conflict_only_in_regenerated_paths_with_the_branchs_side() {
+    let p = Proj::with_files(&[("parts/0", "zero\n"), ("gen.txt", "zero\n")], REGEN);
+    let wt = p.start("feat", None);
+    fs::write(wt.join("parts/f"), "f\n").unwrap();
+    commit(&wt, "gen.txt", "zero\nf\n", "feat");
+    p.repo.write("parts/m", "m\n");
+    p.repo.write("gen.txt", "zero\nm\n");
+    p.repo.commit_all("main regenerates");
+    let out = p.repo.atelier_in(&wt, &["follow"]);
+    assert_eq!(code(&out), 0, "{}", both(&out));
+    let so = stdout(&out);
+    assert!(
+        so.contains("follow: conflict in gen.txt settled with feat's side"),
+        "{so}"
+    );
+    assert!(so.contains("run the generator"), "{so}");
+    assert_eq!(fs::read_to_string(wt.join("gen.txt")).unwrap(), "zero\nf\n");
+    assert!(wt.join("parts/m").is_file());
+    assert_eq!(git(&wt, &["status", "--porcelain"]), "");
+}
+
+// ---------------------------------------------------------------------------------------------
+// Platforms on the owner's machines (module 3.6): a fake remote machine `box` of this platform,
+// reached through the fake ssh, which runs its commands on this computer.
+
+/// A machines file whose one machine is `box`, with the binary under test installed there and
+/// the project's checkout created; returns the environment the program needs to reach it.
+fn with_box(p: &Proj) -> Vec<(String, String)> {
+    let machines = p.base.join("machines");
+    let bin = machines.join(format!("box/.local/share/atelier/{VERSION}/bin"));
+    fs::create_dir_all(&bin).unwrap();
+    std::os::unix::fs::symlink(atelier_bin(), bin.join("atelier")).unwrap();
+    let file = p.repo.home.join(".config/atelier/machines.toml");
+    fs::create_dir_all(file.parent().unwrap()).unwrap();
+    fs::write(
+        &file,
+        format!(
+            "[machines.box]\nssh = \"box\"\nplatform = \"{}\"\npriority = 10\npath = [\"/usr/bin\", \"/bin\"]\ncheckouts = \"~/checkouts\"\n",
+            this_platform()
+        ),
+    )
+    .unwrap();
+    let env = vec![
+        (
+            "ATELIER_SSH".to_owned(),
+            Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("tests/fixtures/fake-ssh")
+                .to_string_lossy()
+                .into_owned(),
+        ),
+        (
+            "FAKE_SSH_ROOT".to_owned(),
+            machines.to_string_lossy().into_owned(),
+        ),
+    ];
+    let out = run_env(p, &["machines", "init", "box"], &env);
+    assert_eq!(code(&out), 0, "machines init: {}", both(&out));
+    env
+}
+
+fn run_env(p: &Proj, args: &[&str], env: &[(String, String)]) -> Output {
+    let env: Vec<(&str, &str)> = env.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
+    p.repo.atelier_env(p.main(), args, &env)
+}
+
+/// The project's checkout on `box`.
+fn box_checkout(p: &Proj) -> PathBuf {
+    let dir = p.base.join("machines/box/checkouts");
+    let mut entries: Vec<PathBuf> = fs::read_dir(&dir)
+        .unwrap()
+        .map(|e| e.unwrap().path())
+        .collect();
+    assert_eq!(entries.len(), 1);
+    entries.pop().unwrap()
+}
+
+#[test]
+fn the_gate_runs_a_platform_on_the_machine_chosen_for_it_bound_to_m() {
+    let p = Proj::new();
+    let env = with_box(&p);
+    let c = p.ready("feat", "a.txt", "a\n");
+    let out = run_env(&p, &["merge", "feat"], &env);
+    assert_eq!(code(&out), 0, "{}", both(&out));
+    let here = this_platform();
+    let so = stdout(&out);
+    assert!(so.contains(&format!("  {here}: running on box")), "{so}");
+    assert!(so.contains(&format!("  {here}: PASS on box")), "{so}");
+    assert!(so.contains(&format!("{here} PASS on box")), "{so}");
+    p.assert_merged("feat", &c);
+    assert!(
+        p.merge_lines()[0]
+            .platforms
+            .iter()
+            .any(|x| x == &format!("{here}=pass@box")),
+        "{:?}",
+        p.merge_lines()
+    );
+    // box ran the merged commit itself: its checkout is at M, and its runs record M.
+    let m = p.main_tip();
+    let remote = box_checkout(&p);
+    assert_eq!(git(&remote, &["rev-parse", "HEAD"]), m);
+    let mut kinds = Vec::new();
+    for e in fs::read_dir(remote.join(".git/atelier/runs"))
+        .unwrap()
+        .flatten()
+    {
+        if let Some(r) = atelier::runs::RunResult::read(&e.path()).unwrap() {
+            assert_eq!(r.commit.as_deref(), Some(m.as_str()));
+            kinds.push(r.kind.as_str().to_owned());
+        }
+    }
+    kinds.sort();
+    assert_eq!(kinds, ["check", "test-full"]);
+    // Nothing ran the check on this computer.
+    assert!(runs_of_kind(&p, "check").is_empty());
+
+    // box away: exit 3 before the gate, naming why.
+    p.ready("next", "b.txt", "b\n");
+    fs::rename(
+        p.base.join("machines/box"),
+        p.base.join("machines/box-away"),
+    )
+    .unwrap();
+    let gates = runs_of_kind(&p, "gate").len();
+    let out = run_env(&p, &["merge", "next"], &env);
+    assert_eq!(code(&out), 3, "{}", both(&out));
+    assert!(
+        stderr(&out).contains(&format!("{here}: box offline")),
+        "{}",
+        both(&out)
+    );
+    assert_eq!(runs_of_kind(&p, "gate").len(), gates, "checked first");
+}
+
+#[test]
+fn a_red_on_another_machine_is_bisected_on_that_machine() {
+    let p = Proj::new();
+    let env = with_box(&p);
+    let ca = p.ready("a", "a.txt", "a\n");
+    p.ready("b", "BROKEN", "b\n");
+    p.ready("c", "c.txt", "c\n");
+    let out = run_env(&p, &["merge", "a", "b", "c"], &env);
+    assert_eq!(code(&out), 1, "{}", both(&out));
+    let here = this_platform();
+    let so = stdout(&out);
+    assert!(
+        so.contains(&format!("  {here}: FAILED (on box, run ")),
+        "{so}"
+    );
+    assert!(
+        so.contains(&format!("re-running only {here}: its whole run (on box)")),
+        "{so}"
+    );
+    assert!(so.contains("prefix a, b: fails"), "{so}");
+    assert!(so.contains("prefix a: none of the failures appear"), "{so}");
+    assert!(
+        so.contains(&format!(
+            "merge: b breaks: on prefix a, b: {here}: on box, run "
+        )),
+        "{so}"
+    );
+    assert!(so.contains("merged a"), "{so}");
+    p.assert_merged("a", &ca);
+    assert!(
+        runs_of_kind(&p, "check").is_empty(),
+        "everything ran on box"
+    );
+}
