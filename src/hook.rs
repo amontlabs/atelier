@@ -8,9 +8,15 @@
 //!
 //! - a rebase is in progress in that worktree;
 //! - the worktree has uncommitted changes (untracked files included);
-//! - a background task the input lists is still running (Claude Code's `background_tasks`;
-//!   Codex sends no such field);
+//! - a background task the input lists is still running (Claude Code's `background_tasks`, a
+//!   shell command or a subagent; Codex sends no such field);
 //! - the last assistant message has no line starting `compile:`.
+//!
+//! The message is `last_assistant_message`. When the input has none (Claude Code 2.1.322 sends
+//! none on `SubagentStop` when the subagent ended through its `SubagentHandback` tool), it is
+//! the last report in the transcript the input names (`agent_transcript_path` for a subagent,
+//! `transcript_path` otherwise): the last assistant entry's text, or its `SubagentHandback`
+//! message. When neither can be read the message is not checked.
 //!
 //! For `SubagentStop` only the message check applies: the input's folder and background tasks are
 //! the parent session's (P23). Both harnesses take the same block: `{"decision": "block",
@@ -130,6 +136,47 @@ fn running_tasks(input: &Value) -> Vec<String> {
         .collect()
 }
 
+/// The message the `compile:` line is looked for in: `last_assistant_message`, else the last
+/// report in the transcript; `None` when there is neither.
+fn last_message(input: &Value, subagent: bool) -> Option<String> {
+    if let Some(m) = input.get("last_assistant_message").and_then(Value::as_str) {
+        return Some(m.to_owned());
+    }
+    let key = if subagent {
+        "agent_transcript_path"
+    } else {
+        "transcript_path"
+    };
+    let path = input.get(key).and_then(Value::as_str)?;
+    transcript_report(&std::fs::read_to_string(path).ok()?)
+}
+
+/// The last report of a Claude Code transcript (JSON lines): the text of the last assistant
+/// entry that has text or a `SubagentHandback` call.
+pub fn transcript_report(jsonl: &str) -> Option<String> {
+    jsonl.lines().rev().find_map(|line| {
+        let v: Value = serde_json::from_str(line).ok()?;
+        let msg = v.get("message")?;
+        if msg.get("role").and_then(Value::as_str) != Some("assistant") {
+            return None;
+        }
+        let blocks = msg.get("content")?.as_array()?;
+        let mut text = Vec::new();
+        for b in blocks {
+            match b.get("type").and_then(Value::as_str) {
+                Some("text") => text.extend(b.get("text").and_then(Value::as_str)),
+                Some("tool_use")
+                    if b.get("name").and_then(Value::as_str) == Some("SubagentHandback") =>
+                {
+                    text.extend(b.pointer("/input/message").and_then(Value::as_str))
+                }
+                _ => {}
+            }
+        }
+        (!text.is_empty()).then(|| text.join("\n"))
+    })
+}
+
 /// True when some line of the message starts with `compile:` (leading blanks allowed).
 pub fn has_compile_line(message: &str) -> bool {
     message
@@ -169,16 +216,12 @@ pub fn decide(input: &Value) -> Verdict {
         let tasks = running_tasks(input);
         if !tasks.is_empty() {
             problems.push(format!(
-                "background commands are still running: {}; wait for them or stop them",
+                "background tasks are still running: {}; wait for them or stop them",
                 tasks.join("; ")
             ));
         }
     }
-    let message = input
-        .get("last_assistant_message")
-        .and_then(Value::as_str)
-        .unwrap_or("");
-    if !has_compile_line(message) {
+    if last_message(input, subagent).is_some_and(|m| !has_compile_line(&m)) {
         problems.push(
             "your last message has no line starting `compile:`: run `atelier check --compile-only` on the committed tree and copy its `compile:` line into your report"
                 .to_owned(),

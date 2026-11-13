@@ -1,0 +1,1 @@
+{"session_id":"019a7c3e-55d2-7f10-9b8e-2b1d6e4c9a07","transcript_path":null,"cwd":"@CWD@","hook_event_name":"SubagentStop","model":"gpt-5.3-codex","turn_id":"019a7c3f-0e41-7c20-a1d3-5f7b8c9d0e12","agent_id":"019a7c40-1111-7000-8000-000000000001","agent_type":"worker","agent_transcript_path":null,"stop_hook_active":false,"last_assistant_message":"compile: ok"}
