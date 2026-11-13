@@ -72,6 +72,24 @@ pub fn config_problems(file: &str, text: &str) -> Vec<String> {
         }
     };
     let mut problems = Vec::new();
+    if table
+        .get("experimental")
+        .is_some_and(|v| mentions(v, "wrapper-scripts"))
+    {
+        problems.push(format!(
+            "{file}: experimental wrapper-scripts runs every test binary under a command from the file, which can report a failing test as passed"
+        ));
+    }
+    if table
+        .get("scripts")
+        .and_then(|s| s.get("wrapper"))
+        .and_then(toml::Value::as_table)
+        .is_some_and(|t| !t.is_empty())
+    {
+        problems.push(format!(
+            "{file}: scripts.wrapper defines a wrapper around the test binaries, which can report a failing test as passed"
+        ));
+    }
     let Some(profiles) = table.get("profile").and_then(toml::Value::as_table) else {
         return problems;
     };
@@ -80,16 +98,20 @@ pub fn config_problems(file: &str, text: &str) -> Vec<String> {
             continue;
         };
         let at = format!("{file}: profile.{name}");
-        if profile.contains_key("default-filter") {
-            problems.push(format!(
-                "{at}.default-filter leaves tests out without saying so"
-            ));
+        table_problems(&at, profile, &mut problems);
+        if let Some(scripts) = profile.get("scripts").and_then(toml::Value::as_array) {
+            for (i, s) in scripts.iter().enumerate() {
+                if let Some(wrapper) = s.as_table().and_then(|s| s.get("run-wrapper")) {
+                    problems.push(format!(
+                        "{at}.scripts[{i}].run-wrapper is {wrapper}: the wrapper can report a failing test as passed"
+                    ));
+                }
+            }
         }
-        retry_problems(&at, profile, &mut problems);
         if let Some(overrides) = profile.get("overrides").and_then(toml::Value::as_array) {
             for (i, o) in overrides.iter().enumerate() {
                 if let Some(o) = o.as_table() {
-                    retry_problems(&format!("{at}.overrides[{i}]"), o, &mut problems);
+                    table_problems(&format!("{at}.overrides[{i}]"), o, &mut problems);
                 }
             }
         }
@@ -97,7 +119,33 @@ pub fn config_problems(file: &str, text: &str) -> Vec<String> {
     problems
 }
 
-fn retry_problems(at: &str, table: &toml::Table, problems: &mut Vec<String>) {
+/// Whether a value names `word`: a string, a list holding it, or a table keyed by it.
+fn mentions(v: &toml::Value, word: &str) -> bool {
+    match v {
+        toml::Value::String(s) => s == word,
+        toml::Value::Array(a) => a.iter().any(|x| mentions(x, word)),
+        toml::Value::Table(t) => t.contains_key(word),
+        _ => false,
+    }
+}
+
+/// The settings that can hide a test, in a profile or in one of its overrides.
+fn table_problems(at: &str, table: &toml::Table, problems: &mut Vec<String>) {
+    if table.contains_key("default-filter") {
+        problems.push(format!(
+            "{at}.default-filter leaves tests out without saying so"
+        ));
+    }
+    if let Some(v) = table
+        .get("slow-timeout")
+        .and_then(toml::Value::as_table)
+        .and_then(|t| t.get("on-timeout"))
+        && v.as_str() != Some("fail")
+    {
+        problems.push(format!(
+            "{at}.slow-timeout sets on-timeout = {v}: a test that hangs would count as passed"
+        ));
+    }
     if let Some(retries) = table.get("retries") {
         let count = match retries {
             toml::Value::Integer(n) => Some(*n),
@@ -244,6 +292,46 @@ mod tests {
         let got = p("[[profile.default.overrides]]\nfilter = \"test(x)\"\nretries = 3\n");
         assert!(got[0].contains("overrides[0].retries"), "{got:?}");
         assert!(!p("[profile.default\n").is_empty());
+    }
+
+    #[test]
+    fn nextest_settings_that_count_a_failing_test_as_passed_are_refused() {
+        let p = |t: &str| config_problems(".config/nextest.toml", t);
+        let got = p(
+            "[profile.default]\nslow-timeout = { period = \"1s\", terminate-after = 2, on-timeout = \"pass\" }\n",
+        );
+        assert_eq!(got.len(), 1, "{got:?}");
+        assert!(got[0].contains("profile.default.slow-timeout sets on-timeout"));
+        let got = p(
+            "[[profile.ci.overrides]]\nfilter = \"all()\"\nslow-timeout = { period = \"1s\", on-timeout = \"pass\" }\n",
+        );
+        assert!(
+            got[0].contains("profile.ci.overrides[0].slow-timeout"),
+            "{got:?}"
+        );
+        assert!(!p("[profile.default.slow-timeout]\nperiod = \"1s\"\non-timeout = 3\n").is_empty());
+        assert!(
+            p("[profile.default]\nslow-timeout = { period = \"1s\", on-timeout = \"fail\" }\n")
+                .is_empty()
+        );
+        assert!(p("[profile.default]\nslow-timeout = \"60s\"\n").is_empty());
+
+        let got = p(
+            "[[profile.default.overrides]]\nplatform = \"cfg(all())\"\ndefault-filter = \"not test(x)\"\n",
+        );
+        assert!(got[0].contains("overrides[0].default-filter"), "{got:?}");
+
+        let wrapper = "experimental = [\"wrapper-scripts\"]\n[scripts.wrapper.w]\ncommand = \"sh\"\n[[profile.default.scripts]]\nfilter = \"all()\"\nrun-wrapper = \"w\"\n";
+        let got = p(wrapper);
+        assert_eq!(got.len(), 3, "{got:?}");
+        assert!(
+            got.iter()
+                .any(|g| g.contains("experimental wrapper-scripts"))
+        );
+        assert!(got.iter().any(|g| g.contains("scripts.wrapper defines")));
+        assert!(got.iter().any(|g| g.contains("scripts[0].run-wrapper")));
+        // Setup scripts do not decide a verdict.
+        assert!(p("experimental = [\"setup-scripts\"]\n[scripts.setup.s]\ncommand = \"true\"\n[[profile.default.scripts]]\nfilter = \"all()\"\nsetup = \"s\"\n").is_empty());
     }
 
     #[test]

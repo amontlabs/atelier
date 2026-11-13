@@ -730,3 +730,365 @@ fn a_build_folder_made_by_plain_cargo_during_the_run_is_red() {
         stdout(&out)
     );
 }
+
+// ----- the review's probes (module 3.2 review, findings 1-11) -----
+
+/// A nextest file the project ignores in git, so a hook may write it without changing the tree.
+fn ignore(fx: &Fx, lines: &str) {
+    let text = fs::read_to_string(fx.repo.root.join(".gitignore")).unwrap();
+    fx.repo.write(".gitignore", &format!("{text}{lines}"));
+    fx.repo.commit_all("ignore more");
+}
+
+#[test]
+fn nextest_files_that_let_a_failing_test_pass_or_vanish_are_refused() {
+    for (file, needle) in [
+        // Finding 1: a hung test counts as passed.
+        (
+            "[profile.default]\nslow-timeout = { period = \"1s\", terminate-after = 2, on-timeout = \"pass\" }\n",
+            "profile.default.slow-timeout sets on-timeout",
+        ),
+        (
+            "[[profile.default.overrides]]\nfilter = 'all()'\nslow-timeout = { period = \"1s\", on-timeout = \"pass\" }\n",
+            "overrides[0].slow-timeout sets on-timeout",
+        ),
+        // Finding 2: a wrapper swallows every failure.
+        (
+            "experimental = [\"wrapper-scripts\"]\n[scripts.wrapper.swallow]\ncommand = 'sh'\n\
+             [[profile.default.scripts]]\nfilter = 'all()'\nrun-wrapper = 'swallow'\n",
+            "scripts[0].run-wrapper",
+        ),
+        (
+            "experimental = [\"wrapper-scripts\"]\n",
+            "experimental wrapper-scripts",
+        ),
+        // Finding 3: a default filter inside an override.
+        (
+            "[[profile.default.overrides]]\nplatform = 'cfg(all())'\ndefault-filter = 'not test(only_ci)'\n",
+            "overrides[0].default-filter",
+        ),
+    ] {
+        let fx = Fx::new("");
+        fx.repo.write(".config/nextest.toml", file);
+        fx.repo.commit_all("nextest file");
+        let out = fx.check(&[]);
+        assert_eq!(code(&out), 4, "{file}: {}\n{}", stdout(&out), stderr(&out));
+        let err = stderr(&out);
+        assert!(err.contains(needle), "{needle}: {err}");
+        assert!(fx.runs().is_empty(), "nothing ran");
+    }
+}
+
+#[test]
+fn nextest_setup_scripts_are_accepted() {
+    let fx = Fx::new("");
+    fx.repo.write(
+        ".config/nextest.toml",
+        "experimental = [\"setup-scripts\"]\n[scripts.setup.s]\ncommand = 'true'\n\
+         [[profile.default.scripts]]\nfilter = 'all()'\nsetup = 's'\n",
+    );
+    fx.repo.commit_all("setup script");
+    assert_eq!(code(&fx.check(&[])), 0);
+}
+
+#[test]
+fn a_hook_edit_of_an_assume_unchanged_file_changes_the_tree() {
+    // Finding 4.
+    let hook = "[[check.prepare]]\nname = \"add-test\"\nrun = [\"sh\", \"-c\", \"printf '\\\\n#[cfg(test)]\\\\nmod hook {\\\\n    #[test]\\\\n    fn hook_added() {}\\\\n}\\\\n' >> a/src/lib.rs\"]\n";
+    let fx = Fx::new(hook);
+    git(
+        &fx.repo.root,
+        &["update-index", "--assume-unchanged", "a/src/lib.rs"],
+    );
+    let out = fx.check(&[]);
+    assert_eq!(code(&out), 1, "{}\n{}", stdout(&out), stderr(&out));
+    assert!(
+        stdout(&out).contains("hook add-test changed the tree (a/src/lib.rs)"),
+        "{}",
+        stdout(&out)
+    );
+    assert!(
+        last_line(&out).contains("failed: prepare:add-test;"),
+        "{}",
+        last_line(&out)
+    );
+}
+
+#[test]
+fn a_tree_with_edits_under_assume_unchanged_or_skip_worktree_is_not_called_clean() {
+    let fx = Fx::new("");
+    git(
+        &fx.repo.root,
+        &["update-index", "--assume-unchanged", "a/src/lib.rs"],
+    );
+    git(
+        &fx.repo.root,
+        &["update-index", "--skip-worktree", "README"],
+    );
+    fx.repo.write("README", "edited\n");
+    let out = fx.check(&[]);
+    assert_eq!(code(&out), 0, "{}\n{}", stdout(&out), stderr(&out));
+    assert!(
+        last_line(&out).contains("(+ uncommitted changes)"),
+        "{}",
+        last_line(&out)
+    );
+
+    // And a project step that edits a skip-worktree file is caught at the end.
+    let fx = Fx::new(&shell_step("sneaky", "echo x >> README"));
+    git(
+        &fx.repo.root,
+        &["update-index", "--skip-worktree", "README"],
+    );
+    let out = fx.check(&[]);
+    assert_eq!(code(&out), 1, "{}", stdout(&out));
+    assert!(
+        stdout(&out).contains("the tree changed during the run (README)"),
+        "{}",
+        stdout(&out)
+    );
+}
+
+#[test]
+fn a_relative_or_empty_path_entry_is_refused_with_mbx() {
+    // Finding 5.
+    let fx = Fx::new("");
+    fx.fake_mbx("1.30.0");
+    fx.set_settings(&fx.mbx_settings(""));
+    for first in ["bin", "", "."] {
+        let path = format!("{first}:{}", fx.path().to_string_lossy());
+        let out = fx.check_env(&[], &[("PATH", &path)]);
+        assert_eq!(
+            code(&out),
+            4,
+            "{first:?}: {}\n{}",
+            stdout(&out),
+            stderr(&out)
+        );
+        assert!(
+            stderr(&out).contains("PATH has the relative entry"),
+            "{}",
+            stderr(&out)
+        );
+    }
+}
+
+#[test]
+fn another_target_folder_than_the_workspaces_is_refused_with_mbx() {
+    // Finding 6.
+    let fx = Fx::new("");
+    fx.fake_mbx("1.30.0");
+    fx.set_settings(&fx.mbx_settings(""));
+    let elsewhere = fx.repo.tmp.path().join("realtarget");
+    let out = fx.check_env(
+        &[],
+        &[("CARGO_BUILD_TARGET_DIR", elsewhere.to_str().unwrap())],
+    );
+    assert_eq!(code(&out), 4, "{}\n{}", stdout(&out), stderr(&out));
+    assert!(
+        stderr(&out).contains("CARGO_BUILD_TARGET_DIR is set"),
+        "{}",
+        stderr(&out)
+    );
+    assert!(!elsewhere.exists());
+
+    fx.repo.write(
+        ".cargo/config.toml",
+        &format!("[build]\ntarget-dir = {:?}\n", elsewhere.to_str().unwrap()),
+    );
+    fx.repo.commit_all("target-dir");
+    let out = fx.check(&[]);
+    assert_eq!(code(&out), 4, "{}\n{}", stdout(&out), stderr(&out));
+    assert!(
+        stderr(&out).contains("cargo builds in") && stderr(&out).contains("realtarget"),
+        "{}",
+        stderr(&out)
+    );
+    assert!(!elsewhere.exists(), "nothing was built");
+}
+
+#[test]
+fn a_target_folder_moved_during_the_run_is_red() {
+    let fx = Fx::new("");
+    ignore(&fx, ".cargo\n");
+    let storage = fx.fake_mbx("1.30.0");
+    let elsewhere = fx.repo.tmp.path().join("realtarget");
+    let step = shell_step(
+        "late",
+        &format!(
+            "mkdir -p .cargo && printf '[build]\\ntarget-dir = \"{}\"\\n' > .cargo/config.toml",
+            elsewhere.display()
+        ),
+    );
+    fx.set_settings(&format!("{}{step}", fx.mbx_settings("")));
+    fs::create_dir_all(storage.join("t1")).unwrap();
+    std::os::unix::fs::symlink(storage.join("t1"), fx.repo.root.join("target")).unwrap();
+    let out = fx.check(&[]);
+    assert_eq!(code(&out), 1, "{}\n{}", stdout(&out), stderr(&out));
+    assert!(stdout(&out).contains("cargo builds in"), "{}", stdout(&out));
+    assert!(
+        last_line(&out).contains("failed: mbx;"),
+        "{}",
+        last_line(&out)
+    );
+}
+
+#[test]
+fn a_nextest_file_written_during_the_run_is_red() {
+    // Finding 7: a hook writes an ignored file with a default filter.
+    let hook = "[[check.prepare]]\nname = \"filter\"\nrun = [\"sh\", \"-c\", \"mkdir -p .config && printf '[profile.default]\\\\ndefault-filter = \\\"not test(adds)\\\"\\\\n' > .config/nextest.toml\"]\n";
+    let fx = Fx::new(hook);
+    ignore(&fx, ".config\n");
+    let out = fx.check(&[]);
+    assert_eq!(code(&out), 1, "{}\n{}", stdout(&out), stderr(&out));
+    assert!(
+        stdout(&out).contains(".config/nextest.toml appeared during the run"),
+        "{}",
+        stdout(&out)
+    );
+    assert!(
+        last_line(&out).contains("failed: nextest-config;"),
+        "{}",
+        last_line(&out)
+    );
+
+    // The same for a file that changes, and for nextest's user config.
+    let user = fx.repo.tmp.path().join("user-nextest.toml");
+    let fx = Fx::new(&shell_step(
+        "late",
+        &format!("echo '# changed' > {}", user.display()),
+    ));
+    let out = fx.check_env(&[], &[("NEXTEST_USER_CONFIG_FILE", user.to_str().unwrap())]);
+    assert_eq!(code(&out), 1, "{}\n{}", stdout(&out), stderr(&out));
+    assert!(
+        stdout(&out).contains("user-nextest.toml appeared during the run"),
+        "{}",
+        stdout(&out)
+    );
+}
+
+#[test]
+fn an_exclusion_applies_only_where_nextest_accepts_it() {
+    // Finding 8: `package(b)` exists in the second workspace only.
+    let fx = Fx::new("");
+    let r = &fx.repo;
+    r.write(
+        "Cargo.toml",
+        "[workspace]\nmembers = [\"a\"]\nexclude = [\"w2\"]\nresolver = \"3\"\n",
+    );
+    r.write(
+        "w2/Cargo.toml",
+        "[workspace]\nmembers = [\"b\"]\nresolver = \"3\"\n",
+    );
+    r.write(
+        "w2/b/Cargo.toml",
+        "[package]\nname = \"b\"\nversion = \"0.1.0\"\nedition = \"2024\"\n",
+    );
+    r.write(
+        "w2/b/src/lib.rs",
+        "#[cfg(test)]\nmod tests {\n    #[test]\n    fn fine() {}\n\n    #[test]\n    fn skip_me() {\n        panic!(\"excluded\");\n    }\n}\n",
+    );
+    let out = fx.run_cmd(
+        Command::new("cargo").arg("generate-lockfile"),
+        &r.root.join("w2"),
+    );
+    assert_eq!(code(&out), 0, "{}", stderr(&out));
+    fx.set_settings("[[rust.exclude]]\nfilter = \"package(b) & test(skip_me)\"\nreason = \"needs the engine\"\n");
+    let text = fs::read_to_string(r.root.join(".atelier/atelier.toml")).unwrap();
+    r.write(
+        ".atelier/atelier.toml",
+        &text.replace("workspaces = [\".\"]", "workspaces = [\".\", \"w2\"]"),
+    );
+    r.commit_all("two workspaces");
+
+    let out = fx.check(&[]);
+    assert_eq!(code(&out), 0, "{}\n{}", stdout(&out), stderr(&out));
+    let text = stdout(&out);
+    assert!(text.contains("is not applied in workspace ."), "{text}");
+    assert!(
+        last_line(&out).contains(", 3 tests, 1 excluded, "),
+        "{}",
+        last_line(&out)
+    );
+
+    // An exclusion no workspace accepts is RED and named.
+    fx.set_settings("[[rust.exclude]]\nfilter = \"package(nowhere)\"\nreason = \"typo\"\n");
+    let text = fs::read_to_string(r.root.join(".atelier/atelier.toml")).unwrap();
+    r.write(
+        ".atelier/atelier.toml",
+        &text.replace("workspaces = [\".\"]", "workspaces = [\".\", \"w2\"]"),
+    );
+    r.commit_all("a typo");
+    let out = fx.check(&[]);
+    assert_eq!(code(&out), 1, "{}\n{}", stdout(&out), stderr(&out));
+    assert!(
+        stdout(&out).contains(
+            "exclusion package(nowhere) (typo) is not accepted by nextest in any workspace"
+        ),
+        "{}",
+        stdout(&out)
+    );
+    assert!(
+        last_line(&out).contains("exclusions"),
+        "{}",
+        last_line(&out)
+    );
+}
+
+#[test]
+fn an_unreadable_nextest_file_is_refused() {
+    // Finding 9.
+    let fx = Fx::new("");
+    fs::create_dir_all(fx.repo.root.join(".config")).unwrap();
+    fs::write(
+        fx.repo.root.join(".config/nextest.toml"),
+        [0xff, 0xfe, 0x00],
+    )
+    .unwrap();
+    fx.repo.commit_all("binary nextest file");
+    let out = fx.check(&[]);
+    assert_eq!(code(&out), 4, "{}\n{}", stdout(&out), stderr(&out));
+    assert!(
+        stderr(&out).contains(".config/nextest.toml: cannot be read"),
+        "{}",
+        stderr(&out)
+    );
+    assert!(fx.runs().is_empty());
+}
+
+/// The background process of the prerequisite test below: macOS hides the environment of Apple's
+/// own programs, so the sleeper is this test binary, as in the run tests.
+#[test]
+fn sleeper_probe_entry() {
+    if std::env::var("ATELIER_TEST_PROBE").is_ok() {
+        std::thread::sleep(std::time::Duration::from_secs(60));
+    }
+}
+
+#[test]
+fn a_prerequisite_command_that_leaves_a_process_behind_is_refused() {
+    // Finding 10.
+    let fx = Fx::new("");
+    let pid_file = fx.repo.tmp.path().join("sleeper.pid");
+    let script = format!(
+        "ATELIER_TEST_PROBE=1 {} sleeper_probe_entry --exact --nocapture --test-threads=1 >/dev/null 2>&1 </dev/null & echo $! > {}; echo v1",
+        std::env::current_exe().unwrap().display(),
+        pid_file.display()
+    );
+    let tool = format!(
+        "[[prerequisites.tools]]\nname = \"bg\"\nrun = [\"sh\", \"-c\", {script:?}]\nexpect = \"v1\"\n"
+    );
+    fx.set_settings(&tool);
+    let out = fx.check(&[]);
+    // Whatever happens, do not leave the sleeper running.
+    if let Ok(pid) = fs::read_to_string(&pid_file) {
+        let _ = Command::new("kill").arg(pid.trim()).status();
+    }
+    assert_eq!(code(&out), 4, "{}\n{}", stdout(&out), stderr(&out));
+    assert!(
+        stderr(&out).contains("a prerequisite command left processes behind"),
+        "{}",
+        stderr(&out)
+    );
+    assert!(fx.runs().is_empty());
+}

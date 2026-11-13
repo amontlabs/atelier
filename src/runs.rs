@@ -299,10 +299,23 @@ impl Run {
         command: &str,
         worktree: &Path,
     ) -> Result<Run> {
+        Self::start_with_id(state, key, kind, command, worktree, None)
+    }
+
+    /// As [`Run::start`], with `preferred` as the run id when it is free (the id commands
+    /// started before the run already carried as their marker).
+    pub fn start_with_id(
+        state: &State,
+        key: LockKey,
+        kind: RunKind,
+        command: &str,
+        worktree: &Path,
+        preferred: Option<&str>,
+    ) -> Result<Run> {
         let guard = signals::install()
             .map_err(|e| Failure::refused(format!("cannot install signal handlers: {e}")))?;
         let mut lock = HeldLock::acquire(state, key)?;
-        let (id, dir) = create_run_dir(&state.runs_dir())?;
+        let (id, dir) = create_run_dir(&state.runs_dir(), preferred)?;
         let started = fsutil::rfc3339(fsutil::now_secs());
         let mut chain = procs::inherited_runs();
         chain.push(id.clone());
@@ -590,6 +603,19 @@ impl Run {
         Ok(record)
     }
 
+    /// Forgets the last step when it merely exited non-zero: a probe whose failure is an answer,
+    /// not a failure of the run. Its log stays. A step that left processes behind, or did not
+    /// start, is kept.
+    pub fn discard_failed_step(&mut self) {
+        if self
+            .steps
+            .last()
+            .is_some_and(|s| s.status == StepStatus::Failed && s.unstoppable.is_empty())
+        {
+            self.steps.pop();
+        }
+    }
+
     /// Ends the run: the marker scan, then the result, written atomically. `passed` is the
     /// caller's verdict; failed steps, survivors, a failed scan and a stop signal each make the
     /// run fail. The run stays recorded under its lock while survivors live, and when the scan
@@ -683,9 +709,13 @@ fn current_branch(worktree: &Path) -> Option<String> {
     full.strip_prefix("refs/heads/").map(str::to_owned)
 }
 
-fn create_run_dir(runs: &Path) -> Result<(String, PathBuf)> {
+fn create_run_dir(runs: &Path, preferred: Option<&str>) -> Result<(String, PathBuf)> {
+    let mut preferred = preferred.filter(|id| is_run_id(id));
     for _ in 0..64 {
-        let id = new_run_id()?;
+        let id = match preferred.take() {
+            Some(id) => id.to_owned(),
+            None => new_run_id()?,
+        };
         let dir = runs.join(&id);
         match fs::create_dir(&dir) {
             Ok(()) => return Ok((id, dir)),

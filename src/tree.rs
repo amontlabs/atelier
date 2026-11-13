@@ -4,7 +4,9 @@
 //! its files are not part of the tree object, so a change inside it would go unseen.
 
 use std::fs;
-use std::path::PathBuf;
+use std::io::Write;
+use std::path::{Path, PathBuf};
+use std::process::Stdio;
 
 use crate::exit::{Failure, Result};
 use crate::fsutil;
@@ -66,6 +68,8 @@ pub fn tree_id(checkout: &Checkout) -> Result<String> {
             .map_err(|e| Failure::refused(format!("copying the index: {e}")))?;
     }
 
+    clear_index_bits(checkout, &tmp.0)?;
+
     let add = git::command(&checkout.root)
         .env("GIT_INDEX_FILE", &tmp.0)
         .args(["-c", "advice.addEmbeddedRepo=false", "add", "-A"])
@@ -96,6 +100,62 @@ pub fn tree_id(checkout: &Checkout) -> Result<String> {
         refuse_gitlinks(checkout, &head)?;
     }
     Ok(tree)
+}
+
+/// Clears the assume-unchanged and skip-worktree bits of every entry of the temporary index, so
+/// `git add -A` reads each file: with the bits set it would keep the committed content of a file
+/// that changed on disk.
+fn clear_index_bits(checkout: &Checkout, index: &Path) -> Result<()> {
+    let listed = git::command(&checkout.root)
+        .env("GIT_INDEX_FILE", index)
+        .args(["ls-files", "-v", "-z"])
+        .output()
+        .map_err(|e| Failure::refused(format!("cannot run git: {e}")))?;
+    if !listed.status.success() {
+        return Err(Failure::refused(format!(
+            "git ls-files failed: {}",
+            String::from_utf8_lossy(&listed.stderr).trim()
+        )));
+    }
+    // `<tag> <path>\0`: a lowercase tag marks assume-unchanged, `S` skip-worktree.
+    let mut paths = Vec::new();
+    for entry in listed.stdout.split(|b| *b == 0).filter(|e| e.len() > 2) {
+        if entry[0].is_ascii_lowercase() || entry[0] == b'S' {
+            paths.extend_from_slice(&entry[2..]);
+            paths.push(0);
+        }
+    }
+    if paths.is_empty() {
+        return Ok(());
+    }
+    // One flag per call: `update-index` applies only the first of them to a path.
+    for flag in ["--no-assume-unchanged", "--no-skip-worktree"] {
+        let mut child = git::command(&checkout.root)
+            .env("GIT_INDEX_FILE", index)
+            .args(["update-index", "-z", flag, "--stdin"])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped())
+            .spawn()
+            .map_err(|e| Failure::refused(format!("cannot run git: {e}")))?;
+        let mut stdin = child.stdin.take().expect("piped stdin");
+        // Written from a thread so that git's error output cannot fill a pipe nobody reads.
+        let list = paths.clone();
+        let writer = std::thread::spawn(move || {
+            let _ = stdin.write_all(&list);
+        });
+        let out = child
+            .wait_with_output()
+            .map_err(|e| Failure::refused(format!("cannot run git: {e}")))?;
+        let _ = writer.join();
+        if !out.status.success() {
+            return Err(Failure::refused(format!(
+                "git update-index {flag} failed: {}",
+                String::from_utf8_lossy(&out.stderr).trim()
+            )));
+        }
+    }
+    Ok(())
 }
 
 /// Refuses (4) a tree that contains any entry of mode 160000, naming each.

@@ -4,10 +4,16 @@
 //! - one pinned Rust toolchain per workspace, and `rustc --version` reports it;
 //! - cargo-nextest at the pinned version;
 //! - each declared tool whose platforms include this one;
-//! - no silent test filter and no retry in each workspace's `.config/nextest.toml`;
+//! - nothing in each workspace's `.config/nextest.toml` that hides a test or lets a failing one
+//!   count as passed ([`nextest::config_problems`]); the file, and nextest's user config, are read
+//!   again when the run ends ([`recheck_nextest`]);
 //! - with `[prerequisites.mbx]`: mbx's version and every listed setting, `<workspace root>/.mbx.toml`
-//!   read from disk, nothing that tells cargo to bypass mbx, and no build folder that plain cargo
-//!   made. The file and the build folder are read again when the run ends ([`recheck`]).
+//!   read from disk, nothing that tells cargo to bypass mbx, no relative `PATH` entry, cargo's
+//!   target folder (`cargo metadata`) being `<workspace root>/target`, and no build folder that
+//!   plain cargo made. These are checked again when the run ends ([`recheck`]).
+//!
+//! Every command started here carries `ATELIER_RUN=<marker>`; a process still running from one of
+//! them when the checks are done is a problem, named.
 
 use std::collections::BTreeMap;
 use std::fs;
@@ -20,10 +26,23 @@ use crate::exit::{Failure, Result};
 use crate::git::{self, Checkout};
 use crate::nextest;
 use crate::platform::Platform;
+use crate::procs::{self, RUN_MARKER};
 use crate::settings::{Mbx, Settings, Tool};
 
 /// Environment variables that make mbx step aside (mbx §3, §4).
-const MBX_BYPASS_VARS: &[&str] = &["MBX_DISABLE", "CARGO_TARGET_DIR", "RUSTC_WRAPPER"];
+const MBX_BYPASS_VARS: &[&str] = &[
+    "MBX_DISABLE",
+    "CARGO_TARGET_DIR",
+    "CARGO_BUILD_TARGET_DIR",
+    "RUSTC_WRAPPER",
+];
+
+/// A command whose environment carries the run marker.
+fn command(program: impl AsRef<std::ffi::OsStr>, marker: &str) -> Command {
+    let mut cmd = Command::new(program);
+    cmd.env(RUN_MARKER, marker);
+    cmd
+}
 
 /// One Cargo workspace named in the settings.
 #[derive(Debug, Clone)]
@@ -61,7 +80,7 @@ impl Workspace {
 
 /// Asks `cargo metadata` for each workspace's root and members. A failure is recorded in the
 /// workspace, not returned: a broken manifest is RED at the format step, named (r4 §3.7).
-pub fn workspaces(checkout: &Checkout, settings: &Settings) -> Vec<Workspace> {
+pub fn workspaces(checkout: &Checkout, settings: &Settings, marker: &str) -> Vec<Workspace> {
     settings
         .workspaces
         .iter()
@@ -74,10 +93,10 @@ pub fn workspaces(checkout: &Checkout, settings: &Settings) -> Vec<Workspace> {
                 members: Vec::new(),
                 metadata_error: None,
             };
-            match metadata(&dir) {
-                Ok((root, members)) => {
-                    ws.root = root;
-                    ws.members = members;
+            match metadata(&dir, marker) {
+                Ok(m) => {
+                    ws.root = m.root;
+                    ws.members = m.members;
                 }
                 Err(e) => ws.metadata_error = Some(e),
             }
@@ -86,8 +105,16 @@ pub fn workspaces(checkout: &Checkout, settings: &Settings) -> Vec<Workspace> {
         .collect()
 }
 
-fn metadata(dir: &Path) -> std::result::Result<(PathBuf, Vec<String>), String> {
-    let out = Command::new("cargo")
+/// What `cargo metadata` says about a workspace.
+struct Metadata {
+    root: PathBuf,
+    members: Vec<String>,
+    /// Where cargo builds, after every environment variable and config file.
+    target_dir: PathBuf,
+}
+
+fn metadata(dir: &Path, marker: &str) -> std::result::Result<Metadata, String> {
+    let out = command("cargo", marker)
         .args(["metadata", "--no-deps", "--format-version", "1", "--locked"])
         .current_dir(dir)
         .stdin(Stdio::null())
@@ -119,7 +146,15 @@ fn metadata(dir: &Path) -> std::result::Result<(PathBuf, Vec<String>), String> {
         .unwrap_or_default();
     members.sort();
     members.dedup();
-    Ok((PathBuf::from(root), members))
+    let target_dir = v
+        .get("target_directory")
+        .and_then(Value::as_str)
+        .ok_or("cargo metadata has no target_directory")?;
+    Ok(Metadata {
+        root: PathBuf::from(root),
+        members,
+        target_dir: PathBuf::from(target_dir),
+    })
 }
 
 /// What `check` reads again when the run ends.
@@ -127,6 +162,42 @@ fn metadata(dir: &Path) -> std::result::Result<(PathBuf, Vec<String>), String> {
 pub struct Snapshot {
     /// Each workspace root's `.mbx.toml` as read at preflight: its bytes, `None` when absent.
     mbx_files: Vec<(PathBuf, Option<Vec<u8>>)>,
+    /// Each file nextest reads configuration from, as read at preflight.
+    nextest_files: Vec<(PathBuf, FileState)>,
+}
+
+/// A file's bytes (`None`: absent), or why it cannot be read.
+type FileState = std::result::Result<Option<Vec<u8>>, String>;
+
+fn file_state(path: &Path) -> FileState {
+    match fs::read(path) {
+        Ok(bytes) => Ok(Some(bytes)),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(e.to_string()),
+    }
+}
+
+/// The files nextest takes configuration from: each workspace's `.config/nextest.toml`, then
+/// the user config (`NEXTEST_USER_CONFIG_FILE`, else the XDG and home locations).
+fn nextest_paths(workspaces: &[Workspace]) -> (Vec<PathBuf>, Vec<PathBuf>) {
+    let mut project: Vec<PathBuf> = Vec::new();
+    for ws in workspaces {
+        let file = ws.root.join(".config/nextest.toml");
+        if !project.contains(&file) {
+            project.push(file);
+        }
+    }
+    let mut user = Vec::new();
+    if let Some(f) = std::env::var_os("NEXTEST_USER_CONFIG_FILE") {
+        user.push(PathBuf::from(f));
+    }
+    if let Some(xdg) = std::env::var_os("XDG_CONFIG_HOME") {
+        user.push(PathBuf::from(xdg).join("nextest/config.toml"));
+    }
+    if let Some(home) = std::env::var_os("HOME") {
+        user.push(PathBuf::from(home).join(".config/nextest/config.toml"));
+    }
+    (project, user)
 }
 
 /// Verifies every prerequisite; one refusal (4) lists every problem.
@@ -135,34 +206,51 @@ pub fn verify(
     settings: &Settings,
     workspaces: &[Workspace],
     platform: Option<Platform>,
+    marker: &str,
 ) -> Result<Snapshot> {
     let mut problems = Vec::new();
 
     if let Some(rust) = &settings.rust {
         for ws in workspaces {
-            toolchain_problems(checkout, ws, &mut problems);
+            toolchain_problems(checkout, ws, marker, &mut problems);
         }
-        if let Some(p) = nextest_version_problem(&checkout.root, &rust.nextest) {
+        if let Some(p) = nextest_version_problem(&checkout.root, &rust.nextest, marker) {
             problems.push(p);
         }
     }
     for tool in &settings.prerequisites.tools {
         if tool_applies(tool, platform)
-            && let Some(p) = tool_problem(&checkout.root, tool)
+            && let Some(p) = tool_problem(&checkout.root, tool, marker)
         {
             problems.push(p);
         }
     }
-    for ws in workspaces {
-        let file = ws.root.join(".config/nextest.toml");
-        if let Ok(text) = fs::read_to_string(&file) {
-            problems.extend(nextest::config_problems(&display(checkout, &file), &text));
+    let (project_files, user_files) = nextest_paths(workspaces);
+    let mut nextest_files = Vec::new();
+    for file in project_files.iter().chain(&user_files) {
+        let state = file_state(file);
+        match &state {
+            Err(e) => problems.push(format!(
+                "{}: cannot be read ({e}); nextest would not read it either",
+                display(checkout, file)
+            )),
+            Ok(Some(bytes)) if project_files.contains(file) => match std::str::from_utf8(bytes) {
+                Ok(text) => {
+                    problems.extend(nextest::config_problems(&display(checkout, file), text))
+                }
+                Err(_) => problems.push(format!(
+                    "{}: cannot be read (not UTF-8); nextest would not read it either",
+                    display(checkout, file)
+                )),
+            },
+            _ => {}
         }
+        nextest_files.push((file.clone(), state));
     }
 
     let mut mbx_files = Vec::new();
     if let Some(mbx) = &settings.prerequisites.mbx {
-        problems.extend(mbx_problems(checkout, mbx, workspaces));
+        problems.extend(mbx_problems(checkout, mbx, workspaces, marker));
         for ws in workspaces {
             mbx_files.push((
                 ws.root.join(".mbx.toml"),
@@ -171,8 +259,24 @@ pub fn verify(
         }
     }
 
+    match procs::marker_survivors(&[marker.to_owned()]) {
+        Ok(found) if !found.is_empty() => problems.push(format!(
+            "a prerequisite command left processes behind: {}",
+            found
+                .iter()
+                .map(|(p, _)| p.describe())
+                .collect::<Vec<_>>()
+                .join("; ")
+        )),
+        Ok(_) => {}
+        Err(e) => problems.push(format!("cannot scan for processes left behind: {e}")),
+    }
+
     if problems.is_empty() {
-        Ok(Snapshot { mbx_files })
+        Ok(Snapshot {
+            mbx_files,
+            nextest_files,
+        })
     } else {
         Err(Failure::refused(format!(
             "prerequisites not met:\n  {}",
@@ -189,6 +293,7 @@ pub fn recheck(
     settings: &Settings,
     workspaces: &[Workspace],
     snapshot: &Snapshot,
+    marker: &str,
 ) -> Vec<String> {
     let Some(mbx) = &settings.prerequisites.mbx else {
         return Vec::new();
@@ -208,7 +313,30 @@ pub fn recheck(
             ));
         }
     }
-    lines.extend(mbx_problems(checkout, mbx, workspaces));
+    lines.extend(mbx_problems(checkout, mbx, workspaces, marker));
+    lines
+}
+
+/// What changed in the files nextest reads configuration from while the run was going, one line
+/// each (RED when not empty): a file that appeared, changed, vanished or became unreadable.
+pub fn recheck_nextest(checkout: &Checkout, snapshot: &Snapshot) -> Vec<String> {
+    let mut lines = Vec::new();
+    for (path, before) in &snapshot.nextest_files {
+        let now = file_state(path);
+        if &now == before {
+            continue;
+        }
+        let what = match (before, &now) {
+            (_, Err(e)) => format!("cannot be read now ({e})"),
+            (Ok(None), _) => "appeared".to_owned(),
+            (_, Ok(None)) => "was removed".to_owned(),
+            _ => "changed".to_owned(),
+        };
+        lines.push(format!(
+            "{} {what} during the run; the project steps' nextest calls may not have used the file that was checked",
+            display(checkout, path)
+        ));
+    }
     lines
 }
 
@@ -244,9 +372,9 @@ fn first_line(cmd: &mut Command) -> std::result::Result<String, String> {
         .ok_or_else(|| "printed nothing".to_owned())
 }
 
-fn tool_problem(root: &Path, tool: &Tool) -> Option<String> {
+fn tool_problem(root: &Path, tool: &Tool, marker: &str) -> Option<String> {
     let (program, args) = tool.run.split_first()?;
-    let mut cmd = Command::new(program);
+    let mut cmd = command(program, marker);
     cmd.args(args).current_dir(root);
     match first_line(&mut cmd) {
         Ok(line) if line.starts_with(&tool.expect) => None,
@@ -260,8 +388,8 @@ fn tool_problem(root: &Path, tool: &Tool) -> Option<String> {
     }
 }
 
-fn nextest_version_problem(root: &Path, pinned: &str) -> Option<String> {
-    let mut cmd = Command::new("cargo");
+fn nextest_version_problem(root: &Path, pinned: &str, marker: &str) -> Option<String> {
+    let mut cmd = command("cargo", marker);
     cmd.args(["nextest", "--version"]).current_dir(root);
     match first_line(&mut cmd) {
         Ok(line) => {
@@ -276,7 +404,12 @@ fn nextest_version_problem(root: &Path, pinned: &str) -> Option<String> {
 
 /// `rust-toolchain.toml` (or `rust-toolchain`) from the workspace folder up to the checkout root
 /// names an exact version, and `rustc --version` in the workspace reports it.
-fn toolchain_problems(checkout: &Checkout, ws: &Workspace, problems: &mut Vec<String>) {
+fn toolchain_problems(
+    checkout: &Checkout,
+    ws: &Workspace,
+    marker: &str,
+    problems: &mut Vec<String>,
+) {
     let at = &ws.rel;
     let mut dir = Some(ws.dir.as_path());
     let mut channel = None;
@@ -303,7 +436,7 @@ fn toolchain_problems(checkout: &Checkout, ws: &Workspace, problems: &mut Vec<St
         problems.push(format!("{file}: `channel` is not an exact version"));
         return;
     };
-    let mut cmd = Command::new("rustc");
+    let mut cmd = command("rustc", marker);
     cmd.arg("--version").current_dir(&ws.dir);
     match first_line(&mut cmd) {
         Ok(line) if line.split_whitespace().nth(1) == Some(version.as_str()) => {}
@@ -330,12 +463,27 @@ fn toolchain_channel(text: &str) -> Option<String> {
 
 // ----- mbx -----
 
-fn mbx_problems(checkout: &Checkout, mbx: &Mbx, workspaces: &[Workspace]) -> Vec<String> {
+fn mbx_problems(
+    checkout: &Checkout,
+    mbx: &Mbx,
+    workspaces: &[Workspace],
+    marker: &str,
+) -> Vec<String> {
     let mut problems = Vec::new();
 
     for var in MBX_BYPASS_VARS {
         if std::env::var_os(var).is_some() {
             problems.push(format!("{var} is set: it makes cargo bypass mbx; unset it"));
+        }
+    }
+    // A relative entry (an empty one is `.`) resolves against the folder each job runs in, not
+    // against the folder atelier was started in, so which `cargo` runs cannot be told here.
+    if let Some(path) = std::env::var_os("PATH") {
+        for entry in std::env::split_paths(&path).filter(|e| !e.is_absolute()) {
+            problems.push(format!(
+                "PATH has the relative entry {:?}: it resolves differently in each folder a job runs in; use absolute entries",
+                entry.display().to_string()
+            ));
         }
     }
     match first_cargo() {
@@ -356,7 +504,7 @@ fn mbx_problems(checkout: &Checkout, mbx: &Mbx, workspaces: &[Workspace]) -> Vec
         }
     }
 
-    let mut cmd = Command::new("mbx");
+    let mut cmd = command("mbx", marker);
     cmd.arg("--version").current_dir(&checkout.root);
     match first_line(&mut cmd) {
         Ok(line) => {
@@ -371,7 +519,7 @@ fn mbx_problems(checkout: &Checkout, mbx: &Mbx, workspaces: &[Workspace]) -> Vec
         Err(e) => problems.push(format!("mbx --version {e}")),
     }
     for (key, want) in &mbx.settings {
-        match mbx_setting(&checkout.root, key) {
+        match mbx_setting(&checkout.root, key, marker) {
             Ok(got) if got == value_text(want) => {}
             Ok(got) => problems.push(format!(
                 "mbx setting {key} is {got:?}; the settings require {}",
@@ -381,7 +529,7 @@ fn mbx_problems(checkout: &Checkout, mbx: &Mbx, workspaces: &[Workspace]) -> Vec
         }
     }
 
-    let storage = mbx_target_roots(&checkout.root);
+    let storage = mbx_target_roots(&checkout.root, marker);
     for ws in workspaces {
         let file = ws.root.join(".mbx.toml");
         match fs::read_to_string(&file) {
@@ -393,7 +541,23 @@ fn mbx_problems(checkout: &Checkout, mbx: &Mbx, workspaces: &[Workspace]) -> Vec
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
             Err(e) => problems.push(format!("{}: {e}", display(checkout, &file))),
         }
-        if let Some(p) = target_problem(checkout, &ws.root.join("target"), &storage) {
+        let target = ws.root.join("target");
+        if ws.metadata_error.is_none() {
+            match metadata(&ws.dir, marker) {
+                Ok(m) if normalize(&m.target_dir) == normalize(&target) => {}
+                Ok(m) => problems.push(format!(
+                    "workspace {}: cargo builds in {}, not in {}; mbx manages only the workspace's `target` (a CARGO_BUILD_TARGET_DIR or `build.target-dir` setting moves it)",
+                    ws.rel,
+                    m.target_dir.display(),
+                    display(checkout, &target)
+                )),
+                Err(e) => problems.push(format!(
+                    "workspace {}: cannot ask cargo for its target folder: {e}",
+                    ws.rel
+                )),
+            }
+        }
+        if let Some(p) = target_problem(checkout, &target, &storage) {
             problems.push(p);
         }
     }
@@ -401,8 +565,8 @@ fn mbx_problems(checkout: &Checkout, mbx: &Mbx, workspaces: &[Workspace]) -> Vec
 }
 
 /// `mbx settings get <key>`: the value as text (empty when unset).
-fn mbx_setting(root: &Path, key: &str) -> std::result::Result<String, String> {
-    let out = Command::new("mbx")
+fn mbx_setting(root: &Path, key: &str, marker: &str) -> std::result::Result<String, String> {
+    let out = command("mbx", marker)
         .args(["settings", "get", key])
         .current_dir(root)
         .stdin(Stdio::null())
@@ -477,8 +641,12 @@ fn flatten(prefix: &str, table: &toml::Table, out: &mut Vec<(String, toml::Value
 
 /// Where mbx keeps managed build folders: `target.root`, else `<cache_dir>/targets`, else the
 /// platform's default cache folder.
-fn mbx_target_roots(root: &Path) -> Vec<PathBuf> {
-    let get = |key: &str| mbx_setting(root, key).ok().filter(|v| !v.is_empty());
+fn mbx_target_roots(root: &Path, marker: &str) -> Vec<PathBuf> {
+    let get = |key: &str| {
+        mbx_setting(root, key, marker)
+            .ok()
+            .filter(|v| !v.is_empty())
+    };
     if let Some(r) = get("target.root") {
         return vec![PathBuf::from(r)];
     }
@@ -592,9 +760,10 @@ mod tests {
         assert!(got[0].contains(".mbx.toml sets build_script_execution = true"));
         assert!(!f("[target]\nseed = false\n").is_empty());
         assert!(f("[target]\nseed = true\n").is_empty());
-        assert!(
-            !f("\"target.seed\" = false\n").is_empty() || f("\"target.seed\" = false\n").is_empty()
-        );
+        // A quoted key with a dot is the same listed key.
+        let got = f("\"target.seed\" = false\n");
+        assert_eq!(got.len(), 1, "{got:?}");
+        assert!(got[0].contains("sets target.seed = false"), "{got:?}");
         assert!(!f("= nope").is_empty());
     }
 

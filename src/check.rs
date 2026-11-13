@@ -17,22 +17,27 @@ use crate::nextest::{self, Verdict};
 use crate::platform::Platform;
 use crate::preflight::Context;
 use crate::prereq::{self, Workspace};
-use crate::runs::{Outcome, Run, RunResult, StepStatus};
+use crate::runs::{self, Outcome, Run, RunResult, StepStatus};
+use crate::settings::Exclude;
 use crate::tree;
 
 /// Runs the check; the exit code is 0 for GREEN (or `compile: OK`) and 1 for RED.
 pub fn run(ctx: &Context, compile_only: bool) -> Result<Exit> {
     let checkout = &ctx.checkout;
-    let workspaces = prereq::workspaces(checkout, &ctx.settings);
+    // The prerequisite commands carry the id the run then takes, so any of them that leaves a
+    // process behind is found by the marker scan.
+    let marker = runs::new_run_id()?;
+    let workspaces = prereq::workspaces(checkout, &ctx.settings, &marker);
     let platform = Platform::current();
-    let snapshot = prereq::verify(checkout, &ctx.settings, &workspaces, platform)?;
+    let snapshot = prereq::verify(checkout, &ctx.settings, &workspaces, platform, &marker)?;
 
     let started = Instant::now();
-    let mut run = Run::start(
+    let mut run = Run::start_with_id(
         &ctx.state,
         LockKey::worktree(checkout),
         "check",
         &checkout.root,
+        Some(&marker),
     )?;
     let run_id = run.id().to_owned();
     let run_dir = run.dir().to_path_buf();
@@ -272,6 +277,8 @@ impl Checker<'_> {
             .as_ref()
             .map(|r| r.exclude.clone())
             .unwrap_or_default();
+        let mut applied_anywhere = vec![false; exclude.len()];
+        let mut tried = false;
         for (i, ws) in workspaces.iter().enumerate() {
             let name = self.suffixed("tests", ws);
             if !healthy[i] {
@@ -282,36 +289,46 @@ impl Checker<'_> {
                 println!("  {name}: skipped (compile failed)");
                 continue;
             }
-            for e in &exclude {
-                println!("  excluded: {} ({})", e.filter, e.reason);
+            // Only the exclusions nextest accepts in this workspace (a `package()` naming a
+            // package of another workspace is an error here) go into its run.
+            let mut applicable: Vec<Exclude> = Vec::new();
+            let mut counts: Vec<usize> = Vec::new();
+            for (k, e) in exclude.iter().enumerate() {
+                tried = true;
+                let file = format!("excluded-{}-{k}.json", file_tag(ws));
+                match self.list_matching(&format!("{name}:exclusion-{k}"), ws, &e.filter, &file)? {
+                    Some(n) => {
+                        applied_anywhere[k] = true;
+                        applicable.push(e.clone());
+                        counts.push(n);
+                        println!("  excluded: {} ({})", e.filter, e.reason);
+                    }
+                    None => println!(
+                        "  excluded: {} is not applied in workspace {}: nextest does not accept it there",
+                        e.filter, ws.rel
+                    ),
+                }
+                if self.stop {
+                    return Ok(());
+                }
             }
-            if !exclude.is_empty() {
-                // The tests the run leaves out: what the exclusion filtersets match.
-                let any = exclude
+            if applicable.len() == 1 {
+                self.excluded += counts[0];
+            } else if applicable.len() > 1 {
+                // Overlapping exclusions count each test once.
+                let any = applicable
                     .iter()
                     .map(|e| format!("({})", e.filter))
                     .collect::<Vec<_>>()
                     .join(" | ");
-                let mut argv: Vec<String> = [
-                    "cargo",
-                    "nextest",
-                    "list",
-                    "--workspace",
-                    "--locked",
-                    "--ignore-default-filter",
-                    "--message-format",
-                    "json",
-                    "-E",
-                ]
-                .map(str::to_owned)
-                .to_vec();
-                argv.push(any);
                 let file = format!("excluded-{}.json", file_tag(ws));
-                if self.step(&format!("{name}:exclusions"), &argv, &ws.dir, Some(&file))? {
-                    let text = fs::read_to_string(self.run.dir().join(&file)).unwrap_or_default();
-                    self.excluded += nextest::count_matching(&text);
+                if let Some(n) =
+                    self.list_matching(&format!("{name}:exclusions"), ws, &any, &file)?
+                {
+                    self.excluded += n;
                 }
             }
+            let exclude = applicable;
             let mut argv = vec!["cargo".to_owned()];
             argv.extend(nextest::run_args(&exclude));
             let file = format!("tests-{}.jsonl", file_tag(ws));
@@ -346,7 +363,62 @@ impl Checker<'_> {
                 return Ok(());
             }
         }
+        if tried {
+            for (k, e) in exclude.iter().enumerate() {
+                if !applied_anywhere[k] {
+                    self.fail(
+                        "exclusions",
+                        format!(
+                            "exclusion {} ({}) is not accepted by nextest in any workspace; nothing was left out for it",
+                            e.filter, e.reason
+                        ),
+                    );
+                }
+            }
+        }
         Ok(())
+    }
+
+    /// `cargo nextest list` with `filter` in `ws`: how many tests it matches, or `None` when
+    /// nextest rejects it there. A rejection is an answer, not a failure of the run.
+    fn list_matching(
+        &mut self,
+        name: &str,
+        ws: &Workspace,
+        filter: &str,
+        file: &str,
+    ) -> Result<Option<usize>> {
+        let mut argv: Vec<String> = [
+            "cargo",
+            "nextest",
+            "list",
+            "--workspace",
+            "--locked",
+            "--ignore-default-filter",
+            "--message-format",
+            "json",
+            "-E",
+        ]
+        .map(str::to_owned)
+        .to_vec();
+        argv.push(filter.to_owned());
+        let env = Self::env(nextest::JSON_ENV);
+        let rec = self
+            .run
+            .step_with_stdout(name, &argv, &ws.dir, &env, Some(file))?;
+        if self.run.interrupted().is_some() {
+            self.stop = true;
+        }
+        if rec.status == StepStatus::Failed {
+            self.run.discard_failed_step();
+            return Ok(None);
+        }
+        if !rec.passed() {
+            println!("  {name}: could not list the excluded tests ({})", rec.log);
+            return Ok(None);
+        }
+        let text = fs::read_to_string(self.run.dir().join(file)).unwrap_or_default();
+        Ok(Some(nextest::count_matching(&text)))
     }
 
     fn project_steps(&mut self) -> Result<()> {
@@ -380,11 +452,16 @@ impl Checker<'_> {
                 Err(e) => self.fail("tree", e.message),
             }
         }
+        for line in prereq::recheck_nextest(self.checkout(), snapshot) {
+            self.fail("nextest-config", line);
+        }
+        let marker = self.run.id().to_owned();
         let lines = prereq::recheck(
             self.checkout(),
             &self.ctx.settings,
             self.workspaces,
             snapshot,
+            &marker,
         );
         for line in lines {
             self.fail("mbx", line);

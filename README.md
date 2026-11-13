@@ -30,9 +30,10 @@ derived Rust structs and implement the whole specification, where these template
 fields and anything else must be an error.
 
 `atelier check [--compile-only]` proves the tree in a worktree: tool prerequisites (Rust
-toolchain, nextest pin, declared tools, nextest-file refusals, and with `[prerequisites.mbx]` the
-mbx version, settings, `.mbx.toml`, `cargo` on `PATH`, bypass variables and the build folder, read
-again at the end), the run lock, the tree id, `check.prepare` hooks, format, compile, nextest with
+toolchain, nextest pin, declared tools, nextest-file refusals (default filters, retries, flaky
+passes, `on-timeout` other than `fail`, wrapper scripts; the files are read again at the end), and
+with `[prerequisites.mbx]` the mbx version, settings, `.mbx.toml`, absolute `PATH` entries, `cargo`
+on `PATH`, bypass variables and the build folder cargo really uses, read again at the end), the run lock, the tree id, `check.prepare` hooks, format, compile, nextest with
 the fixed no-retry flags, `check.steps`, the survivor scan. Per-test results are kept in the run
 folder (`tests.tsv`, nextest's libtest JSON in `tests-<workspace>.jsonl`).
 
