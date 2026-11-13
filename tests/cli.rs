@@ -190,8 +190,6 @@ fn stub_commands_preflight_then_exit_2() {
         (&["promote"], "3.4"),
         (&["tmp", "--", "true"], "3.5"),
         (&["clean"], "3.5"),
-        (&["test", "--all"], "3.6"),
-        (&["machines"], "3.6"),
         (&["status"], "3.8"),
     ] {
         let out = repo.atelier(args);

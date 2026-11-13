@@ -10,10 +10,12 @@ use crate::dispatch::{self, DISPATCHED_VAR, Decision, VERSION};
 use crate::exit::{Exit, Failure, Result};
 use crate::git::Checkout;
 use crate::preflight::{self, Needs};
+use crate::remote_run::{self, RemoteAction};
 use crate::rules;
 use crate::settings::{self, SETTINGS_PATH};
 use crate::state::State;
 use crate::task;
+use crate::testcmd;
 
 #[derive(Debug, Parser)]
 #[command(
@@ -121,6 +123,12 @@ pub enum Cmd {
         #[command(subcommand)]
         action: Option<MachinesCmd>,
     },
+    /// Internal: the machine side of a run started over ssh by `test` or `merge`.
+    #[command(hide = true)]
+    RemoteRun {
+        #[command(subcommand)]
+        action: RemoteAction,
+    },
 }
 
 #[derive(Debug, Subcommand)]
@@ -147,6 +155,7 @@ impl Cmd {
             Cmd::Agents => "agents",
             Cmd::Status => "status",
             Cmd::Machines { .. } => "machines",
+            Cmd::RemoteRun { .. } => "remote-run",
         }
     }
 
@@ -157,7 +166,7 @@ impl Cmd {
             Cmd::Start { .. } | Cmd::Follow => "3.3",
             Cmd::Approve { .. } | Cmd::Merge { .. } | Cmd::Promote { .. } => "3.4",
             Cmd::Tmp { .. } | Cmd::Clean { .. } => "3.5",
-            Cmd::Test { .. } | Cmd::Machines { .. } => "3.6",
+            Cmd::Test { .. } | Cmd::Machines { .. } | Cmd::RemoteRun { .. } => "3.6",
             Cmd::Init { .. } | Cmd::Rules | Cmd::Task { .. } | Cmd::Agents => "3.7",
             Cmd::Status => "3.8",
         }
@@ -227,6 +236,34 @@ fn main_with(args: &[OsString]) -> Result<Exit> {
 
 /// Runs a parsed command in `cwd`.
 pub fn run(cmd: Cmd, cwd: &Path) -> Result<Exit> {
+    match cmd {
+        Cmd::RemoteRun { action } => return remote_run::main(action),
+        Cmd::Test {
+            platform,
+            all,
+            command,
+        } => {
+            let ctx = preflight::run(
+                cwd,
+                "test",
+                Cmd::Test {
+                    platform: None,
+                    all,
+                    command: Vec::new(),
+                }
+                .needs(),
+            )?;
+            return testcmd::test(&ctx, cwd, platform.as_deref(), all, command);
+        }
+        Cmd::Machines { action } => {
+            let ctx = preflight::run(cwd, "machines", Cmd::Machines { action: None }.needs())?;
+            return match action {
+                None => testcmd::list(&ctx),
+                Some(MachinesCmd::Init { name }) => testcmd::init(&ctx, &name),
+            };
+        }
+        _ => {}
+    }
     match &cmd {
         Cmd::Init { version } => {
             init_preflight(cwd, version.as_deref())?;
