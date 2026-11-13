@@ -1,0 +1,61 @@
+atelier = "0.1.0"
+integration_branch = "main"            # checked out in the main checkout; moved only by `merge`/`promote`
+workspaces = ["app/SiloUI"]            # folders holding a Cargo workspace
+promotion_wait_seconds = 300           # how long `merge` keeps retrying a busy main checkout
+
+[rust]
+nextest = "0.9.151"
+# [[rust.exclude]]                     # a test deliberately not run: nextest filterset + required reason. Silo: none.
+
+[prerequisites.mbx]                    # optional; leave out for plain cargo
+version = "1.30.0"
+cargo = ["~/.local/bin/cargo", "~/Library/Application Support/mbx/bin/cargo"]
+settings = { build_script_execution = false, learned_incremental = true, seed_incremental = true, "target.seed" = true, share_out_dir = false, eager_incremental = false, share_workspace_root = false }
+
+[[prerequisites.tools]]
+name = "node"
+run = ["node", "--version"]
+expect = "v24."
+[[prerequisites.tools]]
+platforms = ["macos-aarch64"]          # optional: only machines that run these platforms need it [REV4 9]
+name = "lychee"
+run = ["lychee", "--version"]
+expect = "lychee 0.24.2"
+
+[[check.prepare]]                      # before the Rust steps and before every platform run; may write only git-ignored files; optional `platforms = [...]`
+name = "private-build-file"
+run = [".atelier/hooks/private-build-file.sh"]   # on a remote machine it needs the file in that machine's own place, or fails naming it
+[[check.prepare]]
+name = "npm-ci"
+run = ["npm", "--prefix", "app/SiloUI", "ci"]
+[[check.prepare]]
+name = "runtime"
+run = [".atelier/hooks/runtime.sh"]
+
+[[check.steps]]                        # after the Rust steps; each is a script CI calls too
+name = "frontend"
+run = ["app/SiloUI/scripts/ci/frontend.sh"]
+[[check.steps]]
+name = "typecheck"
+run = ["npm", "--prefix", "app/SiloUI", "run", "typecheck"]
+compile = true                         # also part of --compile-only
+[[check.steps]]
+name = "scripts"
+run = ["app/SiloUI/scripts/ci/scripts.sh"]
+[[check.steps]]
+name = "links"
+run = ["app/SiloUI/scripts/ci/links.sh"]
+
+[[merge.after]]                        # in the gate worktree, after merging; its changes are committed
+name = "api-regenerate"
+run = [".atelier/hooks/api-regenerate.sh"]
+commit = "Regenerate API files"
+
+[platforms.macos-aarch64]             # what must pass, and where; machines come from the owner's machines file (2.5)
+run = "check"                          # the full `atelier check`
+# Before every run on any machine, full or narrow: the `check.prepare` hooks that apply to the platform, then its own `prepare` [REV4 7, round 2].
+[platforms.linux-x86_64]
+prepare = ["app/SiloUI/scripts/ci/linux-prepare.sh"]   # Node preflight, bundled Git staging; before every run here, full or narrow
+run = ["app/SiloUI/scripts/ci/linux.sh"]               # the tests CI's Linux job runs
+# machines = ["linux-box"]             # optional: this project's own order, overriding the machines file
+# gui = true                           # optional: only machines with a GUI session qualify
