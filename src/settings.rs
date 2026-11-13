@@ -161,6 +161,21 @@ pub fn read_pin(text: &str) -> Result<String> {
     Ok(pin.to_owned())
 }
 
+/// Reads only `integration_branch` (default `main`) from settings text, ignoring every other key,
+/// so that the branch can be read from any version's committed settings.
+pub fn read_integration_branch(text: &str) -> Result<String> {
+    let table: toml::Table = toml::from_str(text)
+        .map_err(|e| Failure::refused(format!("{SETTINGS_PATH}: {}", one_line(&e.to_string()))))?;
+    match table.get("integration_branch") {
+        None => Ok(default_integration_branch()),
+        Some(v) => v.as_str().map(str::to_owned).ok_or_else(|| {
+            Failure::refused(format!(
+                "{SETTINGS_PATH}: integration_branch is not a string"
+            ))
+        }),
+    }
+}
+
 /// A version string usable as one path segment: `MAJOR.MINOR.PATCH`, optionally `-<pre-release>`.
 pub fn validate_version(v: &str) -> std::result::Result<(), String> {
     let (core, pre) = match v.split_once('-') {

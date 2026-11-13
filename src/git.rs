@@ -29,6 +29,15 @@ pub fn command(dir: &Path) -> Command {
     cmd
 }
 
+/// A git command that leads its own process group, so a Ctrl-C or a stop signal sent to the
+/// terminal's group never reaches it (for a push that must not be cut short).
+pub fn command_own_group(dir: &Path) -> Command {
+    use std::os::unix::process::CommandExt;
+    let mut cmd = command(dir);
+    cmd.process_group(0);
+    cmd
+}
+
 /// Runs git and returns its output whatever the exit status.
 pub fn output<I, S>(dir: &Path, args: I) -> Result<Output>
 where

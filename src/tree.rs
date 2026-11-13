@@ -22,6 +22,32 @@ impl Drop for TempIndex {
     }
 }
 
+const INDEX_PREFIX: &str = "atelier-tree-index-";
+
+/// Removes temporary indexes left by an atelier that was killed: those whose process (named in
+/// the file name) no longer exists. A reused pid only keeps a leftover a little longer.
+fn remove_stale_indexes(git_dir: &std::path::Path) {
+    let Ok(entries) = fs::read_dir(git_dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let Some(rest) = name.to_str().and_then(|n| n.strip_prefix(INDEX_PREFIX)) else {
+            continue;
+        };
+        let Some(pid) = rest.split('-').next().and_then(|p| p.parse::<i32>().ok()) else {
+            continue;
+        };
+        // SAFETY: existence check only.
+        let gone = pid > 0
+            && unsafe { libc::kill(pid, 0) } != 0
+            && std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH);
+        if gone {
+            let _ = fs::remove_file(entry.path());
+        }
+    }
+}
+
 /// Computes the tree id of the worktree. Refuses (4) a tree with an entry of mode 160000 and a
 /// tree git cannot record (a nested repository without a commit, for one).
 pub fn tree_id(checkout: &Checkout) -> Result<String> {
@@ -29,8 +55,9 @@ pub fn tree_id(checkout: &Checkout) -> Result<String> {
         &checkout.root,
         ["rev-parse", "--path-format=absolute", "--git-path", "index"],
     )?);
+    remove_stale_indexes(&checkout.git_dir);
     let tmp = TempIndex(checkout.git_dir.join(format!(
-        "atelier-tree-index-{}-{}",
+        "{INDEX_PREFIX}{}-{}",
         std::process::id(),
         fsutil::random_hex(6)?
     )));

@@ -380,3 +380,73 @@ fn a_symbolic_integration_branch_is_refused() {
         stderr(&out)
     );
 }
+
+#[test]
+fn versioned_commands_run_only_in_the_main_checkout_on_its_integration_branch() {
+    let repo = Repo::new();
+    repo.install_self(VERSION);
+    let settings = |branch: &str| {
+        format!(
+            "atelier = \"{VERSION}\"\nintegration_branch = \"{branch}\"\n[platforms.macos-aarch64]\nrun = \"check\"\n"
+        )
+    };
+    // main pins another version.
+    repo.write(
+        ".atelier/atelier.toml",
+        "atelier = \"9.9.9\"\n[platforms.macos-aarch64]\nrun = \"check\"\n",
+    );
+    repo.commit_all("pin 9.9.9 on main");
+
+    // The review's case: an upgrade branch pins this version and names itself the integration
+    // branch, in its own worktree. The worktree's settings play no part.
+    let wt = repo.tmp.path().join("up");
+    git(
+        &repo.root,
+        &["worktree", "add", "-q", "-b", "up", wt.to_str().unwrap()],
+    );
+    fs::write(wt.join(".atelier/atelier.toml"), settings("up")).unwrap();
+    git(&wt, &["add", "-A"]);
+    git(&wt, &["commit", "-q", "-m", "up names itself"]);
+    let out = repo.atelier_in(&wt, &["approve", "a", "abc"]);
+    assert_eq!(code(&out), 4, "{}", stderr(&out));
+    assert!(
+        stderr(&out).contains("runs only with the atelier version pinned on main (9.9.9)"),
+        "{}",
+        stderr(&out)
+    );
+    assert!(!repo.root.join(".git/atelier/versioned").exists());
+
+    // With main pinning this version, a linked worktree is still refused.
+    repo.write(".atelier/atelier.toml", &settings("main"));
+    repo.commit_all("pin this version on main");
+    let out = repo.atelier_in(&wt, &["approve", "a", "abc"]);
+    assert_eq!(code(&out), 4, "{}", stderr(&out));
+    assert!(
+        stderr(&out).contains("runs only in the main checkout"),
+        "{}",
+        stderr(&out)
+    );
+    assert!(!repo.root.join(".git/atelier/versioned").exists());
+
+    // The main checkout on another branch that names main is refused too.
+    git(&repo.root, &["switch", "-q", "-c", "feature"]);
+    let out = repo.atelier(&["approve", "a", "abc"]);
+    assert_eq!(code(&out), 4, "{}", stderr(&out));
+    assert!(
+        stderr(&out).contains("runs only in the main checkout on main; it is on feature"),
+        "{}",
+        stderr(&out)
+    );
+    // A detached HEAD as well.
+    git(&repo.root, &["switch", "-q", "--detach"]);
+    let out = repo.atelier(&["approve", "a", "abc"]);
+    assert_eq!(code(&out), 4, "{}", stderr(&out));
+    assert!(stderr(&out).contains("detached"), "{}", stderr(&out));
+    assert!(!repo.root.join(".git/atelier/versioned").exists());
+
+    // On main, in the main checkout: the preflight passes (the command is a stub, exit 2).
+    git(&repo.root, &["switch", "-q", "main"]);
+    let out = repo.atelier(&["approve", "a", "abc"]);
+    assert_eq!(code(&out), 2, "{}", stderr(&out));
+    assert!(repo.root.join(".git/atelier/versioned/format").is_file());
+}

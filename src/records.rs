@@ -1,6 +1,8 @@
 //! Frozen-layer records (DESIGN §2.2, §2.4): branch records and the temp-folder registry. Their
-//! format never changes, so any atelier version may read and write them. Behaviour (`start`,
-//! `follow`, `tmp`, `clean`) comes in modules 3.3 and 3.5; this module fixes the files.
+//! format is frozen (`docs/FROZEN-LAYER.md`), so any atelier version may read and write them:
+//! later versions may add fields, never change or remove one. A reader keeps the fields it does
+//! not know (`later`) and writes them back unchanged. Behaviour (`start`, `follow`, `tmp`,
+//! `clean`) comes in modules 3.3 and 3.5; this module fixes the files.
 
 use std::fs;
 use std::io::ErrorKind;
@@ -11,6 +13,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::exit::{Failure, IoContext, Result};
 use crate::fsutil;
+use crate::refs::check_oid;
 use crate::state::State;
 
 /// A branch's lifecycle state.
@@ -23,28 +26,35 @@ pub enum BranchState {
 }
 
 /// A `follow` that started a rebase and has not been settled yet.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Pending {
     pub target: String,
     pub old_base: String,
+    /// Fields written by a later version, kept as they are.
+    #[serde(flatten)]
+    pub later: toml::Table,
 }
 
 /// One fact per branch: what it is built on (DESIGN §2.4).
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct BranchRecord {
     pub name: String,
     /// New for every `start`.
     pub lifetime: String,
     /// The branch it is built on: the integration branch or another item.
     pub lower: String,
-    /// The lower branch's lifetime id; absent for the integration branch.
+    /// The lower branch is the integration branch (then `lower_lifetime` is absent).
+    pub lower_is_integration: bool,
+    /// The lower branch's lifetime id; absent exactly when the lower branch is the integration
+    /// branch.
     pub lower_lifetime: Option<String>,
     /// The exact commit of what it is built on.
     pub base: String,
     pub state: BranchState,
     pub pending: Option<Pending>,
+    /// Fields written by a later version, kept as they are.
+    #[serde(flatten)]
+    pub later: toml::Table,
 }
 
 /// A fresh lifetime id.
@@ -70,10 +80,36 @@ impl BranchRecord {
                 record.name
             )));
         }
+        record.validate().map_err(|f| f.context(path.display()))?;
         Ok(Some(record))
     }
 
+    /// Checks what later commands rely on: full commit ids (they reach `git rebase --onto`),
+    /// atelier ids, and a lower lifetime exactly when the lower branch is not the integration
+    /// branch.
+    pub fn validate(&self) -> Result<()> {
+        check_plain_id(&self.lifetime)?;
+        check_oid(&self.base).map_err(|f| Failure::refused(f.message).context("base"))?;
+        if let Some(p) = &self.pending {
+            check_oid(&p.target)
+                .map_err(|f| Failure::refused(f.message).context("pending.target"))?;
+            check_oid(&p.old_base)
+                .map_err(|f| Failure::refused(f.message).context("pending.old_base"))?;
+        }
+        match (&self.lower_lifetime, self.lower_is_integration) {
+            (None, true) => Ok(()),
+            (Some(l), false) => check_plain_id(l),
+            (Some(_), true) => Err(Failure::refused(
+                "lower_is_integration is true but lower_lifetime is set",
+            )),
+            (None, false) => Err(Failure::refused(
+                "lower_lifetime is missing for a lower branch that is not the integration branch",
+            )),
+        }
+    }
+
     pub fn write(&self, state: &State) -> Result<()> {
+        self.validate()?;
         let path = state.branch_record_path(&self.name);
         let text = toml::to_string(self).map_err(|e| Failure::refused(e.to_string()))?;
         fsutil::write_atomic(&path, text.as_bytes()).ctx(path.display())
@@ -81,16 +117,20 @@ impl BranchRecord {
 }
 
 /// One registered temp folder: its exact path and file-system identity.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct TmpEntry {
+    /// Canonical: no symbolic link anywhere in it (`/private/var/...`, not `/var/...`).
     pub path: PathBuf,
     pub dev: u64,
     pub ino: u64,
+    /// Fields written by a later version, kept as they are.
+    #[serde(flatten)]
+    pub later: toml::Table,
 }
 
 impl TmpEntry {
-    /// Records an existing folder's identity.
+    /// Records an existing folder's identity under its canonical path. Refuses (4) a path that
+    /// is not a real folder (a link to one included) and one that is not UTF-8.
     pub fn of(path: &Path) -> Result<TmpEntry> {
         let meta = fs::symlink_metadata(path).ctx(path.display())?;
         if !meta.is_dir() {
@@ -99,10 +139,20 @@ impl TmpEntry {
                 path.display()
             )));
         }
+        // The last component is not a link (checked above), so this only resolves the parents.
+        let canonical = fs::canonicalize(path).ctx(path.display())?;
+        if canonical.to_str().is_none() {
+            return Err(Failure::refused(format!(
+                "{} is not a UTF-8 path; atelier registers only UTF-8 paths",
+                path.display()
+            )));
+        }
+        let meta = fs::symlink_metadata(&canonical).ctx(canonical.display())?;
         Ok(TmpEntry {
-            path: path.to_path_buf(),
+            path: canonical,
             dev: meta.dev(),
             ino: meta.ino(),
+            later: toml::Table::new(),
         })
     }
 
@@ -119,7 +169,9 @@ impl TmpEntry {
         check_plain_id(id)?;
         let dir = state.tmp_dir().join(lifetime);
         match fs::create_dir(&dir) {
-            Ok(()) => {}
+            Ok(()) => fs::File::open(state.tmp_dir())
+                .and_then(|d| d.sync_all())
+                .ctx(state.tmp_dir().display())?,
             Err(e) if e.kind() == ErrorKind::AlreadyExists => {}
             Err(e) => return Err(Failure::refused(format!("{}: {e}", dir.display()))),
         }
@@ -181,18 +233,113 @@ mod tests {
             name: "disk/ui".into(),
             lifetime: new_lifetime_id().unwrap(),
             lower: "main".into(),
+            lower_is_integration: true,
             lower_lifetime: None,
             base: "a".repeat(40),
             state: BranchState::Active,
             pending: Some(Pending {
                 target: "b".repeat(40),
                 old_base: "a".repeat(40),
+                later: toml::Table::new(),
             }),
+            later: toml::Table::new(),
         };
         r.write(&state).unwrap();
         assert!(state.root().join("branches/disk%2Fui.toml").is_file());
         assert_eq!(BranchRecord::read(&state, "disk/ui").unwrap(), Some(r));
         assert_eq!(BranchRecord::read(&state, "disk%2Fui").unwrap(), None);
+    }
+
+    #[test]
+    fn later_fields_are_read_and_written_back() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = State::open_at(dir.path().join("atelier")).unwrap();
+        let path = state.branch_record_path("x");
+        let a = "a".repeat(40);
+        let b = "b".repeat(64);
+        fs::write(
+            &path,
+            format!(
+                "name = \"x\"\nlifetime = \"00ff\"\nlower = \"y\"\nlower_is_integration = false\nlower_lifetime = \"11ee\"\nbase = \"{a}\"\nstate = \"active\"\nreviewed_by = \"later\"\n\n[pending]\ntarget = \"{b}\"\nold_base = \"{a}\"\nstep = 3\n\n[extra]\nkey = [1, 2]\n"
+            ),
+        )
+        .unwrap();
+        let r = BranchRecord::read(&state, "x").unwrap().unwrap();
+        assert_eq!(r.later["reviewed_by"].as_str(), Some("later"));
+        assert!(r.later["extra"].is_table());
+        assert_eq!(
+            r.pending.as_ref().unwrap().later["step"].as_integer(),
+            Some(3)
+        );
+        r.write(&state).unwrap();
+        assert_eq!(BranchRecord::read(&state, "x").unwrap().unwrap(), r);
+        let text = fs::read_to_string(&path).unwrap();
+        assert!(text.contains("reviewed_by = \"later\""), "{text}");
+        assert!(text.contains("step = 3"), "{text}");
+    }
+
+    #[test]
+    fn records_with_bad_commits_or_lower_fields_are_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = State::open_at(dir.path().join("atelier")).unwrap();
+        let a = "a".repeat(40);
+        for (body, why) in [
+            (
+                "lower_is_integration = true\nbase = \"HEAD~1\"\n".to_owned(),
+                "base",
+            ),
+            (
+                "lower_is_integration = true\nbase = \"--upload-pack=x\"\n".to_owned(),
+                "base",
+            ),
+            (
+                format!(
+                    "lower_is_integration = true\nbase = \"{a}\"\n[pending]\ntarget = \"main\"\nold_base = \"{a}\"\n"
+                ),
+                "pending.target",
+            ),
+            (
+                format!("lower_is_integration = false\nbase = \"{a}\"\n"),
+                "lower_lifetime",
+            ),
+            (
+                format!("lower_is_integration = true\nlower_lifetime = \"00ff\"\nbase = \"{a}\"\n"),
+                "lower_is_integration",
+            ),
+            (format!("base = \"{a}\"\n"), "lower_is_integration"),
+        ] {
+            let path = state.branch_record_path("x");
+            let text = format!(
+                "name = \"x\"\nlifetime = \"00ff\"\nlower = \"main\"\nstate = \"active\"\n{body}"
+            );
+            // `state` must come before any table: put tables last.
+            fs::write(&path, text).unwrap();
+            let e = BranchRecord::read(&state, "x").unwrap_err();
+            assert_eq!(e.exit, crate::exit::Exit::Refused);
+            assert!(e.message.contains(why), "{why}: {}", e.message);
+        }
+    }
+
+    #[test]
+    fn tmp_entries_store_the_canonical_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let real = fs::canonicalize(dir.path()).unwrap();
+        let link = real.join("link");
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+        fs::create_dir(real.join("t")).unwrap();
+        // Through a linked parent: the entry names the real path.
+        let e = TmpEntry::of(&link.join("t")).unwrap();
+        assert_eq!(e.path, real.join("t"));
+        assert!(e.still_matches());
+        // A link as the folder itself is refused.
+        assert!(TmpEntry::of(&link).is_err());
+        #[cfg(target_os = "linux")]
+        {
+            use std::os::unix::ffi::OsStrExt;
+            let odd = real.join(std::ffi::OsStr::from_bytes(b"x\xff"));
+            fs::create_dir(&odd).unwrap();
+            assert!(TmpEntry::of(&odd).unwrap_err().message.contains("UTF-8"));
+        }
     }
 
     #[test]

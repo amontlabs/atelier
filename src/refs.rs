@@ -139,7 +139,7 @@ fn check_refname(refname: &str) -> Result<()> {
 }
 
 /// A full object id: 40 or 64 lowercase hex digits.
-fn check_oid(oid: &str) -> Result<()> {
+pub fn check_oid(oid: &str) -> Result<()> {
     let ok = (oid.len() == 40 || oid.len() == 64)
         && oid
             .bytes()

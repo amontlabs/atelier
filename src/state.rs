@@ -2,11 +2,12 @@
 //!
 //! **Frozen layer**, the same in every version, so any version may use it: `state.lock`, the lock
 //! files under `locks/`, the run folders under `runs/`, the temp-folder registry under `tmp/`,
-//! and the branch records under `branches/`. These paths and formats never change.
+//! and the branch records under `branches/`. These paths never change, and their formats only
+//! gain fields that older readers ignore (`docs/FROZEN-LAYER.md`).
 //!
 //! **Versioned layer**, under `versioned/`, with a format number in `versioned/format`:
 //! approvals, the merge record, the promotion record. Only the version pinned on the integration
-//! branch reads or writes it.
+//! branch reads or writes it, and only in the main checkout on that branch.
 //!
 //! Every command takes `state.lock` shared before anything else and holds it until it exits. A
 //! conversion of the versioned layer takes it exclusive, without waiting.
@@ -158,27 +159,110 @@ impl State {
             ));
         }
         let result = (|| {
-            let dir = self.versioned_dir();
             while let Some(f) = self.format()?.filter(|f| *f < current) {
                 if f == 0 {
                     return Err(Failure::refused(
                         "versioned/format: 0 is not a format number",
                     ));
                 }
-                (converters[(f - 1) as usize])(&dir)
-                    .map_err(|e| e.context(format!("converting state format {f}")))?;
-                fsutil::write_atomic(&dir.join("format"), format!("{}\n", f + 1).as_bytes())
-                    .ctx("versioned/format")?;
+                self.convert_one(f, converters[(f - 1) as usize])?;
             }
             Ok(())
         })();
         self.lock.lock_shared().ctx("state.lock")?;
         result
     }
+
+    /// Converts format `f` to `f + 1` into a new folder, then swaps the two folders in one
+    /// rename. A crash at any point leaves either the old layer whole (the next conversion starts
+    /// again from it) or the new one whole; the converter never sees its own half-done output.
+    fn convert_one(&self, f: u32, converter: Converter) -> Result<()> {
+        let dir = self.versioned_dir();
+        let next = self.root.join("versioned.next");
+        remove_tree(&next)?;
+        create_dir(&next)?;
+        converter(&dir, &next).map_err(|e| e.context(format!("converting state format {f}")))?;
+        fsutil::write_atomic(&next.join("format"), format!("{}\n", f + 1).as_bytes())
+            .ctx("versioned.next/format")?;
+        sync_tree(&next).ctx("versioned.next")?;
+        swap(&dir, &next).map_err(|e| {
+            Failure::refused(format!(
+                "cannot swap {} and {}: {e}",
+                dir.display(),
+                next.display()
+            ))
+        })?;
+        File::open(&self.root)
+            .and_then(|d| d.sync_all())
+            .ctx(self.root.display())?;
+        // `versioned.next` now holds the old format.
+        remove_tree(&next)
+    }
 }
 
-/// Converts the versioned layer in the given folder from one format to the next.
-pub type Converter = fn(&Path) -> Result<()>;
+/// Converts the versioned layer of format `n`, in the first folder (read only), into format
+/// `n + 1`, written into the second, empty folder. atelier writes the new `format` file and
+/// flushes everything the converter wrote.
+pub type Converter = fn(&Path, &Path) -> Result<()>;
+
+/// Exchanges two folders atomically.
+#[cfg(target_os = "macos")]
+fn swap(a: &Path, b: &Path) -> std::io::Result<()> {
+    use std::os::unix::ffi::OsStrExt;
+    let a = std::ffi::CString::new(a.as_os_str().as_bytes())?;
+    let b = std::ffi::CString::new(b.as_os_str().as_bytes())?;
+    // SAFETY: two valid NUL-terminated paths.
+    if unsafe { libc::renamex_np(a.as_ptr(), b.as_ptr(), libc::RENAME_SWAP) } == 0 {
+        Ok(())
+    } else {
+        Err(std::io::Error::last_os_error())
+    }
+}
+
+/// Exchanges two folders atomically.
+#[cfg(target_os = "linux")]
+fn swap(a: &Path, b: &Path) -> std::io::Result<()> {
+    use std::os::unix::ffi::OsStrExt;
+    let a = std::ffi::CString::new(a.as_os_str().as_bytes())?;
+    let b = std::ffi::CString::new(b.as_os_str().as_bytes())?;
+    // SAFETY: two valid NUL-terminated paths, relative to nothing (they are absolute or cwd).
+    let r = unsafe {
+        libc::renameat2(
+            libc::AT_FDCWD,
+            a.as_ptr(),
+            libc::AT_FDCWD,
+            b.as_ptr(),
+            libc::RENAME_EXCHANGE,
+        )
+    };
+    if r == 0 {
+        Ok(())
+    } else {
+        Err(std::io::Error::last_os_error())
+    }
+}
+
+fn remove_tree(p: &Path) -> Result<()> {
+    match fs::remove_dir_all(p) {
+        Ok(()) => Ok(()),
+        Err(e) if e.kind() == ErrorKind::NotFound => Ok(()),
+        Err(e) => Err(Failure::refused(format!("{}: {e}", p.display()))),
+    }
+}
+
+/// Flushes every file and folder under `p` to disk, `p` included.
+fn sync_tree(p: &Path) -> std::io::Result<()> {
+    for entry in fs::read_dir(p)? {
+        let path = entry?.path();
+        let meta = fs::symlink_metadata(&path)?;
+        if meta.is_dir() {
+            sync_tree(&path)?;
+        } else if meta.is_file() {
+            File::open(&path)?.sync_all()?;
+        }
+    }
+    File::open(p)?.sync_all()
+}
 
 /// Access to the versioned layer, for as long as the shared `state.lock` is held.
 #[derive(Debug)]
@@ -199,15 +283,31 @@ fn write_format_if_absent(dir: &Path, format: u32) -> Result<()> {
         std::process::id(),
         fsutil::random_hex(4)?
     ));
-    fs::write(&tmp, format!("{format}\n")).ctx(tmp.display())?;
+    let written = (|| {
+        let mut f = OpenOptions::new().write(true).create_new(true).open(&tmp)?;
+        std::io::Write::write_all(&mut f, format!("{format}\n").as_bytes())?;
+        f.sync_all()
+    })();
+    if let Err(e) = written {
+        let _ = fs::remove_file(&tmp);
+        return Err(Failure::refused(format!("{}: {e}", tmp.display())));
+    }
     // A hard link never replaces an existing file: the first creator wins.
     let r = fs::hard_link(&tmp, dir.join("format"));
     let _ = fs::remove_file(&tmp);
     match r {
-        Ok(()) => Ok(()),
-        Err(e) if e.kind() == ErrorKind::AlreadyExists => Ok(()),
-        Err(e) => Err(Failure::refused(format!("versioned/format: {e}"))),
+        Ok(()) => {}
+        Err(e) if e.kind() == ErrorKind::AlreadyExists => {}
+        Err(e) => return Err(Failure::refused(format!("versioned/format: {e}"))),
     }
+    // The link and the temp file's removal are flushed with the folder; so is the folder's own
+    // entry in the state folder, created just before.
+    for d in [dir, dir.parent().unwrap_or(dir)] {
+        File::open(d)
+            .and_then(|f| f.sync_all())
+            .map_err(|e| Failure::refused(format!("{}: {e}", d.display())))?;
+    }
+    Ok(())
 }
 
 fn create_dir(p: &Path) -> Result<()> {
@@ -218,9 +318,9 @@ fn create_dir(p: &Path) -> Result<()> {
     }
 }
 
-/// The atelier version pinned in the integration branch's own tree, or `None` when that branch
-/// has no settings yet. The ref must be plain.
-pub fn pin_on_integration_branch(checkout: &Checkout, branch: &str) -> Result<Option<String>> {
+/// The settings text committed at a branch's tip, or `None` when the branch or the file does
+/// not exist. The ref must be plain.
+pub fn committed_settings(checkout: &Checkout, branch: &str) -> Result<Option<String>> {
     let refname = names::branch_ref(branch);
     let Some(commit) = refs::read(&checkout.root, &refname)? else {
         return Ok(None);
@@ -236,9 +336,58 @@ pub fn pin_on_integration_branch(checkout: &Checkout, branch: &str) -> Result<Op
     if !out.status.success() {
         return Ok(None);
     }
-    settings::read_pin(&String::from_utf8_lossy(&out.stdout))
+    Ok(Some(String::from_utf8_lossy(&out.stdout).into_owned()))
+}
+
+/// The atelier version pinned in the integration branch's own tree, or `None` when that branch
+/// has no settings yet. The ref must be plain.
+pub fn pin_on_integration_branch(checkout: &Checkout, branch: &str) -> Result<Option<String>> {
+    let Some(text) = committed_settings(checkout, branch)? else {
+        return Ok(None);
+    };
+    settings::read_pin(&text)
         .map(Some)
         .map_err(|f| f.context(format!("{branch}:{}", settings::SETTINGS_PATH)))
+}
+
+/// The integration branch as the main checkout sees it: the branch the main checkout's `HEAD`
+/// names, and the integration branch the settings committed on that branch name. Neither comes
+/// from the worktree a command runs in.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MainBranch {
+    /// The branch the main checkout is on; `None` when its `HEAD` is detached.
+    pub head: Option<String>,
+    /// `integration_branch` committed on `head`; `None` when `head` has no settings.
+    pub integration: Option<String>,
+}
+
+impl MainBranch {
+    pub fn read(checkout: &Checkout) -> Result<MainBranch> {
+        // The main checkout's HEAD lives in the common git folder.
+        let out = git::output(&checkout.common_dir, ["symbolic-ref", "-q", "HEAD"])?;
+        let head = out
+            .status
+            .success()
+            .then(|| String::from_utf8_lossy(&out.stdout).trim().to_owned())
+            .and_then(|r| r.strip_prefix("refs/heads/").map(str::to_owned));
+        let Some(head) = head else {
+            return Ok(MainBranch {
+                head: None,
+                integration: None,
+            });
+        };
+        let integration = match committed_settings(checkout, &head)? {
+            Some(text) => Some(
+                settings::read_integration_branch(&text)
+                    .map_err(|f| f.context(format!("{head}:{}", settings::SETTINGS_PATH)))?,
+            ),
+            None => None,
+        };
+        Ok(MainBranch {
+            head: Some(head),
+            integration,
+        })
+    }
 }
 
 #[cfg(test)]
@@ -251,8 +400,15 @@ mod tests {
         (dir, s)
     }
 
-    fn bump(dir: &Path) -> Result<()> {
-        fs::write(dir.join("converted"), "yes").ctx("converted")
+    fn bump(from: &Path, to: &Path) -> Result<()> {
+        assert!(from.join("format").is_file());
+        assert_eq!(fs::read_dir(to).unwrap().count(), 0, "starts empty");
+        fs::write(to.join("converted"), "yes").ctx("converted")
+    }
+
+    fn half_then_fail(_from: &Path, to: &Path) -> Result<()> {
+        fs::write(to.join("half"), "written").ctx("half")?;
+        Err(Failure::refused("crashed"))
     }
 
     #[test]
@@ -307,6 +463,48 @@ mod tests {
         let other = File::open(s.root().join("state.lock")).unwrap();
         assert!(other.try_lock().is_err());
         assert!(other.try_lock_shared().is_ok());
+    }
+
+    #[test]
+    fn an_interrupted_conversion_reruns_from_the_old_layer() {
+        let (_d, s) = state();
+        let v = s.versioned(1, &[]).unwrap();
+        fs::write(v.dir().join("approvals"), "old").unwrap();
+        // The converter dies half-way: the old layer is untouched and still format 1.
+        let e = s.versioned(2, &[half_then_fail]).unwrap_err();
+        assert!(
+            e.message.contains("converting state format 1"),
+            "{}",
+            e.message
+        );
+        assert_eq!(s.format().unwrap(), Some(1));
+        assert_eq!(
+            fs::read_to_string(s.root().join("versioned/approvals")).unwrap(),
+            "old"
+        );
+        assert!(!s.root().join("versioned/half").exists());
+        // A crash also leaves the half-written folder behind; the rerun starts from scratch.
+        assert!(s.root().join("versioned.next/half").exists());
+        let v = s.versioned(2, &[bump]).unwrap();
+        assert!(v.dir().join("converted").is_file());
+        assert!(!v.dir().join("half").exists());
+        assert!(!s.root().join("versioned.next").exists());
+        assert_eq!(s.format().unwrap(), Some(2));
+    }
+
+    #[test]
+    fn the_format_file_is_written_whole() {
+        let (_d, s) = state();
+        s.versioned(1, &[]).unwrap();
+        assert_eq!(
+            fs::read_to_string(s.root().join("versioned/format")).unwrap(),
+            "1\n"
+        );
+        let leftovers: Vec<_> = fs::read_dir(s.root().join("versioned"))
+            .unwrap()
+            .map(|e| e.unwrap().file_name())
+            .collect();
+        assert_eq!(leftovers, vec![std::ffi::OsString::from("format")]);
     }
 
     #[test]

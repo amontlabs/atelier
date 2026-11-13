@@ -8,7 +8,7 @@ It deletes only what it made and what was merged. Agents get generated rules tha
 parts the project uses.
 
 The design is kept outside this repository (`DESIGN.md`, revision 5, with mechanics in
-`DESIGN-r4.md`).
+`DESIGN-r4.md`). The formats every version shares are in [docs/FROZEN-LAYER.md](docs/FROZEN-LAYER.md).
 
 ## Status: skeleton (module 3.1)
 
@@ -52,8 +52,8 @@ rustix are not needed. Two more crates:
 - `libc`: `kill` on process groups, `setsid` in tests, and `sysctl(KERN_PROCARGS2)`, the source
   `ps -E` reads on macOS. With it, the survivor scan compares each environment entry exactly,
   where a command line that happens to contain the marker text would match `ps -E` output.
-- `signal-hook`: installs the TERM, INT and HUP handlers safely. The handler only records the
-  signal.
+- `signal-hook`: installs the TERM, INT and HUP handlers safely. During a run the handler only
+  records the signal; outside runs it runs the signal's default action.
 
 ## Install (once releases exist)
 

@@ -380,3 +380,40 @@ fn a_nested_repository_that_is_not_ignored_is_refused() {
     repo.write(".gitignore", "nested/\n");
     assert!(tree::tree_id(&repo.checkout()).is_ok());
 }
+
+#[test]
+fn temporary_indexes_of_dead_ateliers_are_removed() {
+    let repo = Repo::new();
+    let checkout = repo.checkout();
+    let dead = repo.root.join(".git/atelier-tree-index-9999999-00aa");
+    let live = repo.root.join(format!(
+        ".git/atelier-tree-index-{}-00bb",
+        std::process::id()
+    ));
+    fs::write(&dead, "x").unwrap();
+    fs::write(&live, "x").unwrap();
+    tree::tree_id(&checkout).unwrap();
+    assert!(!dead.exists(), "a dead atelier's leftover is removed");
+    assert!(live.exists(), "a live atelier's index is left alone");
+    fs::remove_file(live).unwrap();
+}
+
+#[test]
+fn git_can_run_in_its_own_process_group() {
+    let repo = Repo::new();
+    let out = atelier::git::command_own_group(&repo.root)
+        .args(["rev-parse", "--git-dir"])
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+    // Its group is not this test's: the probe is a shell that prints its own pgid.
+    let mut cmd = std::process::Command::new("/bin/sh");
+    cmd.args(["-c", "ps -o pgid= -p $$"]);
+    std::os::unix::process::CommandExt::process_group(&mut cmd, 0);
+    let pgid: i32 = String::from_utf8_lossy(&cmd.output().unwrap().stdout)
+        .trim()
+        .parse()
+        .unwrap();
+    // SAFETY: getpgrp has no preconditions.
+    assert_ne!(pgid, unsafe { libc::getpgrp() });
+}

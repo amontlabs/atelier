@@ -15,7 +15,7 @@ use std::time::{Duration, Instant};
 
 use atelier::exit::Exit;
 use atelier::locks::LockKey;
-use atelier::runs::{Outcome, Run, RunResult, STEP_TRAMPOLINE, StepStatus};
+use atelier::runs::{Outcome, Run, RunInfo, RunKind, RunResult, STEP_TRAMPOLINE, StepStatus};
 use atelier::state::State;
 use atelier::tree;
 use common::*;
@@ -36,6 +36,8 @@ fn probe_child_entry() {
             sleep(Duration::from_secs(60));
             0
         }
+        "nested" => probe_nested(),
+        "after-run" => probe_after_run(),
         other => panic!("unknown probe mode {other}"),
     };
     std::process::exit(code);
@@ -49,6 +51,7 @@ fn probe_run() -> i32 {
     let run = match Run::start(
         &state,
         LockKey::branch("probe/branch"),
+        RunKind::Check,
         "probe",
         Path::new("/"),
     ) {
@@ -72,6 +75,63 @@ fn probe_run() -> i32 {
         Outcome::Passed => 0,
         Outcome::Failed | Outcome::Interrupted => 1,
     }
+}
+
+/// An atelier inside a step of another: runs one step that leaves a survivor, then exits.
+fn probe_nested() -> i32 {
+    let state_root = PathBuf::from(std::env::var("ATELIER_TEST_STATE").unwrap());
+    let state = State::open_at(state_root).unwrap();
+    let mut run = Run::start(
+        &state,
+        LockKey::branch("inner"),
+        RunKind::Gate,
+        "inner",
+        Path::new("/"),
+    )
+    .unwrap();
+    let me = std::env::current_exe().unwrap();
+    run.step(
+        "escape",
+        &[
+            me.to_string_lossy().into_owned(),
+            "probe_child_entry".into(),
+            "--exact".into(),
+            "--nocapture".into(),
+            "--test-threads=1".into(),
+        ],
+        Path::new("/"),
+        &[(PROBE.into(), "escape".into())],
+    )
+    .unwrap();
+    let result = run.finish(true).unwrap();
+    fs::write(
+        std::env::var("ATELIER_TEST_INNER").unwrap(),
+        format!("{}\n{}", result.id, result.survivors.join("\n")),
+    )
+    .unwrap();
+    0
+}
+
+/// Finishes a run, says so, then waits: a stop signal must end it as it would any program.
+fn probe_after_run() -> i32 {
+    let state_root = PathBuf::from(std::env::var("ATELIER_TEST_STATE").unwrap());
+    let flag = PathBuf::from(std::env::var("ATELIER_TEST_PIDFILE").unwrap());
+    let state = State::open_at(state_root).unwrap();
+    let mut run = Run::start(
+        &state,
+        LockKey::branch("after"),
+        RunKind::Check,
+        "after",
+        Path::new("/"),
+    )
+    .unwrap();
+    run.step("t", &["/usr/bin/true".into()], Path::new("/"), &[])
+        .unwrap();
+    run.finish(true).unwrap();
+    fs::write(&flag, "finished").unwrap();
+    sleep(Duration::from_secs(30));
+    fs::write(&flag, "still alive").unwrap();
+    0
 }
 
 /// Starts a sleeper in a new session (it leaves the step's group, keeping the environment),
@@ -181,7 +241,14 @@ fn a_step_runs_as_its_own_group_leader_with_the_run_marker() {
     let repo = Repo::new();
     let checkout = repo.checkout();
     let state = State::open(&checkout).unwrap();
-    let mut run = Run::start(&state, LockKey::worktree(&checkout), "probe", &repo.root).unwrap();
+    let mut run = Run::start(
+        &state,
+        LockKey::worktree(&checkout),
+        RunKind::Check,
+        "probe",
+        &repo.root,
+    )
+    .unwrap();
     let tree = tree::tree_id(&checkout).unwrap();
     let head_tree = tree::head_tree(&checkout).unwrap().unwrap();
     run.set_tree(
@@ -232,7 +299,14 @@ fn a_step_runs_as_its_own_group_leader_with_the_run_marker() {
 fn a_failing_or_missing_program_fails_the_run() {
     let repo = Repo::new();
     let state = State::open(&repo.checkout()).unwrap();
-    let mut run = Run::start(&state, LockKey::branch("x"), "probe", &repo.root).unwrap();
+    let mut run = Run::start(
+        &state,
+        LockKey::branch("x"),
+        RunKind::Check,
+        "probe",
+        &repo.root,
+    )
+    .unwrap();
     assert_eq!(
         run.step("bad", &sh("exit 3"), &repo.root, &[])
             .unwrap()
@@ -286,7 +360,14 @@ fn a_step_that_leaves_its_group_populated_fails_and_the_group_is_stopped() {
     let repo = Repo::new();
     let state = State::open(&repo.checkout()).unwrap();
     let pidfile = repo.tmp.path().join("bg.pid");
-    let mut run = Run::start(&state, LockKey::branch("x"), "probe", &repo.root).unwrap();
+    let mut run = Run::start(
+        &state,
+        LockKey::branch("x"),
+        RunKind::Check,
+        "probe",
+        &repo.root,
+    )
+    .unwrap();
     let step = run
         .step(
             "bg",
@@ -326,7 +407,14 @@ fn a_member_that_ignores_term_is_killed() {
     let repo = Repo::new();
     let state = State::open(&repo.checkout()).unwrap();
     let pidfile = repo.tmp.path().join("bg.pid");
-    let run = Run::start(&state, LockKey::branch("x"), "probe", &repo.root).unwrap();
+    let run = Run::start(
+        &state,
+        LockKey::branch("x"),
+        RunKind::Check,
+        "probe",
+        &repo.root,
+    )
+    .unwrap();
     let mut run = run.with_grace(Duration::from_millis(300));
     let started = Instant::now();
     let step = run
@@ -354,7 +442,14 @@ fn a_survivor_that_left_its_group_makes_the_run_red_and_blocks_the_next_run() {
     let state = State::open(&repo.checkout()).unwrap();
     let pidfile = repo.tmp.path().join("sleeper.pid");
     let me = std::env::current_exe().unwrap();
-    let mut run = Run::start(&state, LockKey::branch("x"), "probe", &repo.root).unwrap();
+    let mut run = Run::start(
+        &state,
+        LockKey::branch("x"),
+        RunKind::Check,
+        "probe",
+        &repo.root,
+    )
+    .unwrap();
     let id = run.id().to_owned();
     let step = run
         .step(
@@ -393,7 +488,14 @@ fn a_survivor_that_left_its_group_makes_the_run_red_and_blocks_the_next_run() {
     assert!(alive(sleeper));
 
     // The next command under the same lock refuses while it lives.
-    let e = Run::start(&state, LockKey::branch("x"), "probe", &repo.root).unwrap_err();
+    let e = Run::start(
+        &state,
+        LockKey::branch("x"),
+        RunKind::Check,
+        "probe",
+        &repo.root,
+    )
+    .unwrap_err();
     assert_eq!(e.exit, Exit::Refused);
     assert!(e.message.contains(&sleeper.to_string()), "{}", e.message);
     assert!(
@@ -402,13 +504,26 @@ fn a_survivor_that_left_its_group_makes_the_run_red_and_blocks_the_next_run() {
         e.message
     );
     // Another lock is not affected.
-    Run::start(&state, LockKey::branch("y"), "probe", &repo.root)
-        .unwrap()
-        .finish(true)
-        .unwrap();
+    Run::start(
+        &state,
+        LockKey::branch("y"),
+        RunKind::Check,
+        "probe",
+        &repo.root,
+    )
+    .unwrap()
+    .finish(true)
+    .unwrap();
 
     kill_and_wait(sleeper, false);
-    let run = Run::start(&state, LockKey::branch("x"), "probe", &repo.root).unwrap();
+    let run = Run::start(
+        &state,
+        LockKey::branch("x"),
+        RunKind::Check,
+        "probe",
+        &repo.root,
+    )
+    .unwrap();
     assert_eq!(run.finish(true).unwrap().outcome, Outcome::Passed);
 }
 
@@ -428,7 +543,14 @@ fn a_killed_atelier_leaves_a_live_group_and_the_next_run_refuses() {
     let step = read_pid(&pidfile);
 
     // While the probe holds the lock, another run is refused for that reason.
-    let e = Run::start(&state, LockKey::branch("probe/branch"), "probe", &repo.root).unwrap_err();
+    let e = Run::start(
+        &state,
+        LockKey::branch("probe/branch"),
+        RunKind::Check,
+        "probe",
+        &repo.root,
+    )
+    .unwrap_err();
     assert_eq!(e.exit, Exit::Refused);
     assert!(
         e.message.contains("held by another atelier command"),
@@ -445,8 +567,24 @@ fn a_killed_atelier_leaves_a_live_group_and_the_next_run_refuses() {
         !run_dir.join("result").exists(),
         "a killed run has no result"
     );
+    // The group is recorded with its leader's start time.
+    let record = fs::read_to_string(state.locks_dir().join("branch/probe%2Fbranch.procs")).unwrap();
+    let start = atelier::procs::start_time(step).unwrap();
+    assert!(
+        record
+            .lines()
+            .any(|l| l.starts_with(&format!("group {step} ")) && l.ends_with(&format!(" {start}"))),
+        "{record}"
+    );
 
-    let e = Run::start(&state, LockKey::branch("probe/branch"), "probe", &repo.root).unwrap_err();
+    let e = Run::start(
+        &state,
+        LockKey::branch("probe/branch"),
+        RunKind::Check,
+        "probe",
+        &repo.root,
+    )
+    .unwrap_err();
     assert_eq!(e.exit, Exit::Refused);
     assert!(e.message.contains("still alive"), "{}", e.message);
     assert!(e.message.contains(&format!("{step} ")), "{}", e.message);
@@ -459,7 +597,14 @@ fn a_killed_atelier_leaves_a_live_group_and_the_next_run_refuses() {
     assert!(alive(step));
 
     kill_and_wait(step, true);
-    let run = Run::start(&state, LockKey::branch("probe/branch"), "probe", &repo.root).unwrap();
+    let run = Run::start(
+        &state,
+        LockKey::branch("probe/branch"),
+        RunKind::Check,
+        "probe",
+        &repo.root,
+    )
+    .unwrap();
     assert_eq!(run.finish(true).unwrap().outcome, Outcome::Passed);
 }
 
@@ -510,7 +655,14 @@ fn stop_signals_stop_the_group_and_write_a_result() {
             result.steps[0].left
         );
         // Nothing stays recorded, so the next run starts.
-        let run = Run::start(&state, LockKey::branch("probe/branch"), "probe", &repo.root).unwrap();
+        let run = Run::start(
+            &state,
+            LockKey::branch("probe/branch"),
+            RunKind::Check,
+            "probe",
+            &repo.root,
+        )
+        .unwrap();
         run.finish(true).unwrap();
     }
 }
@@ -537,4 +689,311 @@ fn the_lock_is_not_handed_to_children() {
     assert!(lock.try_lock().is_ok(), "the step does not hold the lock");
     drop(lock);
     kill_and_wait(step, true);
+}
+
+fn escape_argv() -> Vec<String> {
+    let me = std::env::current_exe().unwrap();
+    vec![
+        me.to_string_lossy().into_owned(),
+        "probe_child_entry".into(),
+        "--exact".into(),
+        "--nocapture".into(),
+        "--test-threads=1".into(),
+    ]
+}
+
+#[test]
+fn run_files_name_the_kind_the_lock_key_and_where_the_run_ran() {
+    let repo = Repo::new();
+    let state = State::open(&repo.checkout()).unwrap();
+    let mut run = Run::start(
+        &state,
+        LockKey::branch("a/b"),
+        RunKind::TestNarrow,
+        "test",
+        &repo.root,
+    )
+    .unwrap();
+    let id = run.id().to_owned();
+    let dir = run.dir().to_path_buf();
+    let info = RunInfo::read(&dir).unwrap().unwrap();
+    assert_eq!(info.kind, RunKind::TestNarrow);
+    assert_eq!(info.lock, "branch/a%2Fb");
+    assert_eq!(LockKey::from_id(&info.lock), Some(LockKey::branch("a/b")));
+    assert_eq!(info.branch.as_deref(), Some("main"));
+    assert_eq!(info.atelier_version, VERSION);
+    assert_eq!(
+        info.pid_start,
+        atelier::procs::start_time(std::process::id() as i32)
+    );
+    assert_eq!(info.runs.last(), Some(&id));
+    run.set_tests(atelier::runs::TestCounts {
+        passed: 7,
+        failed: 1,
+        flaky: 1,
+        skipped: 2,
+        excluded: 3,
+    });
+    run.set_test_results("junit.xml");
+    let result = run.finish(true).unwrap();
+    assert_eq!(result.kind, RunKind::TestNarrow);
+    assert_eq!(result.branch.as_deref(), Some("main"));
+    assert_eq!(result.worktree, repo.root);
+    assert_eq!(result.atelier_version, VERSION);
+    assert_eq!(
+        result.platform,
+        atelier::platform::Platform::current().map(|p| p.to_string())
+    );
+    assert_eq!(result.machine, None);
+    assert_eq!(result.tests.unwrap().excluded, 3);
+    assert_eq!(result.test_results.as_deref(), Some("junit.xml"));
+    assert_eq!(RunResult::read(&dir).unwrap().unwrap(), result);
+
+    // A later version's fields and kinds are read, not refused.
+    for file in ["result", "run.toml"] {
+        let text = fs::read_to_string(dir.join(file)).unwrap();
+        let text = text.replace("kind = \"test-narrow\"", "kind = \"bench\"");
+        fs::write(dir.join(file), format!("later_field = 1\n{text}")).unwrap();
+    }
+    let read = RunResult::read(&dir).unwrap().unwrap();
+    assert_eq!(read.kind, RunKind::Other("bench".into()));
+    assert_eq!(read.tests, result.tests);
+    assert_eq!(
+        RunInfo::read(&dir).unwrap().unwrap().kind,
+        RunKind::Other("bench".into())
+    );
+    // A file that is not TOML is refused.
+    fs::write(dir.join("result"), "not = = toml").unwrap();
+    assert_eq!(RunResult::read(&dir).unwrap_err().exit, Exit::Refused);
+}
+
+#[test]
+fn a_step_environment_cannot_replace_the_run_markers() {
+    let repo = Repo::new();
+    let state = State::open(&repo.checkout()).unwrap();
+    let mut run = Run::start(
+        &state,
+        LockKey::branch("x"),
+        RunKind::Check,
+        "probe",
+        &repo.root,
+    )
+    .unwrap();
+    let id = run.id().to_owned();
+    for var in ["ATELIER_RUN", "ATELIER_RUNS"] {
+        let e = run
+            .step(
+                "env",
+                &sh("true"),
+                &repo.root,
+                &[(var.into(), "other".into())],
+            )
+            .unwrap_err();
+        assert_eq!(e.exit, Exit::Usage, "{var}");
+        assert!(e.message.contains(var), "{}", e.message);
+    }
+    let step = run
+        .step(
+            "env",
+            &sh("echo \"run=$ATELIER_RUN runs=$ATELIER_RUNS\""),
+            &repo.root,
+            &[],
+        )
+        .unwrap();
+    assert_eq!(step.status, StepStatus::Passed);
+    let log = fs::read_to_string(run.dir().join("env.log")).unwrap();
+    assert!(log.contains(&format!("run={id} ")), "{log}");
+    let runs = log.split("runs=").nth(1).unwrap().trim();
+    assert_eq!(runs.split(':').next_back(), Some(id.as_str()), "{log}");
+    assert_eq!(run.steps().len(), 1, "refused steps are not recorded");
+    run.finish(true).unwrap();
+}
+
+#[test]
+fn a_program_name_starting_with_a_dash_is_refused() {
+    let repo = Repo::new();
+    let state = State::open(&repo.checkout()).unwrap();
+    let mut run = Run::start(
+        &state,
+        LockKey::branch("x"),
+        RunKind::Check,
+        "probe",
+        &repo.root,
+    )
+    .unwrap();
+    for argv in [
+        vec!["-x".to_owned()],
+        vec!["-c".to_owned(), "true".to_owned()],
+    ] {
+        let e = run.step("dash", &argv, &repo.root, &[]).unwrap_err();
+        assert_eq!(e.exit, Exit::Usage, "{argv:?}");
+    }
+    assert!(run.steps().is_empty());
+    run.finish(true).unwrap();
+}
+
+#[test]
+fn an_outer_run_finds_what_a_nested_atelier_left_behind() {
+    let repo = Repo::new();
+    let state = State::open(&repo.checkout()).unwrap();
+    let pidfile = repo.tmp.path().join("sleeper.pid");
+    let inner_file = repo.tmp.path().join("inner");
+    let mut run = Run::start(&state, LockKey::Gate, RunKind::Gate, "outer", &repo.root).unwrap();
+    let outer = run.id().to_owned();
+    let step = run
+        .step(
+            "nested",
+            &escape_argv(),
+            &repo.root,
+            &[
+                (PROBE.into(), "nested".into()),
+                (
+                    "ATELIER_TEST_STATE".into(),
+                    state.root().to_string_lossy().into_owned(),
+                ),
+                (
+                    "ATELIER_TEST_PIDFILE".into(),
+                    pidfile.to_string_lossy().into_owned(),
+                ),
+                (
+                    "ATELIER_TEST_INNER".into(),
+                    inner_file.to_string_lossy().into_owned(),
+                ),
+            ],
+        )
+        .unwrap();
+    assert_eq!(step.status, StepStatus::Passed, "{step:?}");
+    let sleeper = read_pid(&pidfile);
+    // The inner run saw its own survivor.
+    let inner = fs::read_to_string(&inner_file).unwrap();
+    let inner_id = inner.lines().next().unwrap().to_owned();
+    assert!(
+        inner.contains(&format!("\n{sleeper} ")),
+        "inner survivors: {inner}"
+    );
+    let inner_info = RunInfo::read(&state.runs_dir().join(&inner_id))
+        .unwrap()
+        .unwrap();
+    assert!(
+        inner_info
+            .runs
+            .ends_with(&[outer.clone(), inner_id.clone()])
+    );
+    // The outer run sees it too, through ATELIER_RUNS.
+    let result = run.finish(true).unwrap();
+    assert_eq!(result.outcome, Outcome::Failed);
+    assert!(
+        result
+            .survivors
+            .iter()
+            .any(|s| s.starts_with(&format!("{sleeper} "))),
+        "{:?}",
+        result.survivors
+    );
+    // Both locks refuse while it lives.
+    for key in [LockKey::Gate, LockKey::branch("inner")] {
+        let e = Run::start(&state, key.clone(), RunKind::Check, "probe", &repo.root).unwrap_err();
+        assert!(
+            e.message.contains(&format!("{sleeper} ")),
+            "{key:?}: {}",
+            e.message
+        );
+    }
+    kill_and_wait(sleeper, false);
+    Run::start(&state, LockKey::Gate, RunKind::Gate, "probe", &repo.root)
+        .unwrap()
+        .finish(true)
+        .unwrap();
+}
+
+fn failing_scan(_: &[String]) -> std::io::Result<Vec<(atelier::procs::ProcInfo, String)>> {
+    Err(std::io::Error::other("process list unavailable"))
+}
+
+#[test]
+fn a_failed_survivor_scan_keeps_the_run_recorded() {
+    let repo = Repo::new();
+    let state = State::open(&repo.checkout()).unwrap();
+    let run = Run::start(
+        &state,
+        LockKey::branch("x"),
+        RunKind::Check,
+        "probe",
+        &repo.root,
+    )
+    .unwrap()
+    .with_survivor_scan(failing_scan);
+    let id = run.id().to_owned();
+    let result = run.finish(true).unwrap();
+    assert_eq!(result.outcome, Outcome::Failed);
+    assert!(
+        result
+            .failures
+            .iter()
+            .any(|f| f.contains("cannot scan for processes left behind")),
+        "{:?}",
+        result.failures
+    );
+    let record = fs::read_to_string(state.locks_dir().join("branch/x.procs")).unwrap();
+    assert!(record.contains(&format!("run {id}")), "{record}");
+    // The next taker scans for it (nothing is left) and clears it.
+    Run::start(
+        &state,
+        LockKey::branch("x"),
+        RunKind::Check,
+        "probe",
+        &repo.root,
+    )
+    .unwrap()
+    .finish(true)
+    .unwrap();
+    assert!(!state.locks_dir().join("branch/x.procs").exists());
+}
+
+#[test]
+fn stop_signals_end_the_process_again_after_a_run() {
+    use std::os::unix::process::ExitStatusExt;
+    for ignore_hup in [false, true] {
+        let repo = Repo::new();
+        let state = State::open(&repo.checkout()).unwrap();
+        let flag = repo.tmp.path().join("flag");
+        let mut cmd = probe("after-run");
+        cmd.env("ATELIER_TEST_STATE", state.root())
+            .env("ATELIER_TEST_PIDFILE", &flag);
+        if ignore_hup {
+            // As under nohup: HUP ignored before atelier starts stays ignored.
+            // SAFETY: signal is async-signal-safe.
+            unsafe {
+                cmd.pre_exec(|| {
+                    libc::signal(libc::SIGHUP, libc::SIG_IGN);
+                    Ok(())
+                });
+            }
+        }
+        let mut child = cmd.spawn().unwrap();
+        wait_for("the run to finish", Duration::from_secs(20), || {
+            fs::read_to_string(&flag).is_ok_and(|s| s == "finished")
+        });
+        let sig = if ignore_hup {
+            // SAFETY: the probe is this test's child.
+            unsafe { libc::kill(child.id() as i32, libc::SIGHUP) };
+            sleep(Duration::from_millis(300));
+            assert!(child.try_wait().unwrap().is_none(), "HUP stays ignored");
+            libc::SIGINT
+        } else {
+            libc::SIGTERM
+        };
+        // SAFETY: the probe is this test's child.
+        unsafe { libc::kill(child.id() as i32, sig) };
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let status = loop {
+            if let Some(s) = child.try_wait().unwrap() {
+                break s;
+            }
+            assert!(Instant::now() < deadline, "the signal was swallowed");
+            sleep(Duration::from_millis(20));
+        };
+        assert_eq!(status.signal(), Some(sig), "{status:?}");
+        assert_eq!(fs::read_to_string(&flag).unwrap(), "finished");
+    }
 }
