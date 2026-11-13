@@ -48,6 +48,7 @@ use std::process::Command;
 
 use crate::dirfd;
 use crate::exit::{Exit, Failure, Result};
+pub use crate::gate::{gate_worktree, main_root};
 use crate::git::{self, Checkout, canonical};
 use crate::locks::{HeldLock, LockKey};
 use crate::names;
@@ -58,20 +59,6 @@ use crate::stack::Stack;
 
 /// A reason a check refused.
 type Check<T> = std::result::Result<T, String>;
-
-/// The folder `merge` checks `M` out in: `<main checkout>.gate`, beside the main checkout.
-pub fn gate_worktree(checkout: &Checkout) -> PathBuf {
-    let main = main_root(checkout);
-    let mut name = main.file_name().map(|n| n.to_owned()).unwrap_or_default();
-    name.push(".gate");
-    main.with_file_name(name)
-}
-
-/// The main checkout's folder, canonical.
-pub fn main_root(checkout: &Checkout) -> PathBuf {
-    let common = canonical(&checkout.common_dir);
-    common.parent().map(Path::to_path_buf).unwrap_or(common)
-}
 
 /// A short id of this repository for temp folder paths: the FNV-1a hash of its common git
 /// folder's canonical path.

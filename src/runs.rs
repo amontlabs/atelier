@@ -74,6 +74,8 @@ pub enum RunKind {
     Check,
     /// `atelier check --compile-only`.
     CheckCompile,
+    /// `atelier check --only <file>`: a red gate's failures re-run by name (bisection).
+    CheckOnly,
     /// The gate of `merge`.
     Gate,
     /// `atelier test` of the whole suite.
@@ -91,6 +93,7 @@ impl RunKind {
         match self {
             RunKind::Check => "check",
             RunKind::CheckCompile => "check-compile",
+            RunKind::CheckOnly => "check-only",
             RunKind::Gate => "gate",
             RunKind::TestFull => "test-full",
             RunKind::TestNarrow => "test-narrow",
@@ -106,6 +109,7 @@ impl From<String> for RunKind {
         match s.as_str() {
             "check" => RunKind::Check,
             "check-compile" => RunKind::CheckCompile,
+            "check-only" => RunKind::CheckOnly,
             "gate" => RunKind::Gate,
             "test-full" => RunKind::TestFull,
             "test-narrow" => RunKind::TestNarrow,
@@ -655,11 +659,18 @@ impl Run {
     /// run fail. The run stays recorded under its lock while survivors live, and when the scan
     /// failed, so the next taker of the lock scans for it again.
     pub fn finish(self, passed: bool) -> Result<RunResult> {
-        self.finish_then(
+        self.finish_keeping_lock(passed).map(|(r, _)| r)
+    }
+
+    /// As [`Run::finish`], handing the run's lock back to the caller instead of releasing it:
+    /// for the gate, whose promotion follows its run under the same lock.
+    pub fn finish_keeping_lock(self, passed: bool) -> Result<(RunResult, HeldLock)> {
+        let (result, lock) = self.finish_then(
             passed,
             || unreachable!("not called without a follow-up"),
             false,
-        )
+        )?;
+        Ok((result, lock.expect("the lock is kept without a follow-up")))
     }
 
     /// As [`Run::finish`], then, when the run would pass, `then` runs before the result is
@@ -667,7 +678,7 @@ impl Run {
     /// which takes the same lock), and the result includes `then`'s verdict and lines. Until
     /// then the run has no result, so no reader takes it for a pass.
     pub fn finish_after(self, passed: bool, then: impl FnOnce() -> FollowUp) -> Result<RunResult> {
-        self.finish_then(passed, then, true)
+        self.finish_then(passed, then, true).map(|(r, _)| r)
     }
 
     fn finish_then(
@@ -675,7 +686,7 @@ impl Run {
         passed: bool,
         then: impl FnOnce() -> FollowUp,
         follow: bool,
-    ) -> Result<RunResult> {
+    ) -> Result<(RunResult, Option<HeldLock>)> {
         let (survivors, scanned) = match (self.scan)(std::slice::from_ref(&self.id)) {
             Ok(found) => (
                 found
@@ -764,13 +775,13 @@ impl Run {
         fsutil::write_atomic(&self.dir.join("result"), text.as_bytes()).ctx("result")?;
         // Survivors keep the run recorded under the lock, so the next taker refuses while they
         // live; so does a scan that failed. Groups that could not be emptied stay recorded too.
-        if let Some(mut l) = lock
+        if let Some(l) = lock.as_mut()
             && scanned
             && survivors.is_empty()
         {
             l.remove_run(&self.id)?;
         }
-        Ok(result)
+        Ok((result, lock))
     }
 }
 

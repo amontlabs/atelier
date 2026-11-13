@@ -91,7 +91,7 @@ When nothing lives, the record is removed.
 | Field | Type | Meaning |
 |---|---|---|
 | `id` | string | the run id |
-| `kind` | string | `check`, `check-compile`, `gate`, `test-full`, `test-narrow`, `follow`, `tmp`, or a later kind |
+| `kind` | string | `check`, `check-compile`, `check-only` (a red gate's failures re-run by name, DESIGN §8.3), `gate`, `test-full`, `test-narrow`, `follow`, `tmp`, or a later kind |
 | `command` | string | the command, for people |
 | `lock` | string | the lock's machine key: its path under `locks/` without the extension (`gate`, `branch/<key>`, `worktree/<key>`) |
 | `worktree` | path | the worktree the run started in |

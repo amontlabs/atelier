@@ -24,9 +24,60 @@ use crate::tree;
 /// The per-test results in the run folder: workspace, test, verdict, seconds, tab-separated.
 const TEST_RESULTS: &str = "tests.tsv";
 
+/// What a narrow re-run (`atelier check --only <file>`, used by the gate's bisection, DESIGN
+/// §8.3) runs: the `check.prepare` hooks, then only these tests by name and these steps whole.
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct Only {
+    #[serde(default)]
+    pub tests: Vec<OnlyTest>,
+    /// Step names as a check's result names them (`fmt`, `compile@w`, a project step).
+    #[serde(default)]
+    pub steps: Vec<String>,
+}
+
+/// One test of [`Only`]: its workspace folder and nextest's name (`<binary id>$<test name>`).
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct OnlyTest {
+    pub workspace: String,
+    pub name: String,
+}
+
+impl Only {
+    pub fn read(path: &Path) -> Result<Only> {
+        let text = fs::read_to_string(path)
+            .map_err(|e| crate::exit::Failure::usage(format!("--only {}: {e}", path.display())))?;
+        toml::from_str(&text).map_err(|e| {
+            crate::exit::Failure::usage(format!(
+                "--only {}: {}",
+                path.display(),
+                e.to_string().trim()
+            ))
+        })
+    }
+
+    fn tests_in(&self, ws: &Workspace) -> Vec<&OnlyTest> {
+        self.tests
+            .iter()
+            .filter(|t| t.workspace == ws.rel)
+            .collect()
+    }
+
+    /// The nextest filterset selecting exactly these tests.
+    fn filterset(tests: &[&OnlyTest]) -> String {
+        tests
+            .iter()
+            .map(|t| match t.name.split_once('$') {
+                Some((bin, test)) => format!("(binary_id(={bin}) & test(={test}))"),
+                None => format!("test(={})", t.name),
+            })
+            .collect::<Vec<_>>()
+            .join(" | ")
+    }
+}
+
 /// Runs the check; the exit code is 0 for GREEN (or `compile: OK`) and 1 for RED.
 pub fn run(ctx: &Context, compile_only: bool) -> Result<Exit> {
-    run_noting(ctx, compile_only, &mut None)
+    run_mode(ctx, compile_only, None, &mut None)
 }
 
 /// The branch checked out here when atelier has a record of it.
@@ -47,6 +98,17 @@ fn started_branch(ctx: &Context) -> Result<Option<String>> {
 
 /// As [`run`], and sets `id` to the check's run id once the run has started.
 pub fn run_noting(ctx: &Context, compile_only: bool, id: &mut Option<String>) -> Result<Exit> {
+    run_mode(ctx, compile_only, None, id)
+}
+
+/// [`run`], or with `only` the narrow re-run of [`Only`]: 0 when none of the given failures
+/// appears, 1 otherwise; never GREEN. Sets `id` to the check's run id once the run has started.
+pub fn run_mode(
+    ctx: &Context,
+    compile_only: bool,
+    only: Option<Only>,
+    id: &mut Option<String>,
+) -> Result<Exit> {
     let checkout = &ctx.checkout;
     // In the worktree of a branch atelier started, the branch lock is held shared for the whole
     // check, so `clean`, `follow` and `start` refuse while it runs (r4 §3.9 step 1).
@@ -65,7 +127,9 @@ pub fn run_noting(ctx: &Context, compile_only: bool, id: &mut Option<String>) ->
     let mut run = Run::start_with_id(
         &ctx.state,
         LockKey::worktree(checkout),
-        if compile_only {
+        if only.is_some() {
+            RunKind::CheckOnly
+        } else if compile_only {
             RunKind::CheckCompile
         } else {
             RunKind::Check
@@ -103,6 +167,7 @@ pub fn run_noting(ctx: &Context, compile_only: bool, id: &mut Option<String>) ->
         excluded: 0,
         counts: None,
         compile_only,
+        only,
     };
     c.hooks()?;
     if !c.stop {
@@ -113,6 +178,7 @@ pub fn run_noting(ctx: &Context, compile_only: bool, id: &mut Option<String>) ->
     }
     c.end(&snapshot);
 
+    let c_only = c.only.is_some();
     let Checker {
         mut run,
         extras,
@@ -128,8 +194,18 @@ pub fn run_noting(ctx: &Context, compile_only: bool, id: &mut Option<String>) ->
             run.set_test_results(TEST_RESULTS);
         }
     }
+    let narrow = c_only;
     let result = run.finish(extras.is_empty())?;
     let elapsed = started.elapsed();
+    if narrow {
+        let passed = result.outcome == Outcome::Passed;
+        println!(
+            "check: only the given failures, run {run_id}: {}; log {}",
+            if passed { "none appeared" } else { "FAILED" },
+            run_dir.display()
+        );
+        return Ok(if passed { Exit::Ok } else { Exit::Fail });
+    }
     Ok(report(
         &result,
         &run_dir,
@@ -156,6 +232,8 @@ struct Checker<'a> {
     /// The result's test counts, once a test step has run.
     counts: Option<TestCounts>,
     compile_only: bool,
+    /// A narrow re-run: only these tests and steps.
+    only: Option<Only>,
 }
 
 impl Checker<'_> {
@@ -283,6 +361,9 @@ impl Checker<'_> {
 
         for (i, ws) in workspaces.iter().enumerate() {
             let name = self.suffixed("fmt", ws);
+            if self.only.as_ref().is_some_and(|o| !o.steps.contains(&name)) {
+                continue;
+            }
             if let Some(why) = &ws.metadata_error {
                 self.fail(&name, format!("workspace {}: {why}", ws.rel));
                 healthy[i] = false;
@@ -305,6 +386,11 @@ impl Checker<'_> {
                 continue;
             }
             let name = self.suffixed("compile", ws);
+            if self.only.as_ref().is_some_and(|o| !o.steps.contains(&name)) {
+                // A narrow re-run builds what its tests need through nextest itself.
+                compiled[i] = true;
+                continue;
+            }
             let argv: Vec<String> = ["cargo", "check", "--workspace", "--all-targets", "--locked"]
                 .map(str::to_owned)
                 .to_vec();
@@ -328,6 +414,16 @@ impl Checker<'_> {
         let mut tried = false;
         for (i, ws) in workspaces.iter().enumerate() {
             let name = self.suffixed("tests", ws);
+            let only_filter = match &self.only {
+                None => None,
+                Some(o) => {
+                    let tests = o.tests_in(ws);
+                    if tests.is_empty() {
+                        continue;
+                    }
+                    Some(Only::filterset(&tests))
+                }
+            };
             if !healthy[i] {
                 println!("  {name}: skipped (cargo metadata failed)");
                 continue;
@@ -341,6 +437,9 @@ impl Checker<'_> {
             let mut applicable: Vec<Exclude> = Vec::new();
             let mut counts: Vec<usize> = Vec::new();
             for (k, e) in exclude.iter().enumerate() {
+                if only_filter.is_some() {
+                    break;
+                }
                 tried = true;
                 let file = format!("excluded-{}-{k}.json", file_tag(ws));
                 match self.list_matching(&format!("{name}:exclusion-{k}"), ws, &e.filter, &file)? {
@@ -377,7 +476,16 @@ impl Checker<'_> {
             }
             let exclude = applicable;
             let mut argv = vec!["cargo".to_owned()];
-            argv.extend(nextest::run_args(&exclude));
+            match &only_filter {
+                None => argv.extend(nextest::run_args(&exclude)),
+                Some(f) => {
+                    argv.extend(["nextest", "run"].map(str::to_owned));
+                    argv.extend(nextest::FLAGS.iter().map(|s| (*s).to_owned()));
+                    argv.push("-E".to_owned());
+                    // The tests named failed in a full run, so no exclusion applies to them.
+                    argv.push(f.clone());
+                }
+            }
             let file = format!("tests-{}.jsonl", file_tag(ws));
             let ok = self.step(&name, &argv, &ws.dir, Some(&file))?;
             let stream = fs::read_to_string(self.run.dir().join(&file)).unwrap_or_default();
@@ -485,6 +593,7 @@ impl Checker<'_> {
             .steps
             .iter()
             .filter(|s| !self.compile_only || s.compile)
+            .filter(|s| self.only.as_ref().is_none_or(|o| o.steps.contains(&s.name)))
             .cloned()
             .collect();
         for s in steps {

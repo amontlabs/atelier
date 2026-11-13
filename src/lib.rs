@@ -3,10 +3,13 @@
 //! Module 3.1, the skeleton: exit codes, the dispatcher and pin, settings and the owner's files,
 //! the shared state and its locks, runs with process groups and the survivor scan, the tree id,
 //! and plain refs. Module 3.3: `start`, `follow` and the branch record rules (`stack`). Module
-//! 3.5: `tmp` and `clean`. Module 3.6: machines, `test` and remote runs. Other commands come in
-//! later modules.
+//! 3.4: `approve`, `merge` (`gate`, `bisect`), `promote` and the versioned records (`ledger`).
+//! Module 3.5: `tmp` and `clean`. Module 3.6: machines, `test` and remote runs. Other commands
+//! come in later modules.
 
 pub mod agents;
+pub mod approve;
+pub mod bisect;
 pub mod check;
 pub mod clean;
 pub mod cli;
@@ -16,8 +19,10 @@ pub mod exchange;
 pub mod exit;
 pub mod follow;
 pub mod fsutil;
+pub mod gate;
 pub mod git;
 pub mod jobs;
+pub mod ledger;
 pub mod locks;
 pub mod machines;
 pub mod names;
@@ -26,6 +31,7 @@ pub mod platform;
 pub mod preflight;
 pub mod prereq;
 pub mod procs;
+pub mod promote;
 pub mod records;
 pub mod refs;
 pub mod remote;

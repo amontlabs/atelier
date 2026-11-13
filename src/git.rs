@@ -144,3 +144,52 @@ impl Checkout {
 pub fn canonical(p: &Path) -> PathBuf {
     std::fs::canonicalize(p).unwrap_or_else(|_| p.to_path_buf())
 }
+
+/// One registered worktree, as `git worktree list --porcelain` reports it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WorktreeEntry {
+    pub path: PathBuf,
+    /// The commit its `HEAD` names; `None` on an unborn branch.
+    pub head: Option<String>,
+    /// The full ref its `HEAD` names; `None` when detached.
+    pub branch: Option<String>,
+    /// Registered, but its folder is missing.
+    pub prunable: bool,
+    /// The first entry: the main checkout (or the bare repository).
+    pub main: bool,
+}
+
+/// Every registered worktree of the clone `dir` belongs to, prunable ones included.
+pub fn worktree_list(dir: &Path) -> Result<Vec<WorktreeEntry>> {
+    let out = output(dir, ["worktree", "list", "--porcelain", "-z"])?;
+    if !out.status.success() {
+        return Err(Failure::refused(format!(
+            "git worktree list failed: {}",
+            String::from_utf8_lossy(&out.stderr).trim()
+        )));
+    }
+    let mut list: Vec<WorktreeEntry> = Vec::new();
+    for field in out.stdout.split(|&b| b == 0) {
+        let field = String::from_utf8_lossy(field);
+        if let Some(p) = field.strip_prefix("worktree ") {
+            let main = list.is_empty();
+            list.push(WorktreeEntry {
+                path: PathBuf::from(p),
+                head: None,
+                branch: None,
+                prunable: false,
+                main,
+            });
+            continue;
+        }
+        let Some(cur) = list.last_mut() else { continue };
+        if let Some(h) = field.strip_prefix("HEAD ") {
+            cur.head = Some(h.to_owned());
+        } else if let Some(b) = field.strip_prefix("branch ") {
+            cur.branch = Some(b.to_owned());
+        } else if field == "prunable" || field.starts_with("prunable ") {
+            cur.prunable = true;
+        }
+    }
+    Ok(list)
+}

@@ -43,6 +43,14 @@ pub enum Cmd {
         /// Format, compile, and the steps marked `compile = true` only.
         #[arg(long)]
         compile_only: bool,
+        /// Re-run only the failures listed in this file (the gate's bisection).
+        #[arg(
+            long,
+            value_name = "FILE",
+            hide = true,
+            conflicts_with = "compile_only"
+        )]
+        only: Option<PathBuf>,
     },
     /// Create a branch and record what it is built on.
     Start {
@@ -326,9 +334,36 @@ pub fn run(cmd: Cmd, cwd: &Path) -> Result<Exit> {
                 );
             }
         }
-        Cmd::Check { compile_only } => {
+        Cmd::Check { compile_only, only } => {
             let context = preflight::run(cwd, cmd.name(), cmd.needs())?;
-            return crate::check::run(&context, *compile_only);
+            let only = match only {
+                Some(f) => Some(crate::check::Only::read(f)?),
+                None => None,
+            };
+            return crate::check::run_mode(&context, *compile_only, only, &mut None);
+        }
+        Cmd::Approve { branch, commit } => {
+            let ctx = preflight::run(cwd, cmd.name(), cmd.needs())?;
+            return crate::approve::run(&ctx, branch, commit);
+        }
+        Cmd::Merge {
+            branches,
+            waive,
+            reason,
+        } => {
+            let ctx = preflight::run(cwd, cmd.name(), cmd.needs())?;
+            let waiver = match (waive, reason) {
+                (Some(platform), Some(reason)) => Some(crate::gate::Waiver {
+                    platform: platform.clone(),
+                    reason: reason.clone(),
+                }),
+                _ => None,
+            };
+            return crate::gate::run(&ctx, branches, waiver);
+        }
+        Cmd::Promote { discard } => {
+            let ctx = preflight::run(cwd, cmd.name(), cmd.needs())?;
+            return crate::promote::run(&ctx, *discard);
         }
         Cmd::Start {
             branch,

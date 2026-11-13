@@ -149,6 +149,10 @@ pub struct AfterHook {
     pub name: String,
     pub run: Vec<String>,
     pub commit: Option<String>,
+    /// Paths this hook rewrites: a gate merge whose conflicts are only in these is settled by
+    /// taking the incoming side, and the hook regenerates them (HF1).
+    #[serde(default)]
+    pub regenerates: Vec<String>,
 }
 
 #[derive(Debug, Clone, Deserialize, PartialEq)]
@@ -402,6 +406,20 @@ impl Settings {
             command_problems(root, &at, &a.run, &mut problems);
             if a.commit.as_deref().is_some_and(|c| c.trim().is_empty()) {
                 problems.push(format!("{at}: commit message is empty"));
+            }
+            for r in &a.regenerates {
+                if let Err(m) = project_path(root, r) {
+                    problems.push(format!("{at}: regenerates {m}"));
+                } else if r.ends_with('/')
+                    || Path::new(r)
+                        .components()
+                        .any(|c| matches!(c, Component::CurDir))
+                    || root.join(r).is_dir()
+                {
+                    problems.push(format!(
+                        "{at}: regenerates {r:?} must name one file, as git names it"
+                    ));
+                }
             }
         }
         if let Some(r) = &self.merge.resolver
