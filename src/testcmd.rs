@@ -495,7 +495,8 @@ fn outcome_of(o: &Outcome) -> Ended {
 }
 
 /// `atelier machines`: every machine with its platform, GUI, priority, place, and whether it
-/// is reachable, ready (with the first failing line) and busy.
+/// is reachable, ready (with the first failing line; a remote machine's prerequisites only when
+/// a run starts) and busy.
 pub fn list(ctx: &Context) -> Result<Exit> {
     let home = home()?;
     let file = MachinesFile::load_owner(&home)?;
@@ -532,6 +533,11 @@ pub fn list(ctx: &Context) -> Result<Exit> {
     Ok(Exit::Ok)
 }
 
+/// A remote machine's readiness as the probe knows it: the tool prerequisites depend on the
+/// commit's files, so they are checked when a run starts there, and a machine that lacks one is
+/// then passed over like one that is not ready.
+const REMOTE_READY: &str = "ready (prerequisites checked at run time)";
+
 fn state_of(ctx: &Context, home: &Path, name: &str, m: &Machine) -> String {
     if m.platform().os == Os::Windows {
         return "not supported (Windows)".to_owned();
@@ -552,8 +558,8 @@ fn state_of(ctx: &Context, home: &Path, name: &str, m: &Machine) -> String {
     }
     let r = Remote::new(name, m, &ctx.checkout);
     match r.probe(&m.platform) {
-        Probe::Ready => "reachable, ready, free".to_owned(),
-        Probe::Busy(h) => format!("reachable, ready, busy ({h})"),
+        Probe::Ready => format!("reachable, {REMOTE_READY}, free"),
+        Probe::Busy(h) => format!("reachable, {REMOTE_READY}, busy ({h})"),
         Probe::NotReady(l) => format!("reachable, not ready: {l}"),
         Probe::Offline(d) => format!("offline ({d})"),
     }

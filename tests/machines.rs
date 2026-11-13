@@ -239,7 +239,10 @@ fn machines_lists_reachable_ready_and_busy() {
     };
     assert!(line("down").contains("offline"), "{text}");
     assert!(line("box").contains("ssh box"), "{text}");
-    assert!(line("box").ends_with("reachable, ready, free"), "{text}");
+    assert!(
+        line("box").ends_with("reachable, ready (prerequisites checked at run time), free"),
+        "{text}"
+    );
     assert!(
         line("here").contains("this computer, ready, free"),
         "{text}"
@@ -255,7 +258,7 @@ fn machines_lists_reachable_ready_and_busy() {
     let _held = hold_machine_lock(&w.machines.join("box"));
     let out = w.run(&["machines"]);
     assert!(
-        stdout(&out).contains("reachable, ready, busy (pid "),
+        stdout(&out).contains("reachable, ready (prerequisites checked at run time), busy (pid "),
         "{}",
         both(&out)
     );
@@ -1243,5 +1246,81 @@ fn a_failing_check_fails_the_platforms_recorded_run_here_and_there() {
     assert_eq!(
         caller.last().unwrap().outcome,
         atelier::runs::Outcome::Failed
+    );
+}
+
+/// A project whose tool `frob` exists on `box2` only (a file in its HOME), tried on `box` first.
+fn prerequisite_world() -> World {
+    let w = World::new(
+        "machines = [\"box\", \"box2\"]\n\n[[prerequisites.tools]]\nname = \"frob\"\nrun = [\"sh\", \"-c\", \"test -e $HOME/frob && echo v1\"]\nexpect = \"v1\"\n",
+    );
+    fs::write(w.repo.home.join("frob"), "").unwrap();
+    let box2 = w.add_machine("box2");
+    fs::write(box2.join("frob"), "").unwrap();
+    w.machines_file(Some(&format!(
+        "\n[machines.box2]\nssh = \"box2\"\nplatform = \"{}\"\npriority = 20\npath = [\"/usr/bin\", \"/bin\"]\ncheckouts = \"~/checkouts\"\n",
+        here()
+    )));
+    w.init_box();
+    assert_eq!(code(&w.run(&["machines", "init", "box2"])), 0);
+    w
+}
+
+#[test]
+fn a_machine_without_a_prerequisite_is_passed_over_once_the_run_starts() {
+    let w = prerequisite_world();
+    let out = w.run(&["machines"]);
+    assert!(
+        stdout(&out).contains("ssh box   ")
+            && stdout(&out).contains("reachable, ready (prerequisites checked at run time), free"),
+        "{}",
+        both(&out)
+    );
+    let out = w.run(&["test", &here(), "--", "true"]);
+    assert_eq!(code(&out), 0, "{}", both(&out));
+    let line = stdout(&out).trim().to_owned();
+    assert!(
+        line.starts_with(&format!("{}: PASS on box2 (box not ready: ", here()))
+            && line.contains("frob"),
+        "{line}"
+    );
+
+    // Waited for, then not ready: dropped, and the next machine runs.
+    let held = hold_machine_lock(&w.machines.join("box"));
+    let held2 = hold_machine_lock(&w.machines.join("box2"));
+    let child = w
+        .command(&w.repo.root, &["test", &here(), "--", "true"])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    std::thread::sleep(Duration::from_secs(2));
+    drop(held);
+    drop(held2);
+    let out = child.wait_with_output().unwrap();
+    assert_eq!(code(&out), 0, "{}", both(&out));
+    assert!(
+        stderr(&out).contains("waiting for a busy machine to free up: box, box2"),
+        "{}",
+        both(&out)
+    );
+    let line = stdout(&out).trim().to_owned();
+    assert!(
+        line.starts_with(&format!("{}: PASS on box2 (box not ready: ", here()))
+            && line.contains("frob"),
+        "{line}"
+    );
+
+    // No machine left: exit 3, naming why.
+    fs::remove_file(w.machines.join("box2/frob")).unwrap();
+    let out = w.run(&["test", &here(), "--", "true"]);
+    assert_eq!(code(&out), 3, "{}", both(&out));
+    let line = stdout(&out).trim().to_owned();
+    assert!(
+        line.starts_with(&format!(
+            "{}: no machine available (box not ready: ",
+            here()
+        )) && line.contains("box2 not ready: "),
+        "{line}"
     );
 }
