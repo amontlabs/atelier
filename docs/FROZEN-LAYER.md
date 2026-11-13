@@ -28,8 +28,8 @@ runs its pinned version beside the orchestrator's. These rules keep that safe.
 | `runs/<run id>/result` | written atomically when a run ends; absent for a run that was killed |
 | `runs/<run id>/<step key>.log` | a step's output |
 | `runs/<run id>/coalitions` | macOS: one line per step job of the run and of every run nested in it (below) |
-| `runs/<run id>/jobs/<n>/` | macOS: a step job's spec, plist and FIFOs while it runs; removed with the job |
 | `probes/coalition-<uid>.toml` | macOS: the macOS version on which the coalition probe passed for this user (below) |
+| `hooks/<session id>` | the stop hook's counts and warnings for one harness session (below) |
 | `branches/<key>.toml` | one record per branch |
 | `tmp/<lifetime id>/<entry id>.toml` | one registered temp folder |
 | `versioned/` | the versioned layer, with its format number in `versioned/format`; only the version pinned on the integration branch uses it |
@@ -105,6 +105,18 @@ is not loaded are removed too.
 fork, then exits 3) found the sleeper by coalition, stopped it, and read exit status 3 from
 `launchctl print`. A record of another macOS version, or none, makes the next run probe again; a
 failed probe refuses (4) and writes nothing.
+
+## Stop hook sessions
+
+`hooks/<session id>` is TOML, written by `atelier hook stop` for an input whose `session_id` is
+made of ASCII letters, digits, `-`, `_` and `.` (128 bytes at most, not starting with `.`);
+removed when it holds nothing.
+
+- `blocks`: a table, condition → the number of blocks in a row for it in the current turn.
+- `warning`: an array of tables, newest first, 20 at most: the stops the hook let through while a
+  condition remained. `at` (RFC 3339 UTC), `branch`, `condition` (`rebase`, `merge`,
+  `uncommitted`, `submodule`, `background`, `compile`, or a later one), `why` (`repeated`: after
+  3 blocks in a row; `unfixable`: at once), `detail` (the advice).
 
 ## Lock records
 

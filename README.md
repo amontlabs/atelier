@@ -77,20 +77,29 @@ Module 3.10, launchd steps and the stop hook ([docs/HOOKS.md](docs/HOOKS.md) for
   `user/<uid>` with `LimitLoadToSessionType = Background` without a GUI login). atelier itself is
   the job's shim: it sets exactly the step's environment, restores the caller's open-file limit
   and umask, and runs the program only once the step is recorded under the lock. The job's
-  resource coalition replaces the marker scan: what a step leaves behind (after `setsid`, a double
+  resource coalition adds to the marker scan: what a step leaves behind (after `setsid`, a double
   fork, `env -i`, as a system program) and still alive 1 s after the step ends (`git commit`'s
   detached auto-maintenance usually ends sooner) is found by coalition, stopped (TERM,
   the grace, KILL, the coalition re-checked before each signal) and makes the run RED; `launchctl
-  bootout` comes last. The exit status is read from `launchctl print`. Before the first run on a
+  bootout` comes last; a member another user owns is reported at once ("cannot stop <pid> (owned
+  by <user>)"). A nested atelier lists its jobs in every outer run's coalitions file
+  (`ATELIER_COALITIONS`), whatever state it uses, and the end-of-run scan also runs the marker
+  scan. Job folders live in the user's temporary folder with an owner file written before the
+  bootstrap; jobs left loaded by an atelier that died are booted out when a run starts or ends.
+  The exit status is read from `launchctl print`; a shim launchd cannot spawn is reported at
+  once. Steps have no controlling terminal (docs/HOOKS.md). Before the first run on a
   macOS version, the preflight runs the `setsid` case once per user and refuses (4) if the
   coalition misses it; there is no fallback to the weaker scan. Linux keeps process groups and the
   marker scan. Not caught on either system: work handed to an already-running service (launchd
   agents, a daemon), as r4 §3.1 says.
 - `atelier hook stop`, registered by `init` and `rules` in `.claude/settings.json` and
-  `.codex/hooks.json` (merged into what they hold): Claude Code's and Codex's Stop and
+  `.codex/hooks.json` as `sh -c 'atelier hook stop || true'` (a missing file is created; an
+  existing one is never rewritten: the entries to add are printed): Claude Code's and Codex's Stop and
   SubagentStop hook. In a worktree on a branch atelier started it blocks the end of a turn while
   a rebase is open, the tree has uncommitted changes, a background task the input lists runs, or
-  the last message has no line starting `compile:` (for a subagent, the message only). **Codex
+  the last message has no line starting `compile:` (for a subagent, the message only); after 3
+  blocks in a row for one condition, and at once for a merge in progress or a changed submodule,
+  it lets the agent stop with a warning. **Codex
   runs a project's hooks only after the owner trusts them once** (`/hooks` in Codex, in that
   project); atelier cannot grant that.
 
@@ -108,7 +117,7 @@ Module 3.10, launchd steps and the stop hook ([docs/HOOKS.md](docs/HOOKS.md) for
 | `locks` | `flock` locks and their process records |
 | `procs` | process groups, stopping a group, the `ATELIER_RUN` marker scan |
 | `coalition`, `launchd` | macOS: coalition scan and stop, the probe and its record; steps as launchd jobs and the shim |
-| `hook` | `atelier hook stop` and the hook files' merge |
+| `hook` | `atelier hook stop`, its per-session counts, and the hook files |
 | `runs`, `signals` | run ids, folders, steps, atomic results; TERM/INT/HUP |
 | `tree` | tree id via a temporary index; submodule refusal |
 | `refs`, `names`, `git` | plain refs and `--no-deref` updates; branch names and file keys; running git |
@@ -130,9 +139,7 @@ Module 3.10, launchd steps and the stop hook ([docs/HOOKS.md](docs/HOOKS.md) for
 ## Dependencies
 
 clap, serde, serde_json (cargo metadata, nextest output, hook input and the harnesses' hook files)
-and toml handle the command line and the files; tempfile is used by tests only. serde_json's
-`preserve_order` feature (indexmap) keeps the order of the keys in `.claude/settings.json` when
-the hook is merged into it.
+and toml handle the command line and the files; tempfile is used by tests only.
 Locks use the standard library's `File::lock` (`flock`, stable since Rust 1.89), so fs2 and
 rustix are not needed. Two more crates:
 

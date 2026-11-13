@@ -395,10 +395,11 @@ pub fn problems(root: &Path, settings: &Settings) -> Result<Vec<String>> {
         match read_opt(&root.join(file))? {
             None => out.push(format!("{file} is missing (it runs `{}`)", hook::COMMAND)),
             Some(text) => match hook::missing_events(&text) {
-                Err(why) => out.push(format!("{file}: {why}")),
+                Err(why) => out.push(format!(
+                    "{file}: hook missing ({why}); atelier never rewrites the file: add the hook by hand (atelier rules prints the entries)"
+                )),
                 Ok(m) if !m.is_empty() => out.push(format!(
-                    "{file} does not run `{}` on {}",
-                    hook::COMMAND,
+                    "{file}: hook missing on {}; atelier never rewrites the file: add the hook by hand (atelier rules prints the entries)",
                     m.join(" and ")
                 )),
                 Ok(_) => {}
@@ -484,7 +485,8 @@ fn write_planned(plan: &[Planned], changed: &mut Vec<String>) -> Result<()> {
 }
 
 /// Writes the generated set and deletes any other file under `.atelier/rules/`. Returns what
-/// changed, one line each. Refuses, changing nothing, when `AGENTS.md` has broken markers.
+/// changed, one line each, then, for a hook file that exists without the hook (never rewritten),
+/// the entries to add by hand. Refuses, changing nothing, when `AGENTS.md` has broken markers.
 /// `AGENTS.md` and the import files are written last; if one write fails, those already written
 /// are restored.
 pub fn write(checkout: &Checkout, settings: &Settings) -> Result<Vec<String>> {
@@ -549,27 +551,39 @@ pub fn write(checkout: &Checkout, settings: &Settings) -> Result<Vec<String>> {
         });
     }
 
+    // A hook file is created when missing and never rewritten: one without the hook is left as
+    // it is, and the entries to add are printed.
+    let mut by_hand = Vec::new();
     for (file, harness) in [
         (hook::CLAUDE_SETTINGS, hook::Harness::ClaudeCode),
         (hook::CODEX_HOOKS, hook::Harness::Codex),
     ] {
         let path = root.join(file);
         let old = read_opt(&path)?;
-        let new = hook::merged(old.as_deref(), harness).map_err(|why| {
-            Failure::refused(format!(
-                "{file}: {why}; fix it by hand, then run atelier rules"
-            ))
-        })?;
-        let real = fsutil::resolve_link(&path).ctx(path.display())?;
-        if let Some(parent) = real.parent() {
-            fs::create_dir_all(parent).ctx(parent.display())?;
+        match hook::plan(old.as_deref(), harness) {
+            hook::HookFile::Current => {}
+            hook::HookFile::Create(new) => {
+                let real = fsutil::resolve_link(&path).ctx(path.display())?;
+                if let Some(parent) = real.parent() {
+                    fs::create_dir_all(parent).ctx(parent.display())?;
+                }
+                plan.push(Planned {
+                    label: file.to_owned(),
+                    real,
+                    old,
+                    new,
+                });
+            }
+            hook::HookFile::AddByHand {
+                missing,
+                why,
+                snippet,
+            } => by_hand.push(format!(
+                "left {file} as it is{}: it does not run the atelier hook on {}. Add these entries to its \"hooks\" (into the arrays already there):\n{snippet}",
+                why.map(|w| format!(" ({w})")).unwrap_or_default(),
+                missing.join(" and ")
+            )),
         }
-        plan.push(Planned {
-            label: file.to_owned(),
-            real,
-            old,
-            new,
-        });
     }
 
     let mut changed = Vec::new();
@@ -592,6 +606,7 @@ pub fn write(checkout: &Checkout, settings: &Settings) -> Result<Vec<String>> {
     }
     prune_empty_dirs(&rules_dir)?;
     write_planned(&plan, &mut changed)?;
+    changed.extend(by_hand);
     Ok(changed)
 }
 
