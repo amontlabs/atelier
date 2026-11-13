@@ -5,6 +5,7 @@
 //! and plain refs. Commands themselves come in later modules.
 
 pub mod agents;
+pub mod check;
 pub mod cli;
 pub mod dispatch;
 pub mod exit;
@@ -13,8 +14,10 @@ pub mod git;
 pub mod locks;
 pub mod machines;
 pub mod names;
+pub mod nextest;
 pub mod platform;
 pub mod preflight;
+pub mod prereq;
 pub mod procs;
 pub mod records;
 pub mod refs;

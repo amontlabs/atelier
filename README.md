@@ -10,7 +10,7 @@ parts the project uses.
 The design is kept outside this repository (`DESIGN.md`, revision 5, with mechanics in
 `DESIGN-r4.md`). The formats every version shares are in [docs/FROZEN-LAYER.md](docs/FROZEN-LAYER.md).
 
-## Status: skeleton (module 3.1)
+## Status: skeleton (module 3.1) and `check` (module 3.2)
 
 Built so far, with tests on throwaway git repositories:
 
@@ -29,8 +29,15 @@ small Mustache subset (`{{x}}`, `{{#x}}…{{/x}}`) written here because the Must
 derived Rust structs and implement the whole specification, where these templates have run-time
 fields and anything else must be an error.
 
-The other commands (`check`, `start`/`follow`, `merge`, `tmp`/`clean`, machines, `status`) come in
-later modules.
+`atelier check [--compile-only]` proves the tree in a worktree: tool prerequisites (Rust
+toolchain, nextest pin, declared tools, nextest-file refusals, and with `[prerequisites.mbx]` the
+mbx version, settings, `.mbx.toml`, `cargo` on `PATH`, bypass variables and the build folder, read
+again at the end), the run lock, the tree id, `check.prepare` hooks, format, compile, nextest with
+the fixed no-retry flags, `check.steps`, the survivor scan. Per-test results are kept in the run
+folder (`tests.tsv`, nextest's libtest JSON in `tests-<workspace>.jsonl`).
+
+The other commands (`start`/`follow`, `merge`, `tmp`/`clean`, machines, `status`) come in later
+modules.
 
 ## Layout
 
@@ -49,10 +56,11 @@ later modules.
 | `tree` | tree id via a temporary index; submodule refusal |
 | `refs`, `names`, `git` | plain refs and `--no-deref` updates; branch names and file keys; running git |
 | `rules` | rules currency check (stub until module 3.7) |
+| `check`, `prereq`, `nextest` | the `check` command; tool and mbx prerequisites; nextest flags, file refusals and result parsing |
 
 ## Dependencies
 
-clap, serde and toml handle the command line and the files; tempfile is used by tests only.
+clap, serde, serde_json (cargo metadata, nextest output) and toml handle the command line and the files; tempfile is used by tests only.
 Locks use the standard library's `File::lock` (`flock`, stable since Rust 1.89), so fs2 and
 rustix are not needed. Two more crates:
 

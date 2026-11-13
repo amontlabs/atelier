@@ -428,6 +428,19 @@ impl Run {
         cwd: &Path,
         env: &[(String, String)],
     ) -> Result<StepRecord> {
+        self.step_with_stdout(name, argv, cwd, env, None)
+    }
+
+    /// As [`Run::step`], with the step's standard output in `stdout_file` (a name in the run
+    /// folder) instead of the log; standard error stays in the log.
+    pub fn step_with_stdout(
+        &mut self,
+        name: &str,
+        argv: &[String],
+        cwd: &Path,
+        env: &[(String, String)],
+        stdout_file: Option<&str>,
+    ) -> Result<StepRecord> {
         let log_name = format!("{}.log", names::key(name));
         let mut record = StepRecord {
             name: name.to_owned(),
@@ -467,6 +480,18 @@ impl Run {
             .open(&log_path)
             .ctx(log_path.display())?;
         let log_err = log.try_clone().ctx(log_path.display())?;
+        let stdout: Stdio = match stdout_file {
+            Some(file) => {
+                let path = self.dir.join(file);
+                File::options()
+                    .create(true)
+                    .append(true)
+                    .open(&path)
+                    .ctx(path.display())?
+                    .into()
+            }
+            None => log.into(),
+        };
         // The step starts as a shell that waits on a pipe until its group is recorded under the
         // lock, then replaces itself with the program, stdin from /dev/null. If atelier dies
         // before releasing it, the pipe closes and the program never runs.
@@ -476,7 +501,7 @@ impl Run {
             .args(args)
             .current_dir(cwd)
             .stdin(Stdio::piped())
-            .stdout(log)
+            .stdout(stdout)
             .stderr(log_err)
             .env_remove(DISPATCHED_VAR)
             .process_group(0);

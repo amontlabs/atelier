@@ -277,6 +277,10 @@ pub fn run(cmd: Cmd, cwd: &Path) -> Result<Exit> {
                 );
             }
         }
+        Cmd::Check { compile_only } => {
+            let context = preflight::run(cwd, cmd.name(), cmd.needs())?;
+            return crate::check::run(&context, *compile_only);
+        }
         _ => {
             let _context = preflight::run(cwd, cmd.name(), cmd.needs())?;
         }
