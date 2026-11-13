@@ -392,6 +392,41 @@ mod mac {
     }
 
     #[test]
+    fn what_ends_on_its_own_just_after_the_step_is_not_left_behind() {
+        let repo = Repo::new();
+        let state = State::open(&repo.checkout()).unwrap();
+        let mut run = start(&state, LockKey::branch("x")).unwrap();
+        // A background child that ends 600 ms after the step.
+        let s = run
+            .step("bg", &sh("/bin/sleep 0.6 & exit 0"), &repo.root, &[])
+            .unwrap();
+        assert_eq!(s.status, StepStatus::Passed, "{s:?}");
+        // `git commit` starts `git maintenance run --auto --detach`, which leaves the step.
+        fs::write(repo.root.join("c.txt"), "c\n").unwrap();
+        let git_env: Vec<(String, String)> = [
+            ("GIT_CONFIG_GLOBAL", "/dev/null"),
+            ("GIT_CONFIG_NOSYSTEM", "1"),
+            ("GIT_AUTHOR_NAME", "t"),
+            ("GIT_AUTHOR_EMAIL", "t@atelier.invalid"),
+            ("GIT_COMMITTER_NAME", "t"),
+            ("GIT_COMMITTER_EMAIL", "t@atelier.invalid"),
+        ]
+        .iter()
+        .map(|(k, v)| ((*k).to_owned(), (*v).to_owned()))
+        .collect();
+        let s = run
+            .step(
+                "commit",
+                &sh("git add c.txt && git -c commit.gpgsign=false commit -q -m c"),
+                &repo.root,
+                &git_env,
+            )
+            .unwrap();
+        assert_eq!(s.status, StepStatus::Passed, "{s:?}");
+        assert_eq!(run.finish(true).unwrap().outcome, Outcome::Passed);
+    }
+
+    #[test]
     fn a_decoy_outside_the_job_is_never_reported_or_signalled() {
         let repo = Repo::new();
         let state = State::open(&repo.checkout()).unwrap();

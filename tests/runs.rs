@@ -729,6 +729,17 @@ fn the_lock_is_not_handed_to_children() {
     assert!(lock.try_lock().is_ok(), "the step does not hold the lock");
     drop(lock);
     kill_and_wait(step, true);
+    // The next taker clears the record (and, on macOS, removes the dead run's job).
+    start_after_release(
+        &state,
+        LockKey::branch("probe/branch"),
+        RunKind::Check,
+        "probe",
+        &repo.root,
+    )
+    .unwrap()
+    .finish(true)
+    .unwrap();
 }
 
 #[cfg_attr(target_os = "macos", allow(dead_code))]

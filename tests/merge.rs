@@ -2186,7 +2186,9 @@ fn r10_a_tmp_in_the_branchs_worktree_does_not_hold_up_the_merge() {
     let t = Instant::now();
     let out = p.merge(&["feat"]);
     let took = t.elapsed();
-    let _ = child.kill();
+    // Stopped as an owner would: atelier stops its step and removes the step's job.
+    // SAFETY: the test's own child.
+    unsafe { libc::kill(child.id() as i32, libc::SIGTERM) };
     let _ = child.wait();
     assert_eq!(code(&out), 0, "{}", both(&out));
     p.assert_merged("feat", &c);

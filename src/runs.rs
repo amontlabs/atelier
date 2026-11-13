@@ -16,9 +16,10 @@
 //!
 //! On macOS each step is a launchd job instead (DESIGN §8.4, [`crate::launchd`]): the job's
 //! process is the group leader, started by atelier's shim with exactly the step's environment,
-//! and held until its group and coalition are recorded under the lock. When it ends, every live
-//! process of its coalition (those that left the group, the session or the environment
-//! included) is stopped and the step fails with "left processes behind". The run's coalitions,
+//! and held until its group and coalition are recorded under the lock. When it ends, every
+//! process of its coalition still alive after [`crate::coalition::SETTLE`] (those that left the
+//! group, the session or the environment included) is stopped and the step fails with "left
+//! processes behind". The run's coalitions,
 //! and those of runs nested in it, are listed in the run folder; the end-of-run scan looks
 //! through them instead of the markers, stops what it finds, and the run fails. A run refuses
 //! (4) to start on a macOS where the preflight probe ([`crate::coalition::ensure_probed`])
@@ -808,7 +809,11 @@ impl Run {
         if !ended {
             self.interrupted = signals::received();
         }
-        // End-of-step coalition check: the job's process is gone; its coalition must be empty.
+        // End-of-step coalition check: the job's process is gone; its coalition must be empty
+        // once what ends on its own has ended.
+        if ended {
+            coalition::settle(&ids, coalition::SETTLE);
+        }
         let stopped = coalition::stop(&ids, self.grace);
         let (exit, signal) = job.status();
         record.exit = exit;
@@ -908,6 +913,7 @@ impl Run {
                     ids.push(l.coalition);
                 }
             }
+            crate::coalition::settle(&ids, crate::coalition::SETTLE);
             let stopped = crate::coalition::stop(&ids, self.grace);
             if !stopped.remaining.is_empty() {
                 self.failures.push(format!(

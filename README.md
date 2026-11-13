@@ -78,7 +78,8 @@ Module 3.10, launchd steps and the stop hook ([docs/HOOKS.md](docs/HOOKS.md) for
   the job's shim: it sets exactly the step's environment, restores the caller's open-file limit
   and umask, and runs the program only once the step is recorded under the lock. The job's
   resource coalition replaces the marker scan: what a step leaves behind (after `setsid`, a double
-  fork, `env -i`, as a system program) is found by coalition when the step ends, stopped (TERM,
+  fork, `env -i`, as a system program) and still alive 1 s after the step ends (`git commit`'s
+  detached auto-maintenance usually ends sooner) is found by coalition, stopped (TERM,
   the grace, KILL, the coalition re-checked before each signal) and makes the run RED; `launchctl
   bootout` comes last. The exit status is read from `launchctl print`. Before the first run on a
   macOS version, the preflight runs the `setsid` case once per user and refuses (4) if the

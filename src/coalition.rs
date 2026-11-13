@@ -12,8 +12,9 @@
 //! and the boot session tells a record of an earlier boot apart.
 
 use std::fmt;
+use std::time::Duration;
 #[cfg(target_os = "macos")]
-use std::time::{Duration, Instant};
+use std::time::Instant;
 
 #[cfg(target_os = "macos")]
 use crate::procs::{ProcInfo, Stopped};
@@ -181,7 +182,7 @@ pub fn members(ids: &[Coalition]) -> Vec<(i32, u64)> {
 }
 
 /// The members for messages: `pid program arguments`, or `pid ?` when the process cannot be
-/// read (another user's).
+/// read (another user's). A pid that has ended meanwhile is left out.
 #[cfg(target_os = "macos")]
 pub fn describe(pids: &[i32]) -> Vec<ProcInfo> {
     if pids.is_empty() {
@@ -189,6 +190,11 @@ pub fn describe(pids: &[i32]) -> Vec<ProcInfo> {
     }
     let listed = crate::procs::list().unwrap_or_default();
     pids.iter()
+        .filter(|pid| {
+            // SAFETY: an existence check only.
+            let r = unsafe { libc::kill(**pid, 0) };
+            r == 0 || std::io::Error::last_os_error().raw_os_error() != Some(libc::ESRCH)
+        })
         .map(|pid| {
             listed
                 .iter()
@@ -220,6 +226,17 @@ fn signal_members(ids: &[Coalition], sig: libc::c_int) -> Vec<i32> {
     sent
 }
 
+/// How long the members of a step's coalition get to end on their own once the step has ended,
+/// before what is left counts as left behind. `git commit` starts `git maintenance run --auto
+/// --detach`, which leaves the step and usually ends within milliseconds.
+pub const SETTLE: Duration = Duration::from_secs(1);
+
+/// Waits up to `within` for the members of `ids` to end on their own. True when none is left.
+#[cfg(target_os = "macos")]
+pub fn settle(ids: &[Coalition], within: Duration) -> bool {
+    wait_empty(ids, within)
+}
+
 /// Stops every member of `ids`: TERM (and CONT), wait up to `grace`, KILL, wait; up to five
 /// rounds while new members appear. Members still there at the end are `remaining`.
 #[cfg(target_os = "macos")]
@@ -230,6 +247,9 @@ pub fn stop(ids: &[Coalition], grace: Duration) -> Stopped {
         return out;
     }
     out.members = describe(&first);
+    if out.members.is_empty() {
+        return out;
+    }
     for _ in 0..5 {
         if members(ids).is_empty() {
             break;
@@ -373,8 +393,10 @@ pub fn ensure_probed(state: &crate::state::State) -> crate::exit::Result<()> {
     {
         return Ok(());
     }
-    let dir = path.with_extension("job");
-    let _ = std::fs::remove_dir_all(&dir);
+    // A folder of its own: two commands may probe at once.
+    let random =
+        crate::fsutil::random_hex(8).map_err(|e| Failure::refused(format!("random bytes: {e}")))?;
+    let dir = path.with_extension(format!("job-{random}"));
     std::fs::create_dir_all(&dir)
         .map_err(|e| Failure::refused(format!("{}: {e}", dir.display())))?;
     let found = crate::launchd::probe(&dir);
