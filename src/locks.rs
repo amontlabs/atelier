@@ -35,6 +35,7 @@ use std::fs::{self, File, OpenOptions};
 use std::io::ErrorKind;
 use std::path::PathBuf;
 
+use crate::coalition::{self, Coalition};
 use crate::exit::{Failure, IoContext, Result};
 use crate::fsutil;
 use crate::git::Checkout;
@@ -149,8 +150,17 @@ pub struct GroupLine {
     pub run: String,
     /// The leader's [`procs::start_time`] when the group was recorded; `None` when unknown.
     pub leader_start: Option<String>,
-    /// Fields after the known ones, written by a later version; kept as they are.
+    /// Fields after the known ones; kept as they are. The first, when present, is the step's
+    /// launchd coalition (macOS, [`GroupLine::coalition`]) or `-`.
     pub later: Vec<String>,
+}
+
+impl GroupLine {
+    /// The step's launchd coalition, `<id>@<boot session>`: on macOS a step is a launchd job,
+    /// and the group's members are the coalition's.
+    pub fn coalition(&self) -> Option<Coalition> {
+        self.later.first().and_then(|f| Coalition::parse(f))
+    }
 }
 
 /// The processes recorded under a lock.
@@ -255,6 +265,8 @@ pub struct HeldLock {
     shared: bool,
     /// `locks/update/<id>.lock`: held while a shared holder rewrites the record.
     update_lock: PathBuf,
+    /// The state's run folders, where a run's coalitions file is.
+    runs_dir: PathBuf,
 }
 
 /// `<locks>/<id><ext>`: the extension is appended, never put in place of a `.` the key has
@@ -345,6 +357,7 @@ impl HeldLock {
             record: Record::default(),
             shared,
             update_lock,
+            runs_dir: state.runs_dir(),
         })
     }
 
@@ -367,6 +380,19 @@ impl HeldLock {
         let mut alive = Vec::new();
         for g in &self.record.groups {
             let (pgid, id) = (g.pgid, &g.run);
+            // A step that ran as a launchd job: its members are its coalition's.
+            if let Some(c) = g.coalition()
+                && cfg!(target_os = "macos")
+            {
+                for m in coalition_members(std::slice::from_ref(&c)) {
+                    alive.push(format!(
+                        "  {} (group {pgid}, coalition {}, run {id})",
+                        m.describe(),
+                        c.id
+                    ));
+                }
+                continue;
+            }
             if procs::recorded_group_alive(pgid, g.leader_start.as_deref()) {
                 let members = procs::group_members(pgid);
                 if members.is_empty() {
@@ -377,13 +403,36 @@ impl HeldLock {
                 }
             }
         }
-        let survivors = procs::marker_survivors(&self.record.run_ids())
+        // Runs with a coalitions file (macOS steps) are looked for by coalition; the others by
+        // their marker.
+        let mut marked = Vec::new();
+        let mut jobs = Vec::new();
+        for id in self.record.run_ids() {
+            match coalition::read_run_file(&self.runs_dir.join(&id)) {
+                Ok(Some(lines)) if cfg!(target_os = "macos") => {
+                    jobs.extend(lines.into_iter().map(|l| (id.clone(), l)))
+                }
+                _ => marked.push(id),
+            }
+        }
+        let known = |alive: &Vec<String>, pid: i32| {
+            alive.iter().any(|l| l.starts_with(&format!("  {pid} ")))
+        };
+        for (id, line) in &jobs {
+            for m in coalition_members(std::slice::from_ref(&line.coalition)) {
+                if !known(&alive, m.pid) {
+                    alive.push(format!(
+                        "  {} (coalition {}, run {id})",
+                        m.describe(),
+                        line.coalition.id
+                    ));
+                }
+            }
+        }
+        let survivors = procs::marker_survivors(&marked)
             .map_err(|e| Failure::refused(format!("cannot list processes: {e}")))?;
         for (p, id) in survivors {
-            if !alive
-                .iter()
-                .any(|l| l.starts_with(&format!("  {} ", p.pid)))
-            {
+            if !known(&alive, p.pid) {
                 alive.push(format!(
                     "  {} (run {id}, {}={id})",
                     p.describe(),
@@ -397,6 +446,11 @@ impl HeldLock {
                 self.key.describe(),
                 alive.join("\n")
             )));
+        }
+        // Nothing lives: jobs an atelier that died left loaded in launchd are removed.
+        #[cfg(target_os = "macos")]
+        for (_, line) in &jobs {
+            crate::launchd::bootout_label(&line.label);
         }
         self.record = Record::default();
         save(&self.record_path, &self.record)
@@ -423,6 +477,24 @@ impl HeldLock {
             run: run.to_owned(),
             leader_start,
             later: Vec::new(),
+        };
+        self.change(|r| r.groups.push(line.clone()))
+    }
+
+    /// Records a step that runs as a launchd job: its process group (the job's pid), its leader's
+    /// start time, and the job's coalition as the line's fifth field.
+    pub fn add_job_group(
+        &mut self,
+        pgid: i32,
+        run: &str,
+        leader_start: Option<String>,
+        coalition: &Coalition,
+    ) -> Result<()> {
+        let line = GroupLine {
+            pgid,
+            run: run.to_owned(),
+            leader_start,
+            later: vec![coalition.to_string()],
         };
         self.change(|r| r.groups.push(line.clone()))
     }
@@ -479,6 +551,23 @@ pub fn recorded_groups(state: &State, key: &LockKey) -> Vec<GroupLine> {
     read_record(&lock_file(state, key, ".procs"), key)
         .map(|r| r.groups)
         .unwrap_or_default()
+}
+
+/// The live members of coalitions, for messages (macOS; nothing elsewhere).
+fn coalition_members(ids: &[Coalition]) -> Vec<procs::ProcInfo> {
+    #[cfg(target_os = "macos")]
+    {
+        let pids: Vec<i32> = coalition::members(ids)
+            .into_iter()
+            .map(|(p, _)| p)
+            .collect();
+        coalition::describe(&pids)
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = ids;
+        Vec::new()
+    }
 }
 
 fn save(path: &std::path::Path, record: &Record) -> Result<()> {

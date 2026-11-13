@@ -13,12 +13,25 @@
 //! the marker scan looks for processes that left the group; any found makes the run fail, is
 //! named, and is not signalled. A TERM, INT or HUP during a run stops the current group and the
 //! run ends with a result that says so.
+//!
+//! On macOS each step is a launchd job instead (DESIGN §8.4, [`crate::launchd`]): the job's
+//! process is the group leader, started by atelier's shim with exactly the step's environment,
+//! and held until its group and coalition are recorded under the lock. When it ends, every live
+//! process of its coalition (those that left the group, the session or the environment
+//! included) is stopped and the step fails with "left processes behind". The run's coalitions,
+//! and those of runs nested in it, are listed in the run folder; the end-of-run scan looks
+//! through them instead of the markers, stops what it finds, and the run fails. A run refuses
+//! (4) to start on a macOS where the preflight probe ([`crate::coalition::ensure_probed`])
+//! fails: there is no fallback to the marker scan.
 
 use std::fs::{self, File};
 use std::io::{ErrorKind, Write};
+#[cfg(not(target_os = "macos"))]
 use std::os::unix::process::{CommandExt, ExitStatusExt};
 use std::path::{Path, PathBuf};
+#[cfg(not(target_os = "macos"))]
 use std::process::{Command, Stdio};
+#[cfg(not(target_os = "macos"))]
 use std::thread::sleep;
 use std::time::Duration;
 
@@ -300,7 +313,15 @@ pub struct Run {
     tests: Option<TestCounts>,
     test_results: Option<String>,
     interrupted: Option<i32>,
-    scan: SurvivorScan,
+    /// A test's replacement for the end-of-run scan.
+    scan: Option<SurvivorScan>,
+    /// Step jobs started so far (macOS), for their labels and folders.
+    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+    jobs: u32,
+    /// The folders of the runs this one is nested in, in the same state: a step's coalition is
+    /// listed there too, so an outer run finds what a nested atelier left.
+    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+    outer_dirs: Vec<PathBuf>,
     _signals: signals::RunSignals,
 }
 
@@ -357,9 +378,17 @@ impl Run {
         worktree: &Path,
         preferred: Option<&str>,
     ) -> Result<Run> {
+        #[cfg(target_os = "macos")]
+        crate::coalition::ensure_probed(state)?;
         let (id, dir) = create_run_dir(&state.runs_dir(), preferred)?;
         let started = fsutil::rfc3339(fsutil::now_secs());
         let mut chain = procs::inherited_runs();
+        let outer_dirs = chain
+            .iter()
+            .map(|id| state.runs_dir().join(id))
+            .filter(|d| is_run_id(&d.file_name().unwrap_or_default().to_string_lossy()))
+            .filter(|d| d.is_dir())
+            .collect();
         chain.push(id.clone());
         let branch = current_branch(worktree);
         let info = RunInfo {
@@ -399,7 +428,9 @@ impl Run {
             tests: None,
             test_results: None,
             interrupted: None,
-            scan: procs::marker_survivors,
+            scan: None,
+            jobs: 0,
+            outer_dirs,
             _signals: guard,
         })
     }
@@ -413,7 +444,7 @@ impl Run {
     /// Replaces the survivor scan, for tests of a scan that fails.
     #[doc(hidden)]
     pub fn with_survivor_scan(mut self, scan: SurvivorScan) -> Self {
-        self.scan = scan;
+        self.scan = Some(scan);
         self
     }
 
@@ -511,7 +542,7 @@ impl Run {
             left: Vec::new(),
             unstoppable: Vec::new(),
         };
-        let Some((program, args)) = argv.split_first() else {
+        let Some(program) = argv.first() else {
             return Err(Failure::usage(format!("step {name}: empty command")));
         };
         if program.starts_with('-') {
@@ -534,6 +565,32 @@ impl Run {
             return Ok(record);
         }
         let log_path = self.dir.join(&log_name);
+        #[cfg(target_os = "macos")]
+        {
+            let stdout_path = match stdout_file {
+                Some(file) => self.dir.join(file),
+                None => log_path.clone(),
+            };
+            self.job_step(record, argv, cwd, env, &stdout_path, &log_path)
+        }
+        #[cfg(not(target_os = "macos"))]
+        self.group_step(record, argv, cwd, env, stdout_file, &log_path)
+    }
+
+    /// A step as its own process group, released by the `/bin/sh` trampoline (Linux).
+    #[cfg(not(target_os = "macos"))]
+    fn group_step(
+        &mut self,
+        mut record: StepRecord,
+        argv: &[String],
+        cwd: &Path,
+        env: &[(String, String)],
+        stdout_file: Option<&str>,
+        log_path: &Path,
+    ) -> Result<StepRecord> {
+        let (program, args) = argv.split_first().expect("checked by the caller");
+        let name = record.name.clone();
+        let log_path = log_path.to_path_buf();
         let log = File::options()
             .create(true)
             .append(true)
@@ -651,6 +708,145 @@ impl Run {
         Ok(record)
     }
 
+    /// A step as a launchd job, released by atelier's shim (macOS, DESIGN §8.4).
+    #[cfg(target_os = "macos")]
+    fn job_step(
+        &mut self,
+        mut record: StepRecord,
+        argv: &[String],
+        cwd: &Path,
+        env: &[(String, String)],
+        stdout_path: &Path,
+        log_path: &Path,
+    ) -> Result<StepRecord> {
+        use crate::coalition::{self, JobLine};
+        use crate::launchd::{self, LaunchError};
+
+        let program = &argv[0];
+        let note = |line: &str| {
+            if let Ok(mut f) = File::options().create(true).append(true).open(log_path) {
+                let _ = writeln!(f, "atelier: {line}");
+            }
+        };
+        // Created first, as the trampoline's redirections did: an empty log means the step ran
+        // and printed nothing.
+        File::options()
+            .create(true)
+            .append(true)
+            .open(log_path)
+            .ctx(log_path.display())?;
+        self.jobs += 1;
+        let label = format!("atelier.{}.{}", self.id, self.jobs);
+        let job_dir = self.dir.join("jobs").join(self.jobs.to_string());
+        fs::create_dir_all(&job_dir).ctx(job_dir.display())?;
+        let spec = launchd::Spec {
+            argv: argv.iter().map(Into::into).collect(),
+            cwd: cwd.to_path_buf(),
+            env: step_env(env, &self.id, &self.runs),
+            stdout: stdout_path.to_path_buf(),
+            stderr: log_path.to_path_buf(),
+        };
+        let mut job = match launchd::launch(&job_dir, &label, &spec, &mut || {
+            signals::received().is_some()
+        }) {
+            Ok(j) => j,
+            Err(LaunchError::Unavailable(m)) => {
+                let _ = fs::remove_dir_all(&job_dir);
+                return Err(Failure::refused(format!(
+                    "step {}: cannot start it as a launchd job: {m}. atelier runs no step on macOS without one",
+                    record.name
+                )));
+            }
+            Err(LaunchError::NotStarted(m)) => {
+                let _ = fs::remove_dir_all(&job_dir);
+                note(&m);
+                self.steps.push(record.clone());
+                return Ok(record);
+            }
+            Err(LaunchError::Interrupted) => {
+                let _ = fs::remove_dir_all(&job_dir);
+                self.interrupted = signals::received();
+                record.status = StepStatus::Interrupted;
+                self.steps.push(record.clone());
+                return Ok(record);
+            }
+        };
+        let ids = [job.coalition.clone()];
+        let line = JobLine {
+            coalition: job.coalition.clone(),
+            label: label.clone(),
+        };
+        // Listed before the program runs: this run's file, then every outer run's in this state.
+        let listed = coalition::append_run_file(&self.dir, &line)
+            .ctx(self.dir.join(coalition::RUN_FILE).display());
+        for d in &self.outer_dirs {
+            let _ = coalition::append_run_file(d, &line);
+        }
+        let recorded = listed.and_then(|()| {
+            self.lock
+                .add_job_group(job.pid, &self.id, job.start.clone(), &job.coalition)
+        });
+        if let Err(e) = recorded {
+            job.abandon();
+            let _ = job.wait(&mut || false);
+            coalition::stop(&ids, self.grace);
+            job.bootout();
+            return Err(e);
+        }
+        let released = job.release();
+        let ended = match job.wait(&mut || signals::received().is_some()) {
+            Ok(e) => e,
+            Err(e) => {
+                coalition::stop(&ids, self.grace);
+                job.bootout();
+                return Err(Failure::refused(format!(
+                    "waiting for step {}: {e}",
+                    record.name
+                )));
+            }
+        };
+        if !ended {
+            self.interrupted = signals::received();
+        }
+        // End-of-step coalition check: the job's process is gone; its coalition must be empty.
+        let stopped = coalition::stop(&ids, self.grace);
+        let (exit, signal) = job.status();
+        record.exit = exit;
+        record.signal = signal;
+        record.left = stopped
+            .members
+            .iter()
+            .map(procs::ProcInfo::describe)
+            .collect();
+        record.unstoppable = stopped
+            .remaining
+            .iter()
+            .map(procs::ProcInfo::describe)
+            .collect();
+        record.status = if !ended {
+            StepStatus::Interrupted
+        } else if !released {
+            note(&format!(
+                "the step's launchd job ended before {program} could be released"
+            ));
+            StepStatus::NotStarted
+        } else if !stopped.was_empty() {
+            StepStatus::LeftProcesses
+        } else if exit == Some(0) {
+            StepStatus::Passed
+        } else {
+            StepStatus::Failed
+        };
+        if stopped.remaining.is_empty() {
+            self.lock.remove_group(job.pid)?;
+        }
+        if let Some(n) = job.bootout() {
+            note(&n);
+        }
+        self.steps.push(record.clone());
+        Ok(record)
+    }
+
     /// Forgets the last step when it merely exited non-zero: a probe whose failure is an answer,
     /// not a failure of the run. Its log stays. A step that left processes behind, or did not
     /// start, is kept.
@@ -691,24 +887,71 @@ impl Run {
         self.finish_then(passed, then, true).map(|(r, _)| r)
     }
 
+    /// The end-of-run scan: the survivors, described, and whether any still lives. On macOS,
+    /// every live member of the coalitions in the run's coalitions file (its own steps' and
+    /// those of runs nested in it), which are stopped; elsewhere the processes carrying the run's
+    /// marker, which are not signalled.
+    fn end_scan(&mut self) -> std::io::Result<(Vec<String>, bool)> {
+        if let Some(scan) = self.scan {
+            let found: Vec<String> = scan(std::slice::from_ref(&self.id))?
+                .into_iter()
+                .map(|(p, _)| p.describe())
+                .collect();
+            let alive = !found.is_empty();
+            return Ok((found, alive));
+        }
+        #[cfg(target_os = "macos")]
+        {
+            let mut ids: Vec<crate::coalition::Coalition> = Vec::new();
+            for l in crate::coalition::read_run_file(&self.dir)?.unwrap_or_default() {
+                if !ids.contains(&l.coalition) {
+                    ids.push(l.coalition);
+                }
+            }
+            let stopped = crate::coalition::stop(&ids, self.grace);
+            if !stopped.remaining.is_empty() {
+                self.failures.push(format!(
+                    "could not stop: {}",
+                    stopped
+                        .remaining
+                        .iter()
+                        .map(procs::ProcInfo::describe)
+                        .collect::<Vec<_>>()
+                        .join("; ")
+                ));
+            }
+            Ok((
+                stopped
+                    .members
+                    .iter()
+                    .map(procs::ProcInfo::describe)
+                    .collect(),
+                !stopped.remaining.is_empty(),
+            ))
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            let found: Vec<String> = procs::marker_survivors(std::slice::from_ref(&self.id))?
+                .into_iter()
+                .map(|(p, _)| p.describe())
+                .collect();
+            let alive = !found.is_empty();
+            Ok((found, alive))
+        }
+    }
+
     fn finish_then(
         mut self,
         passed: bool,
         then: impl FnOnce() -> FollowUp,
         follow: bool,
     ) -> Result<(RunResult, Option<HeldLock>)> {
-        let (survivors, scanned) = match (self.scan)(std::slice::from_ref(&self.id)) {
-            Ok(found) => (
-                found
-                    .into_iter()
-                    .map(|(p, _)| p.describe())
-                    .collect::<Vec<_>>(),
-                true,
-            ),
+        let (survivors, still_alive, scanned) = match self.end_scan() {
+            Ok((found, alive)) => (found, alive, true),
             Err(e) => {
                 self.failures
                     .push(format!("cannot scan for processes left behind: {e}"));
-                (Vec::new(), false)
+                (Vec::new(), true, false)
             }
         };
         for s in &self.steps {
@@ -787,12 +1030,35 @@ impl Run {
         // live; so does a scan that failed. Groups that could not be emptied stay recorded too.
         if let Some(l) = lock.as_mut()
             && scanned
-            && survivors.is_empty()
+            && !still_alive
         {
             l.remove_run(&self.id)?;
         }
         Ok((result, lock))
     }
+}
+
+/// A step's whole environment: atelier's own without the dispatcher's and the run-id variables,
+/// then `env`, then the run markers, last so that nothing replaces them.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+fn step_env(
+    env: &[(String, String)],
+    id: &str,
+    runs: &str,
+) -> Vec<(std::ffi::OsString, std::ffi::OsString)> {
+    let mut out: Vec<(std::ffi::OsString, std::ffi::OsString)> = std::env::vars_os()
+        .filter(|(k, _)| k != DISPATCHED_VAR && k != RUN_ID_VAR)
+        .collect();
+    let mut set = |k: &str, v: &str| {
+        out.retain(|(x, _)| x != k);
+        out.push((k.into(), v.into()));
+    };
+    for (k, v) in env {
+        set(k, v);
+    }
+    set(RUN_MARKER, id);
+    set(RUNS_MARKER, runs);
+    out
 }
 
 /// The branch `HEAD` names in `worktree`, if it is a git worktree on a branch.

@@ -4,8 +4,8 @@
 //! the dispatcher: it reads the pin from `.atelier/atelier.toml` of the checkout it runs in and
 //! runs `~/.local/share/atelier/<pin>/bin/atelier` with `ATELIER_DISPATCHED=1`, or runs in place
 //! when it is that file itself. A missing version prints the one install command and exits 4;
-//! nothing installs itself. Outside a project only `atelier init --version <v>` and
-//! `atelier --version` (and help) run. The dispatched program removes the variable from its own
+//! nothing installs itself. Outside a project only `atelier init --version <v>`,
+//! `atelier --version` (and help) and `atelier hook …` run. The dispatched program removes the variable from its own
 //! environment, so nothing it starts (a nested atelier in a gate, for one) skips dispatch, and
 //! it compares its own version with the pin anyway (preflight), so calling a binary directly
 //! cannot bypass the check.
@@ -82,6 +82,8 @@ fn classify(args: &[OsString]) -> Ask {
         .collect();
     match rest.as_slice() {
         [] | ["--version"] | ["-V"] | ["--help"] | ["-h"] | ["help", ..] => Ask::Harmless,
+        // A harness hook runs in any folder; outside a project it only lets the agent stop.
+        ["hook", ..] => Ask::Harmless,
         ["init", tail @ ..] => {
             let mut version = None;
             let mut it = tail.iter();
@@ -178,6 +180,7 @@ mod tests {
         );
         assert_eq!(classify(&args(&["init"])), Ask::Init(None));
         assert_eq!(classify(&args(&["check"])), Ask::Other);
+        assert_eq!(classify(&args(&["hook", "stop"])), Ask::Harmless);
         assert_eq!(classify(&args(&["--version", "check"])), Ask::Other);
     }
 

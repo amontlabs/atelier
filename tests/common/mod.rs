@@ -15,6 +15,13 @@ pub fn atelier_bin() -> PathBuf {
     PathBuf::from(env!("CARGO_BIN_EXE_atelier"))
 }
 
+/// Makes the library start step jobs with the atelier binary under test: a test binary that
+/// runs steps through the library is not atelier, and cannot be a launchd job's shim (macOS).
+pub fn steps_use_atelier() {
+    #[cfg(target_os = "macos")]
+    atelier::launchd::use_program(atelier_bin());
+}
+
 /// A git command isolated from the user's and the system's configuration.
 pub fn git_cmd(dir: &Path) -> Command {
     let mut c = Command::new("git");

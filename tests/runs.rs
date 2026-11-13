@@ -29,6 +29,7 @@ fn probe_child_entry() {
     let Ok(mode) = std::env::var(PROBE) else {
         return;
     };
+    steps_use_atelier();
     let code = match mode.as_str() {
         "run" => probe_run(),
         "escape" => probe_escape(),
@@ -191,6 +192,7 @@ fn start_after_release(
     command: &str,
     worktree: &Path,
 ) -> atelier::exit::Result<Run> {
+    steps_use_atelier();
     let deadline = Instant::now() + Duration::from_secs(3);
     loop {
         match Run::start(state, key.clone(), kind.clone(), command, worktree) {
@@ -462,6 +464,9 @@ fn a_member_that_ignores_term_is_killed() {
     run.finish(true).unwrap();
 }
 
+/// Linux: the marker scan. On macOS the coalition catches this at the end of the step
+/// (`tests/launchd.rs`).
+#[cfg(not(target_os = "macos"))]
 #[test]
 fn a_survivor_that_left_its_group_makes_the_run_red_and_blocks_the_next_run() {
     let repo = Repo::new();
@@ -593,13 +598,22 @@ fn a_killed_atelier_leaves_a_live_group_and_the_next_run_refuses() {
         !run_dir.join("result").exists(),
         "a killed run has no result"
     );
-    // The group is recorded with its leader's start time.
+    // The group is recorded with its leader's start time (and, on macOS, the step job's
+    // coalition after it).
     let record = fs::read_to_string(state.locks_dir().join("branch/probe%2Fbranch.procs")).unwrap();
     let start = atelier::procs::start_time(step).unwrap();
     assert!(
         record
             .lines()
-            .any(|l| l.starts_with(&format!("group {step} ")) && l.ends_with(&format!(" {start}"))),
+            .any(|l| l.starts_with(&format!("group {step} "))
+                && l.split(' ').nth(3) == Some(start.as_str())),
+        "{record}"
+    );
+    #[cfg(target_os = "macos")]
+    assert!(
+        record
+            .lines()
+            .any(|l| l.split(' ').nth(4).is_some_and(|c| c.contains('@'))),
         "{record}"
     );
 
@@ -717,6 +731,7 @@ fn the_lock_is_not_handed_to_children() {
     kill_and_wait(step, true);
 }
 
+#[cfg_attr(target_os = "macos", allow(dead_code))]
 fn escape_argv() -> Vec<String> {
     let me = std::env::current_exe().unwrap();
     vec![
@@ -858,6 +873,9 @@ fn a_program_name_starting_with_a_dash_is_refused() {
     run.finish(true).unwrap();
 }
 
+/// Linux: the marker scan. On macOS the coalition catches this at the end of the step
+/// (`tests/launchd.rs`).
+#[cfg(not(target_os = "macos"))]
 #[test]
 fn an_outer_run_finds_what_a_nested_atelier_left_behind() {
     let repo = Repo::new();

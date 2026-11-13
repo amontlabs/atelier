@@ -13,6 +13,7 @@ pub mod bisect;
 pub mod check;
 pub mod clean;
 pub mod cli;
+pub mod coalition;
 pub mod dirfd;
 pub mod dispatch;
 pub mod exchange;
@@ -23,7 +24,10 @@ pub mod fsutil;
 pub mod gate;
 pub mod gate_machines;
 pub mod git;
+pub mod hook;
 pub mod jobs;
+#[cfg(target_os = "macos")]
+pub mod launchd;
 pub mod ledger;
 pub mod locks;
 pub mod machines;

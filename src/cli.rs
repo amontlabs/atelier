@@ -139,6 +139,11 @@ pub enum Cmd {
         #[command(subcommand)]
         action: Option<MachinesCmd>,
     },
+    /// Hooks the agent harnesses run (registered by `init` and `rules`).
+    Hook {
+        #[command(subcommand)]
+        action: HookCmd,
+    },
     /// Internal: the machine side of a run started over ssh by `test` or `merge`.
     #[command(hide = true)]
     RemoteRun {
@@ -159,6 +164,13 @@ pub enum MachinesCmd {
     },
 }
 
+#[derive(Debug, Subcommand)]
+pub enum HookCmd {
+    /// Claude Code's and Codex's Stop and SubagentStop hook: reads the hook's JSON on stdin and
+    /// blocks the end of a worker's turn in an atelier worktree while work is unfinished.
+    Stop,
+}
+
 impl Cmd {
     pub fn name(&self) -> &'static str {
         match self {
@@ -177,6 +189,7 @@ impl Cmd {
             Cmd::Agents => "agents",
             Cmd::Status { .. } => "status",
             Cmd::Machines { .. } => "machines",
+            Cmd::Hook { .. } => "hook",
             Cmd::RemoteRun { .. } => "remote-run",
         }
     }
@@ -191,6 +204,7 @@ impl Cmd {
             Cmd::Test { .. } | Cmd::Machines { .. } | Cmd::RemoteRun { .. } => "3.6",
             Cmd::Init { .. } | Cmd::Rules | Cmd::Task { .. } | Cmd::Agents => "3.7",
             Cmd::Status { .. } => "3.8",
+            Cmd::Hook { .. } => "3.10",
         }
     }
 
@@ -214,6 +228,11 @@ impl Cmd {
 /// The program's entry point; returns the exit code.
 pub fn main() -> i32 {
     let args: Vec<OsString> = std::env::args_os().collect();
+    // A launchd job's shim: the same program, never dispatched (DESIGN §8.4).
+    #[cfg(target_os = "macos")]
+    if args.get(1).is_some_and(|a| a == crate::launchd::SHIM_ARG) {
+        return crate::launchd::shim_main(&args);
+    }
     match main_with(&args) {
         Ok(exit) => exit.code(),
         Err(f) => {
@@ -260,6 +279,13 @@ fn main_with(args: &[OsString]) -> Result<Exit> {
 pub fn run(cmd: Cmd, cwd: &Path) -> Result<Exit> {
     match cmd {
         Cmd::RemoteRun { action } => return remote_run::main(action),
+        // No preflight: a hook must answer whatever state the project is in, and never refuse.
+        Cmd::Hook {
+            action: HookCmd::Stop,
+        } => {
+            crate::hook::stop_main();
+            return Ok(Exit::Ok);
+        }
         Cmd::Test {
             platform,
             all,
@@ -469,6 +495,7 @@ mod tests {
             "atelier status",
             "atelier machines",
             "atelier machines init linux-box",
+            "atelier hook stop",
         ] {
             let args: Vec<&str> = line.split(' ').collect();
             Cli::try_parse_from(&args).unwrap_or_else(|e| panic!("{line}: {e}"));
