@@ -460,6 +460,27 @@ impl HeldLock {
     }
 }
 
+/// Whether another process holds the lock right now, without taking it for good: the lock file
+/// is opened only if it exists, and a shared lock taken to find out is released at once. Where
+/// that cannot be told, `false`.
+pub fn is_held(state: &State, key: &LockKey) -> bool {
+    let path = lock_file(state, key, ".lock");
+    let Ok(file) = OpenOptions::new().read(true).open(&path) else {
+        return false;
+    };
+    matches!(
+        file.try_lock_shared(),
+        Err(std::fs::TryLockError::WouldBlock)
+    )
+}
+
+/// The process groups the lock's record lists; none when it cannot be read.
+pub fn recorded_groups(state: &State, key: &LockKey) -> Vec<GroupLine> {
+    read_record(&lock_file(state, key, ".procs"), key)
+        .map(|r| r.groups)
+        .unwrap_or_default()
+}
+
 fn save(path: &std::path::Path, record: &Record) -> Result<()> {
     if record.is_empty() {
         return match fs::remove_file(path) {

@@ -64,7 +64,7 @@ Platforms of other machines run on machines chosen as `atelier test` chooses the
 
 `atelier status [--json]` (module 3.8, [docs/STATUS.md](docs/STATUS.md)) is the one read-only view:
 the preflight lines, `main` and any pending or interrupted promotion, approvals not yet merged,
-merges not yet cleaned, the last runs, each platform's last result and the waivers since, the
+merges not yet cleaned, the last runs, each platform's last gate result on `main` (waived ones as waived), the
 machines as `atelier machines` prints them, branches that must `follow`, worktrees with no merge
 record, flaky tests, and the conflict forecast (`git merge-tree` for every pair of open branches
 and each against `main`, touching no file). `merge` prints the forecast's pairs that involve the

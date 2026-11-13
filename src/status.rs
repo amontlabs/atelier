@@ -14,8 +14,10 @@ use crate::forecast;
 use crate::gate;
 use crate::git::{self, Checkout};
 use crate::ledger::{Approval, MergeLine, Promotion};
+use crate::locks::{self, LockKey};
 use crate::platform::Platform;
 use crate::preflight::{self, Context, Report};
+use crate::procs;
 use crate::promote::{self, Facts};
 use crate::records::{BranchState, MergeFacts};
 use crate::runs::{self, Outcome, RunInfo, RunKind, RunResult};
@@ -43,6 +45,18 @@ impl Section {
         Section {
             name: name.into(),
             lines,
+            omitted,
+        }
+    }
+}
+
+impl Section {
+    /// `pinned` lines first, never counted against the cap: what the reader must not miss.
+    pub fn pinned(name: impl Into<String>, pinned: Vec<String>, lines: Vec<String>) -> Section {
+        let (lines, omitted) = cap(lines);
+        Section {
+            name: name.into(),
+            lines: pinned.into_iter().chain(lines).collect(),
             omitted,
         }
     }
@@ -142,12 +156,28 @@ struct RunRow {
     result: Option<RunResult>,
     info: Option<RunInfo>,
     dir: PathBuf,
+    /// Why a record of the folder could not be read or is not valid.
+    unreadable: Option<String>,
+}
+
+/// A result this version can trust: the tree is a git object id.
+fn valid(res: &RunResult) -> std::result::Result<(), String> {
+    match &res.tree {
+        Some(t) if t.is_empty() || t.len() > 64 || !t.bytes().all(|b| b.is_ascii_hexdigit()) => {
+            Err("its tree is not a git object id".to_owned())
+        }
+        _ => Ok(()),
+    }
 }
 
 impl RunRow {
-    /// The platform the run's steps ran on: recorded, or this computer's for a local run.
+    /// The platform the run's steps ran on: recorded, or this computer's for a local run. The
+    /// gate's own run has none: its platforms are in the merge records.
     fn platform(&self) -> Option<String> {
         let r = self.result.as_ref()?;
+        if r.kind == RunKind::Gate {
+            return None;
+        }
         r.platform.clone().or_else(|| {
             r.machine
                 .is_none()
@@ -175,11 +205,27 @@ fn scan_runs(state: &crate::state::State) -> (Vec<RunRow>, usize) {
         .into_iter()
         .map(|id| {
             let d = dir.join(&id);
+            let mut unreadable = None;
+            let result = match RunResult::read(&d) {
+                Ok(Some(r)) => match valid(&r) {
+                    Ok(()) => Some(r),
+                    Err(why) => {
+                        unreadable = Some(why);
+                        None
+                    }
+                },
+                Ok(None) => None,
+                Err(e) => {
+                    unreadable = Some(e.message.lines().next().unwrap_or("").to_owned());
+                    None
+                }
+            };
             RunRow {
-                result: RunResult::read(&d).ok().flatten(),
+                result,
                 info: RunInfo::read(&d).ok().flatten(),
                 id,
                 dir: d,
+                unreadable,
             }
         })
         .collect();
@@ -242,18 +288,21 @@ fn project(ctx: &Context, pinned_here: bool) -> Vec<Section> {
         Ok(platform_lines(ctx, &stack, &rows, &merges)),
     ));
     out.push(built("machines", testcmd::machine_table(ctx)));
-    let mut follow = follow_lines(&stack, &records);
-    follow.extend(problems.iter().map(|p| format!("record unreadable: {p}")));
-    out.push(Section::new("must follow", follow));
+    let unreadable = problems
+        .iter()
+        .map(|p| format!("record unreadable: {p}"))
+        .collect();
+    out.push(Section::pinned(
+        "must follow",
+        unreadable,
+        follow_lines(&stack, &records),
+    ));
     out.push(built(
         "worktrees with no merge record",
         worktrees(&ctx.checkout, &records),
     ));
     out.push(Section::new("flaky tests", flaky(&rows)));
-    out.push(built(
-        "conflict forecast",
-        forecast_lines(ctx, &stack, &integration),
-    ));
+    out.push(forecast_section(ctx, &stack, &integration));
     out
 }
 
@@ -316,35 +365,68 @@ fn main_lines(
         );
         return Ok(out);
     };
-    match Promotion::read(v)? {
-        None => out.push("promotion: none".to_owned()),
-        Some(rec) => out.extend(promotion_lines(&main_root, &rec)?),
+    match Promotion::read(v) {
+        Ok(None) => out.push("promotion: none".to_owned()),
+        Ok(Some(rec)) => match promotion_lines(&main_root, &ctx.state, &rec) {
+            Ok(lines) => out.extend(lines),
+            Err(e) => out.push(format!(
+                "promotion: unreadable: {}",
+                e.message.lines().next().unwrap_or("")
+            )),
+        },
+        Err(e) => out.push(format!(
+            "promotion: unreadable: {}",
+            e.message.lines().next().unwrap_or("")
+        )),
     }
     Ok(out)
 }
 
-fn promotion_lines(root: &Path, rec: &Promotion) -> Result<Vec<String>> {
+/// A merge or promote is at work: the gate lock is held, or the push's process group, recorded
+/// with its leader's start time, is alive. `interrupted` is only safe under the gate lock.
+fn promotion_running(state: &crate::state::State, rec: &Promotion) -> bool {
+    if locks::is_held(state, &LockKey::Gate) {
+        return true;
+    }
+    let Some(pgid) = rec.push_pgid.filter(|_| rec.push_unfinished()) else {
+        return false;
+    };
+    locks::recorded_groups(state, &LockKey::Gate)
+        .iter()
+        .any(|g| g.pgid == pgid && procs::recorded_group_alive(pgid, g.leader_start.as_deref()))
+}
+
+fn promotion_lines(
+    root: &Path,
+    state: &crate::state::State,
+    rec: &Promotion,
+) -> Result<Vec<String>> {
     let (old, m) = (short(root, &rec.old), short(root, &rec.m));
-    let head = match promote::facts(root, rec)? {
-        Facts::Promoted => format!(
-            "promotion: {m} is in {} but not recorded (run {}): atelier promote records it",
-            rec.integration, rec.run
-        ),
-        Facts::Moved(_) => format!(
-            "promotion: stale: {} moved from {old} (run {}): the next merge or atelier promote --discard drops it",
-            rec.integration, rec.run
-        ),
-        Facts::Pending => {
-            if promote::interrupted(root, rec).unwrap_or(false) {
-                format!(
-                    "promotion: INTERRUPTED, {} {old} -> {m} (run {}): atelier promote lists the paths; atelier promote --discard drops it",
-                    rec.integration, rec.run
-                )
-            } else {
-                format!(
-                    "promotion: pending, {} {old} -> {m} (run {}): atelier promote",
-                    rec.integration, rec.run
-                )
+    let running = promotion_running(state, rec);
+    let head = if running {
+        "promotion: running (merge or promote in progress)".to_owned()
+    } else {
+        match promote::facts(root, rec)? {
+            Facts::Promoted => format!(
+                "promotion: {m} is in {} but not recorded (run {}): atelier promote records it",
+                rec.integration, rec.run
+            ),
+            Facts::Moved(_) => format!(
+                "promotion: stale: {} moved from {old} (run {}): the next merge or atelier promote --discard drops it",
+                rec.integration, rec.run
+            ),
+            Facts::Pending => {
+                if promote::interrupted(root, rec).unwrap_or(false) {
+                    format!(
+                        "promotion: INTERRUPTED, {} {old} -> {m} (run {}): atelier promote lists the paths; atelier promote --discard drops it",
+                        rec.integration, rec.run
+                    )
+                } else {
+                    format!(
+                        "promotion: pending, {} {old} -> {m} (run {}): atelier promote",
+                        rec.integration, rec.run
+                    )
+                }
             }
         }
     };
@@ -429,6 +511,9 @@ fn runs_section(rows: &[RunRow], total: usize) -> Section {
 }
 
 fn run_line(r: &RunRow) -> String {
+    if let Some(why) = &r.unreadable {
+        return format!("{} unreadable: {why}", r.id);
+    }
     let Some(res) = &r.result else {
         let live = r.info.as_ref().is_some_and(|i| {
             i.pid_start.is_some()
@@ -461,7 +546,7 @@ fn run_line(r: &RunRow) -> String {
         line.push_str(&format!(" on {m}"));
     }
     if let Some(t) = &res.tree {
-        line.push_str(&format!(" tree {}", &t[..t.len().min(12)]));
+        line.push_str(&format!(" tree {}", t.get(..12).unwrap_or(t)));
     }
     line
 }
@@ -474,6 +559,17 @@ fn merge_entry<'a>(l: &'a MergeLine, platform: &str) -> Option<&'a str> {
     })
 }
 
+/// What the last gate that ran a platform found there.
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+enum Gated {
+    Passed,
+    Failed,
+    Waived,
+}
+
+/// The health of `main` per platform: the last gate in which the platform actually ran, from
+/// the gate runs' results and `merges.tsv`, with the commit it merged. A waived platform says
+/// so. A worker's `check` or `test` is not main's state; those runs are under `last runs`.
 fn platform_lines(
     ctx: &Context,
     stack: &Stack,
@@ -493,70 +589,79 @@ fn platform_lines(
         .keys()
         .cloned()
         .collect();
+    // One merge per gate run: its lines share the run, the time and the platforms.
+    let mut merged: Vec<(&MergeLine, Vec<&str>)> = Vec::new();
+    for l in merges {
+        match merged.iter_mut().find(|(f, _)| f.run == l.run) {
+            Some((_, branches)) => branches.push(&l.branch),
+            None => merged.push((l, vec![&l.branch])),
+        }
+    }
     let mut out = Vec::new();
     for p in names {
-        // (time, is a pass, text)
-        let mut seen: Vec<(String, bool, String)> = Vec::new();
-        for r in rows {
-            let Some(res) = &r.result else { continue };
-            let full = matches!(res.kind, RunKind::Check | RunKind::TestFull | RunKind::Gate);
-            if !full || res.outcome == Outcome::Interrupted || r.platform().as_deref() != Some(&p) {
-                continue;
-            }
-            let pass = res.outcome == Outcome::Passed;
-            seen.push((
-                res.ended.clone(),
-                pass,
-                format!(
-                    "{} {} on {} ({})",
-                    if pass { "PASS" } else { "FAIL" },
-                    minute(&res.ended),
-                    res.machine.as_deref().unwrap_or("this computer"),
-                    res.kind.as_str()
-                ),
-            ));
-        }
-        for l in merges {
+        // (time, what, text)
+        let mut seen: Vec<(String, Gated, String)> = Vec::new();
+        for (l, branches) in &merged {
+            let of = format!("merge of {}, {}", branches.join(" "), short(root, &l.m));
             match merge_entry(l, &p) {
                 Some(e) if e.starts_with("pass@") => seen.push((
                     l.time.clone(),
-                    true,
+                    Gated::Passed,
                     format!(
-                        "PASS {} on {} (merge of {})",
+                        "PASS {} on {} ({of})",
                         minute(&l.time),
                         match &e[5..] {
                             "local" => "this computer",
                             m => m,
-                        },
-                        l.branch
+                        }
+                    ),
+                )),
+                Some(e) if e.starts_with("waived:") => seen.push((
+                    l.time.clone(),
+                    Gated::Waived,
+                    format!(
+                        "WAIVED {} ({of}): {}",
+                        minute(&l.time),
+                        &e["waived:".len()..]
                     ),
                 )),
                 _ => {}
             }
         }
+        // A gate that failed on the platform: its failure line names the platform.
+        for r in rows {
+            let Some(res) = &r.result else { continue };
+            if res.kind != RunKind::Gate || res.outcome != Outcome::Failed {
+                continue;
+            }
+            let prefix = format!("{p}: ");
+            if !res.failures.iter().any(|f| f.starts_with(&prefix)) {
+                continue;
+            }
+            seen.push((
+                res.ended.clone(),
+                Gated::Failed,
+                format!(
+                    "FAIL {} (gate of {}, run {}{}, not merged)",
+                    minute(&res.ended),
+                    res.branch.as_deref().unwrap_or("?"),
+                    r.id,
+                    res.commit
+                        .as_deref()
+                        .map(|c| format!(", {}", short(root, c)))
+                        .unwrap_or_default()
+                ),
+            ));
+        }
         seen.sort();
-        let last_pass = seen.iter().rfind(|s| s.1).map(|s| s.0.clone());
         let mut line = match seen.last() {
             Some((_, _, text)) => format!("{p}: {text}"),
-            None => format!("{p}: no run recorded"),
+            None => format!("{p}: no gate has run it"),
         };
-        let waived: Vec<&MergeLine> = merges
-            .iter()
-            .filter(|l| {
-                merge_entry(l, &p).is_some_and(|e| e.starts_with("waived:"))
-                    && last_pass.as_ref().is_none_or(|t| l.time > *t)
-            })
-            .collect();
-        if let Some(last) = waived.last() {
-            let reason = merge_entry(last, &p)
-                .and_then(|e| e.strip_prefix("waived:"))
-                .unwrap_or("");
-            line.push_str(&format!(
-                "; waived since: {} (last {} {}: {reason})",
-                waived.len(),
-                minute(&last.time),
-                last.branch
-            ));
+        if seen.last().is_some_and(|s| s.1 != Gated::Passed)
+            && let Some((_, _, text)) = seen.iter().rfind(|s| s.1 == Gated::Passed)
+        {
+            line.push_str(&format!("; last passed: {text}"));
         }
         out.push(line);
     }
@@ -704,7 +809,7 @@ fn flaky(rows: &[RunRow]) -> Vec<String> {
                 "{ws} {test}: failed in {}, passed in {} ({platform}, tree {})",
                 verdicts[first_fail].1,
                 pass.1,
-                &tree[..tree.len().min(12)]
+                tree.get(..12).unwrap_or(tree)
             ),
         ));
     }
@@ -712,19 +817,34 @@ fn flaky(rows: &[RunRow]) -> Vec<String> {
     found.into_iter().map(|f| f.1).collect()
 }
 
-fn forecast_lines(ctx: &Context, stack: &Stack, integration: &str) -> Result<Vec<String>> {
-    let Some(tip) = stack.tip(integration)? else {
-        return Ok(vec![format!("{integration}: the branch does not exist")]);
+fn forecast_section(ctx: &Context, stack: &Stack, integration: &str) -> Section {
+    let name = "conflict forecast";
+    let tip = match stack.tip(integration) {
+        Ok(Some(t)) => t,
+        Ok(None) => {
+            return Section::new(
+                name,
+                vec![format!("{integration}: the branch does not exist")],
+            );
+        }
+        Err(e) => {
+            return Section::new(
+                name,
+                vec![format!(
+                    "unavailable: {}",
+                    e.message.lines().next().unwrap_or("")
+                )],
+            );
+        }
     };
     let open = forecast::open_branches(stack);
-    let regen: BTreeSet<String> = gate::settings_at(&ctx.checkout.root, &tip)?
-        .map(|s| gate::regenerated_paths(&s))
-        .unwrap_or_default();
+    let old_settings = gate::settings_at(&ctx.checkout.root, &tip).ok().flatten();
     let main = forecast::Open {
         name: integration.to_owned(),
         tip,
+        base: String::new(),
     };
-    let f = forecast::forecast(&ctx.checkout, &main, &open, &regen);
+    let f = forecast::forecast(&ctx.checkout, old_settings.as_ref(), &main, &open, None);
     let mut out: Vec<String> = f.conflicts.iter().map(|c| c.line(5)).collect();
     if out.is_empty() {
         out.push(format!(
@@ -733,8 +853,10 @@ fn forecast_lines(ctx: &Context, stack: &Stack, integration: &str) -> Result<Vec
             if open.len() == 1 { "" } else { "es" }
         ));
     }
-    if f.unknown > 0 {
-        out.push(format!("{} pairs not forecast", f.unknown));
-    }
-    Ok(out)
+    let pinned = if f.unknown > 0 {
+        vec![format!("{} pairs not forecast", f.unknown)]
+    } else {
+        Vec::new()
+    };
+    Section::pinned(name, pinned, out)
 }

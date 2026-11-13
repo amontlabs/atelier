@@ -263,28 +263,31 @@ pub fn run_with(
         }
     }
 
-    // The forecast only warns.
-    let open = crate::forecast::open_branches(&stack);
-    let main = crate::forecast::Open {
-        name: integration.clone(),
-        tip: old.clone(),
-    };
-    let forecast = crate::forecast::forecast(
-        &ctx.checkout,
-        &main,
-        &open,
-        &regenerated_paths(&old_settings),
-    );
-    let batch: Vec<String> = items.iter().map(|i| i.name.clone()).collect();
-    for line in crate::forecast::warning_lines(&forecast, &batch) {
-        println!("{line}");
-    }
-
     let names: Vec<String> = platform_names(&merged)
         .into_iter()
         .filter(|p| waived(waivers, p).is_none())
         .collect();
     require_machines(platforms, &ctx.checkout, &merged, &names, &integration)?;
+
+    // The forecast only warns, and only for the pairs that involve the batch; it runs after the
+    // machine check so an unavailable platform still costs seconds.
+    let open = crate::forecast::open_branches(&stack);
+    let main = crate::forecast::Open {
+        name: integration.clone(),
+        tip: old.clone(),
+        base: String::new(),
+    };
+    let batch: Vec<String> = items.iter().map(|i| i.name.clone()).collect();
+    let forecast = crate::forecast::forecast(
+        &ctx.checkout,
+        Some(&old_settings),
+        &main,
+        &open,
+        Some(&batch),
+    );
+    for line in crate::forecast::warning_lines(&forecast, &batch) {
+        println!("{line}");
+    }
 
     let end = gate(
         ctx,
@@ -925,7 +928,12 @@ fn preconditions(
 /// True when the branch's own commits (from its recorded base) touch `.atelier/`, `AGENTS.md`
 /// or a file the rules import into. A stacked branch is judged by its own commits; its lower
 /// branch is judged by its own.
-fn changes_rules(root: &Path, settings: &Settings, base: &str, commit: &str) -> Result<bool> {
+pub(crate) fn changes_rules(
+    root: &Path,
+    settings: &Settings,
+    base: &str,
+    commit: &str,
+) -> Result<bool> {
     let out = git::output(
         root,
         [
@@ -1289,14 +1297,71 @@ fn merge_attributes(
 /// `merge.default` names, or a built-in name the git configuration redefines. Such a driver
 /// could settle a conflict without a word (DESIGN §8.2: the gate never resolves anything).
 pub fn refuse_merge_drivers(dir: &Path, head: &str, commit: &str, name: &str) -> Result<()> {
-    let both = changed_on_both_sides(dir, head, commit)?;
-    if both.is_empty() {
+    let problems: Vec<String> = merge_driver_uses(dir, head, commit, &[None, Some(commit)])?
+        .iter()
+        .map(DriverUse::line)
+        .collect();
+    if problems.is_empty() {
         return Ok(());
     }
+    Err(Failure::refused(format!(
+        "merging {name}: paths changed on both sides would be merged by a merge driver other than git's text and binary merges; the gate never lets anything resolve a conflict:\n  {}\nremove that merge attribute (.gitattributes, .git/info/attributes) or merge.default, or the driver from the git configuration; nothing was merged",
+        problems.join("\n  ")
+    )))
+}
+
+/// A path changed on both sides of a merge that a driver other than git's text and binary
+/// merges would merge.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct DriverUse {
+    pub path: String,
+    pub driver: String,
+    pub kind: DriverKind,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum DriverKind {
+    /// git's `union`, which never conflicts.
+    Union,
+    /// A driver the git configuration defines.
+    Configured,
+    /// A built-in name the git configuration redefines.
+    Redefined,
+}
+
+impl DriverUse {
+    fn line(&self) -> String {
+        let (path, driver) = (&self.path, &self.driver);
+        match self.kind {
+            DriverKind::Union => {
+                format!("{path}: merge=union, which keeps both sides' lines and never conflicts")
+            }
+            DriverKind::Configured => format!("{path}: merge driver {driver:?}"),
+            DriverKind::Redefined => format!(
+                "{path}: merge={driver}, which the git configuration redefines (merge.{driver}.driver)"
+            ),
+        }
+    }
+}
+
+/// The read-only check behind [`refuse_merge_drivers`]: the paths changed on both sides of
+/// merging `commit` into `head` whose `merge` attribute (read from each of `sources`, `None`
+/// being the checkout's own `.gitattributes`) or `merge.default` names a driver other than
+/// git's text and binary merges. Nothing is merged and no driver runs.
+pub(crate) fn merge_driver_uses(
+    dir: &Path,
+    head: &str,
+    commit: &str,
+    sources: &[Option<&str>],
+) -> Result<Vec<DriverUse>> {
+    let both = changed_on_both_sides(dir, head, commit)?;
+    if both.is_empty() {
+        return Ok(Vec::new());
+    }
     let default = config_value(dir, "merge.default")?;
-    let mut problems: Vec<String> = Vec::new();
-    for source in [None, Some(commit)] {
-        for (path, value) in merge_attributes(dir, source, &both)? {
+    let mut found: Vec<DriverUse> = Vec::new();
+    for source in sources {
+        for (path, value) in merge_attributes(dir, *source, &both)? {
             let driver = match value.as_str() {
                 // `merge` set or unset: git's text and binary merges, never a configured one.
                 "set" | "unset" => continue,
@@ -1306,29 +1371,22 @@ pub fn refuse_merge_drivers(dir: &Path, head: &str, commit: &str, name: &str) ->
                 },
                 other => other.to_owned(),
             };
-            let line = if driver == "union" {
-                format!("{path}: merge=union, which keeps both sides' lines and never conflicts")
+            let kind = if driver == "union" {
+                DriverKind::Union
             } else if !BUILT_IN_DRIVERS.contains(&driver.as_str()) {
-                format!("{path}: merge driver {driver:?}")
+                DriverKind::Configured
             } else if config_value(dir, &format!("merge.{driver}.driver"))?.is_some() {
-                format!(
-                    "{path}: merge={driver}, which the git configuration redefines (merge.{driver}.driver)"
-                )
+                DriverKind::Redefined
             } else {
                 continue;
             };
-            if !problems.contains(&line) {
-                problems.push(line);
+            let u = DriverUse { path, driver, kind };
+            if !found.contains(&u) {
+                found.push(u);
             }
         }
     }
-    if problems.is_empty() {
-        return Ok(());
-    }
-    Err(Failure::refused(format!(
-        "merging {name}: paths changed on both sides would be merged by a merge driver other than git's text and binary merges; the gate never lets anything resolve a conflict:\n  {}\nremove that merge attribute (.gitattributes, .git/info/attributes) or merge.default, or the driver from the git configuration; nothing was merged",
-        problems.join("\n  ")
-    )))
+    Ok(found)
 }
 
 /// Merges one approved commit into the gate's `HEAD` (step 3). `old_regen` is

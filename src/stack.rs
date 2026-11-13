@@ -766,5 +766,6 @@ pub fn is_ancestor(dir: &Path, a: &str, b: &str) -> Result<bool> {
 
 /// An abbreviated commit id for messages.
 pub fn short(dir: &Path, oid: &str) -> String {
-    git::run(dir, ["rev-parse", "--short", oid]).unwrap_or_else(|_| oid[..12].to_owned())
+    git::run(dir, ["rev-parse", "--short", oid])
+        .unwrap_or_else(|_| oid.get(..12).unwrap_or(oid).to_owned())
 }

@@ -34,7 +34,10 @@ impl Proj {
     }
 
     fn with_settings(extra: &str) -> Proj {
-        let repo = Repo::new();
+        Proj::with_settings_in(Repo::new(), extra)
+    }
+
+    fn with_settings_in(repo: Repo, extra: &str) -> Proj {
         repo.install_self(VERSION);
         repo.write(".gitignore", "*.ignored\nbuild/\n");
         repo.write(
@@ -704,40 +707,101 @@ fn last_runs_are_bounded_and_counted() {
     assert_eq!(runs["omitted"], 3);
 }
 
-#[test]
-fn each_platform_shows_its_last_result_machine_and_waivers_since() {
-    let p = Proj::with_settings("\n[platforms.linux-x86_64]\nrun = \"check\"\n");
-    // The first gate: both platforms pass, the other on a machine.
-    let mut line = MergeLine {
-        time: "2026-11-13T10:00:00Z".into(),
-        branch: "one".into(),
+fn merge_line(time: &str, branch: &str, run: &str, platforms: &[String]) -> MergeLine {
+    MergeLine {
+        time: time.into(),
+        branch: branch.into(),
         lifetime: "aa".into(),
         commit: "a".repeat(40),
         old: "b".repeat(40),
         m: "c".repeat(40),
-        run: run_id(0, 1),
-        platforms: vec![
-            format!("{}=pass@local", this_platform()),
-            "linux-x86_64=pass@box".into(),
-        ],
-    };
-    p.append_merge_line(&line);
-    // Two later merges waive linux-x86_64.
-    for (t, b) in [
-        ("2026-11-13T11:00:00Z", "two"),
-        ("2026-11-13T12:00:00Z", "three"),
-    ] {
-        line.time = t.into();
-        line.branch = b.into();
-        line.platforms = vec![
-            format!("{}=pass@local", this_platform()),
-            "linux-x86_64=waived:no box today".into(),
-        ];
-        p.append_merge_line(&line);
+        run: run.into(),
+        platforms: platforms.to_vec(),
     }
-    // This platform also failed a later check.
+}
+
+impl Proj {
+    /// A gate run as `merge` leaves it.
+    fn fabricate_gate(&self, id: &str, outcome: Outcome, branch: &str, failures: &[&str]) {
+        let dir = self.main().join(".git/atelier/runs").join(id);
+        fs::create_dir_all(&dir).unwrap();
+        let time = format!(
+            "{}-{}-{}T{}:{}:00Z",
+            &id[0..4],
+            &id[4..6],
+            &id[6..8],
+            &id[9..11],
+            &id[11..13]
+        );
+        let result = RunResult {
+            id: id.to_owned(),
+            kind: RunKind::Gate,
+            command: format!("merge {branch}"),
+            outcome,
+            tree: Some("d".repeat(40)),
+            commit: Some("e".repeat(40)),
+            uncommitted: Some(false),
+            branch: Some(branch.to_owned()),
+            worktree: self.main().to_path_buf(),
+            // The gate's run records this computer's platform for the whole gate.
+            platform: Some(this_platform()),
+            machine: None,
+            atelier_version: VERSION.to_owned(),
+            started: time.clone(),
+            ended: time,
+            signal: None,
+            failures: failures.iter().map(|f| (*f).to_owned()).collect(),
+            survivors: Vec::new(),
+            test_results: None,
+            tests: None,
+            steps: Vec::new(),
+        };
+        fs::write(dir.join("result"), toml::to_string(&result).unwrap()).unwrap();
+    }
+}
+
+#[test]
+fn each_platform_shows_the_last_gate_in_which_it_ran_and_waivers_are_never_a_pass() {
+    let p = Proj::with_settings("\n[platforms.linux-x86_64]\nrun = \"check\"\n");
+    let this = this_platform();
+    // The first gate: both platforms pass, the other on a machine.
+    p.append_merge_line(&merge_line(
+        "2026-11-13T10:00:00Z",
+        "one",
+        &run_id(0, 1),
+        &[format!("{this}=pass@local"), "linux-x86_64=pass@box".into()],
+    ));
+    let platforms = section(&p.status(), "platforms").join("\n");
+    assert!(
+        platforms.contains(&format!(
+            "{this}: PASS 2026-11-13T10:00Z on this computer (merge of one, ccccccc)"
+        )),
+        "{platforms}"
+    );
+    assert!(
+        platforms.contains("linux-x86_64: PASS 2026-11-13T10:00Z on box (merge of one, ccccccc)"),
+        "{platforms}"
+    );
+    // A later gate, green with linux waived: linux is waived, never PASS, and says what passed.
+    p.append_merge_line(&merge_line(
+        "2026-11-13T10:20:00Z",
+        "two",
+        &run_id(0, 2),
+        &[
+            format!("{this}=pass@local"),
+            "linux-x86_64=waived:no box today".into(),
+        ],
+    ));
+    // The gate's own run records this computer's platform; it is not a result for it.
+    p.fabricate_gate(
+        &run_id(30, 3),
+        Outcome::Failed,
+        "three",
+        &["conflict: three with main"],
+    );
+    // A worker's failing check on its own branch is not the state of main.
     p.fabricate_run(
-        &run_id(30, 1),
+        &run_id(40, 4),
         RunKind::Check,
         Outcome::Failed,
         &"a".repeat(40),
@@ -747,37 +811,70 @@ fn each_platform_shows_its_last_result_machine_and_waivers_since() {
     let platforms = section(&text, "platforms").join("\n");
     assert!(
         platforms.contains(&format!(
-            "{}: PASS 2026-11-13T12:00Z on this computer (merge of three)",
-            this_platform()
+            "{this}: PASS 2026-11-13T10:20Z on this computer (merge of two, ccccccc)"
         )),
         "{platforms}"
     );
     assert!(
         platforms.contains(
-            "linux-x86_64: PASS 2026-11-13T10:00Z on box (merge of one); waived since: 2 (last 2026-11-13T12:00Z three: no box today)"
+            "linux-x86_64: WAIVED 2026-11-13T10:20Z (merge of two, ccccccc): no box today; last passed: PASS 2026-11-13T10:00Z on box (merge of one, ccccccc)"
         ),
         "{platforms}"
     );
-    // Later fabricated run (same day, after) shows as the platform's last result.
-    p.fabricate_run(
-        &format!("20261113T1330Z-{:016x}", 2),
-        RunKind::Check,
+    assert!(!platforms.contains("FAIL"), "{platforms}");
+    let runs = section(&text, "last runs").join("\n");
+    assert!(
+        runs.contains(&format!("{} check FAIL", run_id(40, 4))),
+        "{runs}"
+    );
+    assert!(
+        runs.contains(&format!("{} gate FAIL three", run_id(30, 3))),
+        "{runs}"
+    );
+    assert!(
+        !runs.contains(&format!("gate FAIL three {this}")),
+        "the gate has no platform of its own: {runs}"
+    );
+
+    // A gate that failed on a platform names it.
+    p.fabricate_gate(
+        &run_id(50, 5),
         Outcome::Failed,
-        &"b".repeat(40),
-        "",
+        "four",
+        &[&format!("{this}: check failed")],
     );
     let platforms = section(&p.status(), "platforms").join("\n");
     assert!(
         platforms.contains(&format!(
-            "{}: FAIL 2026-11-13T13:30Z on this computer (check)",
-            this_platform()
+            "{this}: FAIL 2026-11-13T10:50Z (gate of four, run {}, eeeeeee, not merged); last passed: PASS 2026-11-13T10:20Z",
+            run_id(50, 5)
         )),
         "{platforms}"
     );
-    // A project with no records at all says so.
+
+    // A project with no gate at all says so.
     let q = Proj::with_settings("\n[platforms.linux-x86_64]\nrun = \"check\"\n");
-    let text = q.status();
-    assert!(section(&text, "platforms").contains(&"linux-x86_64: no run recorded"));
+    assert!(section(&q.status(), "platforms").contains(&"linux-x86_64: no gate has run it"));
+}
+
+#[test]
+fn a_real_gate_that_ends_on_a_conflict_says_nothing_about_a_platform() {
+    let p = Proj::new();
+    commit(p.main(), "shared.txt", "one\ntwo\n", "shared");
+    p.ready("a", "shared.txt", "A\ntwo\n");
+    p.ready("b", "shared.txt", "B\ntwo\n");
+    let out = p.run(&["merge", "a", "b"]);
+    assert_eq!(code(&out), 5, "{}{}", stdout(&out), stderr(&out));
+    let text = p.status();
+    let platforms = section(&text, "platforms");
+    assert_eq!(
+        platforms,
+        [format!("{}: no gate has run it", this_platform())],
+        "{platforms:?}"
+    );
+    let runs = section(&text, "last runs");
+    assert!(runs[0].contains(" gate FAIL a b"), "{runs:?}");
+    assert!(!runs[0].contains(&this_platform()), "{runs:?}");
 }
 
 #[test]
@@ -890,4 +987,440 @@ fn merge_is_silent_when_no_open_branch_conflicts() {
     let out = p.run(&["merge", "a"]);
     assert_eq!(code(&out), 0, "{}{}", stdout(&out), stderr(&out));
     assert!(!stdout(&out).contains("forecast"), "{}", stdout(&out));
+}
+
+// ---------------------------------------------------------------------------------------------
+// The review round (finding numbers in the names)
+
+use std::os::unix::process::CommandExt;
+use std::process::{Command, Stdio};
+
+fn promotion_line(text: &str) -> String {
+    section(text, "main")
+        .iter()
+        .find(|l| l.starts_with("promotion:"))
+        .unwrap()
+        .to_string()
+}
+
+#[test]
+fn f1_a_promotion_in_progress_is_running_with_no_advice() {
+    let p = Proj::new();
+    let rec = pending(&p);
+    let mut r = rec.clone();
+    r.push_started = Some("2026-11-13T10:00:00Z".into());
+    r.push_pgid = Some(999_999);
+    r.push_ended = None;
+    p.write_promotion(&r);
+    git(p.main(), &["read-tree", "-u", "-m", &rec.m]);
+
+    // The gate lock is held (merge, or a promote, is at work): never INTERRUPTED or pending.
+    let state = p.state();
+    let held = HeldLock::acquire(&state, LockKey::Gate).unwrap();
+    let line = promotion_line(&p.status());
+    assert_eq!(line, "promotion: running (merge or promote in progress)");
+    drop(held);
+    // Not held, and the group is dead: it is interrupted again.
+    assert!(promotion_line(&p.status()).starts_with("promotion: INTERRUPTED"));
+
+    // Not held, but the recorded push group is alive with its recorded start time.
+    let mut child = Command::new("sleep")
+        .arg("60")
+        .stdin(Stdio::null())
+        .process_group(0)
+        .spawn()
+        .unwrap();
+    let pgid = child.id() as i32;
+    r.push_pgid = Some(pgid);
+    p.write_promotion(&r);
+    let mut lock = HeldLock::acquire(&state, LockKey::Gate).unwrap();
+    lock.add_group(pgid, &rec.run, atelier::procs::start_time(pgid))
+        .unwrap();
+    drop(lock);
+    let line = promotion_line(&p.status());
+    child.kill().unwrap();
+    child.wait().unwrap();
+    assert_eq!(line, "promotion: running (merge or promote in progress)");
+    assert!(p.promotion().is_some(), "status records nothing");
+}
+
+#[test]
+fn f1_a_promotion_waiting_for_a_busy_checkout_while_merge_holds_the_lock_is_running() {
+    let p = Proj::new();
+    pending(&p);
+    let state = p.state();
+    let _held = HeldLock::acquire(&state, LockKey::Gate).unwrap();
+    assert_eq!(
+        promotion_line(&p.status()),
+        "promotion: running (merge or promote in progress)"
+    );
+}
+
+const REGEN: &str = "\n[[merge.after]]\nname = \"regen\"\nrun = [\"sh\", \"-c\", \"true\"]\ncommit = \"Regenerate gen.txt\"\nregenerates = [\"gen.txt\"]\n";
+
+fn regen_project() -> Proj {
+    // The regenerated file exists before the settings name it.
+    let repo = Repo::new();
+    repo.write("gen.txt", "zero\n");
+    repo.commit_all("gen");
+    Proj::with_settings_in(repo, REGEN)
+}
+
+#[test]
+fn f2_a_branch_that_changes_the_rules_is_never_filtered_and_others_still_are() {
+    let p = regen_project();
+    let a = p.start("a", None);
+    commit(&a, "gen.txt", "zero\na\n", "a edits gen");
+    commit(
+        &a,
+        ".atelier/hooks/note.sh",
+        "echo hi\n",
+        "a adds a hook file",
+    );
+    let b = p.start("b", None);
+    commit(&b, "gen.txt", "zero\nb\n", "b edits gen");
+    commit(p.main(), "gen.txt", "zero\nmain\n", "main edits gen");
+    let text = p.status();
+    let forecast = section(&text, "conflict forecast");
+    // b only touches the regenerated path: the gate settles it. a changes .atelier/: it does not.
+    assert_eq!(
+        forecast,
+        ["a x main: gen.txt", "a x b: gen.txt"],
+        "{forecast:?}"
+    );
+    // The gate agrees: it settles nothing for a, and refuses on the conflict.
+    let ca = git(&a, &["rev-parse", "HEAD"]);
+    let out = p.run(&["approve", "a", &ca]);
+    assert_eq!(code(&out), 0, "{}", stderr(&out));
+    let out = p.run(&["merge", "a"]);
+    assert!(
+        stdout(&out).contains("warning: forecast: a x main: gen.txt"),
+        "{}",
+        stdout(&out)
+    );
+    assert_eq!(code(&out), 5, "{}{}", stdout(&out), stderr(&out));
+}
+
+#[test]
+fn f2_a_branch_that_removes_the_hook_entry_is_never_filtered() {
+    let p = regen_project();
+    let a = p.start("a", None);
+    let settings = fs::read_to_string(a.join(".atelier/atelier.toml")).unwrap();
+    let cut = settings.find("\n[[merge.after]]").unwrap();
+    commit(
+        &a,
+        ".atelier/atelier.toml",
+        &settings[..cut],
+        "a drops the hook",
+    );
+    commit(&a, "gen.txt", "zero\na\n", "a edits gen");
+    commit(p.main(), "gen.txt", "zero\nmain\n", "main edits gen");
+    let forecast = section(&p.status(), "conflict forecast").join("\n");
+    assert_eq!(forecast, "a x main: gen.txt");
+}
+
+#[test]
+fn f3_merge_forecasts_every_pair_of_its_batch_however_many_branches_are_open() {
+    let p = Proj::new();
+    commit(p.main(), "shared.txt", "one\ntwo\nthree\n", "shared");
+    for i in 0..23 {
+        let name = format!("b{i:02}");
+        let wt = p.start(&name, None);
+        commit(&wt, &format!("only-{name}.txt"), "x\n", &name);
+    }
+    let y = p.start("y", None);
+    commit(&y, "shared.txt", "ONE\ntwo\nthree\n", "y edits");
+    let z = p.start("z", None);
+    let cz = commit(&z, "shared.txt", "uno\ntwo\nthree\n", "z edits");
+    let out = p.run(&["approve", "z", &cz]);
+    assert_eq!(code(&out), 0, "{}", stderr(&out));
+    // 25 branches: status stops at 300 calls and says so.
+    let text = p.status();
+    assert!(
+        section(&text, "conflict forecast")[0].ends_with("pairs not forecast"),
+        "{text}"
+    );
+    let out = p.run(&["merge", "z"]);
+    assert_eq!(code(&out), 0, "{}{}", stdout(&out), stderr(&out));
+    assert!(
+        stdout(&out).contains("warning: forecast: y x z: shared.txt"),
+        "{}",
+        stdout(&out)
+    );
+    assert!(!stdout(&out).contains("not forecast"), "{}", stdout(&out));
+}
+
+#[test]
+fn f4_f5_a_waiver_in_the_last_gate_is_never_shown_as_a_pass() {
+    // See each_platform_shows_the_last_gate_in_which_it_ran_and_waivers_are_never_a_pass; this
+    // one drives a real waived merge.
+    let other = if this_platform() == "linux-x86_64" {
+        "macos-aarch64"
+    } else {
+        "linux-x86_64"
+    };
+    let p = Proj::with_settings(&format!(
+        "\n[platforms.{other}]\nrun = [\"sh\", \"-c\", \"true\"]\n"
+    ));
+    p.ready("feat", "a.txt", "a\n");
+    let out = p.run(&["merge", "feat", "--waive", other, "--reason", "no box"]);
+    assert_eq!(code(&out), 0, "{}{}", stdout(&out), stderr(&out));
+    let platforms = section(&p.status(), "platforms").join("\n");
+    assert!(
+        platforms.contains(&format!("{other}: WAIVED ")) && platforms.contains("no box"),
+        "{platforms}"
+    );
+    assert!(
+        !platforms.contains(&format!("{other}: PASS")),
+        "{platforms}"
+    );
+    assert!(
+        platforms.contains(&format!("{}: PASS ", this_platform())),
+        "{platforms}"
+    );
+    assert!(platforms.contains("merge of feat, "), "{platforms}");
+}
+
+/// A repository where `shared.txt -merge` (git's binary merge: any change on both sides
+/// conflicts) on main; `a` drops the attribute and edits the first line, `b` the last one.
+fn attributes_project() -> Proj {
+    let p = Proj::new();
+    commit(
+        p.main(),
+        ".gitattributes",
+        "shared.txt -merge\n",
+        "attributes",
+    );
+    commit(p.main(), "shared.txt", "one\ntwo\nthree\n", "shared");
+    let a = p.start("a", None);
+    git(&a, &["rm", "-q", ".gitattributes"]);
+    commit(
+        &a,
+        "shared.txt",
+        "ONE\ntwo\nthree\n",
+        "a drops the attribute and edits",
+    );
+    let b = p.start("b", None);
+    commit(&b, "shared.txt", "one\ntwo\ntres\n", "b edits");
+    p
+}
+
+#[test]
+fn f6_the_forecast_reads_the_integration_tips_attributes_from_any_checkout() {
+    let p = attributes_project();
+    let from_main = section(&p.status(), "conflict forecast").join("\n");
+    let from_a = {
+        let out = p.repo.atelier_in(&p.wt("a"), &["status"]);
+        assert_eq!(code(&out), 0);
+        section(&stdout(&out), "conflict forecast").join("\n")
+    };
+    assert_eq!(from_main, from_a);
+    // main's attribute (-merge) is what the forecast uses, also from a's worktree, which has
+    // no attribute file. A pair forecast cannot see that `merge a b` would hand a's removal to
+    // b (documented).
+    assert_eq!(from_main, "a x b: shared.txt");
+    // And the working copy's attribute file does not matter either.
+    fs::write(p.main().join(".gitattributes"), "shared.txt merge=text\n").unwrap();
+    let again = section(&p.status(), "conflict forecast").join("\n");
+    assert_eq!(again, from_main);
+    git(p.main(), &["checkout", "--", ".gitattributes"]);
+}
+
+fn driver_project(marker: &Path) -> Proj {
+    let p = Proj::new();
+    git(
+        p.main(),
+        &[
+            "config",
+            "merge.probe.driver",
+            &format!("sh -c 'pwd >> {}; exit 0' %O %A %B", marker.display()),
+        ],
+    );
+    commit(
+        p.main(),
+        ".gitattributes",
+        "shared.txt merge=probe\n",
+        "attributes",
+    );
+    commit(p.main(), "shared.txt", "one\ntwo\nthree\n", "shared");
+    let a = p.start("a", None);
+    commit(&a, "shared.txt", "ONE\ntwo\nthree\n", "a edits");
+    let b = p.start("b", None);
+    commit(&b, "shared.txt", "uno\ntwo\nthree\n", "b edits");
+    p
+}
+
+#[test]
+fn f7_a_pair_the_gate_would_refuse_for_a_merge_driver_is_reported_and_no_driver_runs() {
+    let marker_dir = tempfile::tempdir().unwrap();
+    let marker = marker_dir.path().join("ran");
+    let p = driver_project(&marker);
+    let text = p.status();
+    let forecast = section(&text, "conflict forecast");
+    assert_eq!(
+        forecast,
+        ["a x b: would be refused: shared.txt uses merge driver probe"],
+        "{forecast:?}"
+    );
+    assert!(!marker.exists(), "status ran the custom merge driver");
+    // merge warns the same way, and still runs the driver for nothing either.
+    let ca = git(&p.wt("a"), &["rev-parse", "HEAD"]);
+    let out = p.run(&["approve", "a", &ca]);
+    assert_eq!(code(&out), 0, "{}", stderr(&out));
+    let out = p.run(&["merge", "a"]);
+    assert!(
+        stdout(&out).contains(
+            "warning: forecast: a x b: would be refused: shared.txt uses merge driver probe"
+        ),
+        "{}{}",
+        stdout(&out),
+        stderr(&out)
+    );
+    assert!(
+        !marker.exists(),
+        "merge's forecast ran the custom merge driver"
+    );
+}
+
+#[test]
+fn f7_a_pair_merged_by_union_is_reported_as_refused_as_the_gate_does() {
+    let p = Proj::new();
+    commit(
+        p.main(),
+        ".gitattributes",
+        "shared.txt merge=union\n",
+        "attributes",
+    );
+    commit(p.main(), "shared.txt", "one\ntwo\nthree\n", "shared");
+    let a = p.start("a", None);
+    commit(&a, "shared.txt", "ONE\ntwo\nthree\n", "a edits");
+    let b = p.start("b", None);
+    commit(&b, "shared.txt", "uno\ntwo\nthree\n", "b edits");
+    let text = p.status();
+    let forecast = section(&text, "conflict forecast");
+    assert_eq!(
+        forecast,
+        ["a x b: would be refused: shared.txt uses merge driver union"],
+        "{forecast:?}"
+    );
+}
+
+#[test]
+fn f8_a_run_record_with_a_tree_that_is_not_an_object_id_is_unreadable_not_a_panic() {
+    let p = Proj::new();
+    p.fabricate_run(
+        &run_id(1, 1),
+        RunKind::Check,
+        Outcome::Passed,
+        "aaaaaaaaaaaébbb",
+        "ws\tt\tpass\n",
+    );
+    p.fabricate_run(
+        &run_id(2, 2),
+        RunKind::Check,
+        Outcome::Passed,
+        &"a".repeat(40),
+        "ws\tt\tfail\n",
+    );
+    // A result that is not even TOML.
+    let dir = p.main().join(".git/atelier/runs").join(run_id(3, 3));
+    fs::create_dir_all(&dir).unwrap();
+    fs::write(dir.join("result"), "not = [valid\n").unwrap();
+    let out = p.run(&["status"]);
+    assert_eq!(code(&out), 0, "{}{}", stdout(&out), stderr(&out));
+    let runs = section(&stdout(&out), "last runs").join("\n");
+    assert!(
+        runs.contains(&format!("{} unreadable:", run_id(1, 1))),
+        "{runs}"
+    );
+    assert!(
+        runs.contains(&format!("{} unreadable:", run_id(3, 3))),
+        "{runs}"
+    );
+    assert!(
+        runs.contains(&format!("{} check PASS", run_id(2, 2))),
+        "{runs}"
+    );
+}
+
+#[test]
+fn f9_merge_checks_machines_before_it_forecasts() {
+    let other = if this_platform() == "linux-x86_64" {
+        "macos-aarch64"
+    } else {
+        "linux-x86_64"
+    };
+    let p = Proj::with_settings(&format!(
+        "\n[platforms.{other}]\nrun = [\"sh\", \"-c\", \"true\"]\n"
+    ));
+    commit(p.main(), "shared.txt", "one\ntwo\nthree\n", "shared");
+    let a = p.start("a", None);
+    let ca = commit(&a, "shared.txt", "ONE\ntwo\nthree\n", "a edits");
+    let b = p.start("b", None);
+    commit(&b, "shared.txt", "uno\ntwo\nthree\n", "b edits");
+    let out = p.run(&["approve", "a", &ca]);
+    assert_eq!(code(&out), 0, "{}", stderr(&out));
+    let out = p.run(&["merge", "a"]);
+    assert_eq!(code(&out), 3, "{}{}", stdout(&out), stderr(&out));
+    assert!(
+        !stdout(&out).contains("forecast"),
+        "no forecast before the machine check passes: {}",
+        stdout(&out)
+    );
+}
+
+#[test]
+fn f10_lines_that_must_not_be_missed_are_never_cut_by_the_cap() {
+    let many: Vec<String> = (0..12).map(|i| format!("line {i}")).collect();
+    let s = atelier::status::Section::pinned("x", vec!["3 pairs not forecast".to_owned()], many);
+    assert_eq!(s.lines.len(), 11);
+    assert_eq!(s.lines[0], "3 pairs not forecast");
+    assert_eq!(s.omitted, 2);
+}
+
+#[test]
+fn f10_a_dead_process_forecast_folder_is_removed_by_the_next_forecast() {
+    let p = Proj::new();
+    let tmp = tempfile::tempdir().unwrap();
+    let dead = {
+        let mut c = Command::new("true").spawn().unwrap();
+        let pid = c.id();
+        c.wait().unwrap();
+        pid
+    };
+    let gone = tmp.path().join(format!("atelier-forecast-{dead}-0f0f0f0f"));
+    let live = tmp
+        .path()
+        .join(format!("atelier-forecast-{}-0e0e0e0e", std::process::id()));
+    for d in [&gone, &live] {
+        fs::create_dir_all(d.join("objects")).unwrap();
+        fs::write(d.join("objects/x"), "x").unwrap();
+    }
+    let t = tmp.path().to_str().unwrap();
+    let out = p.repo.atelier_env(p.main(), &["status"], &[("TMPDIR", t)]);
+    assert_eq!(code(&out), 0, "{}", stderr(&out));
+    assert!(!gone.exists(), "left by a dead process");
+    assert!(live.exists(), "a live process's folder stays");
+    let left: Vec<_> = fs::read_dir(tmp.path()).unwrap().flatten().collect();
+    assert_eq!(left.len(), 1, "{left:?}");
+}
+
+#[test]
+fn f10_a_broken_promotion_record_does_not_take_the_rest_of_main_with_it() {
+    let p = Proj::new();
+    pending(&p);
+    let state = p.state();
+    let v = state.versioned(CURRENT_FORMAT, &[]).unwrap();
+    fs::write(v.dir().join("promotion.toml"), "this is = [not toml\n").unwrap();
+    let text = p.status();
+    let main = section(&text, "main");
+    assert!(main[0].starts_with("main at "), "{main:?}");
+    assert!(
+        main.iter().any(|l| l.starts_with("main checkout:")),
+        "{main:?}"
+    );
+    assert!(
+        main.iter().any(|l| l.starts_with("promotion: unreadable:")),
+        "{main:?}"
+    );
 }

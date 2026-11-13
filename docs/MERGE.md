@@ -69,10 +69,11 @@ Under the gate lock, in this order:
    repeats, each `--waive` with its own `--reason` in the same order; a waiver names a platform
    of OLD's settings or of the merged ones, so a rules item that drops a platform whose machine
    is gone merges with or without a waiver for it.
-   Before the machines are checked, `merge` prints a warning line,
-   `warning: forecast: <branch> x <branch>: <files>`, for each open branch (or `main`) whose merge
-   with a branch of the batch conflicts (`src/forecast.rs`, [STATUS.md](STATUS.md)). It refuses
-   nothing.
+   After the machines are checked, `merge` forecasts each branch of the batch against `main`
+   and every other open branch and prints a warning line,
+   `warning: forecast: <branch> x <branch>: <files>` (or `would be refused: ...`), for each
+   that conflicts, and the number of pairs not forecast (`src/forecast.rs`,
+   [STATUS.md](STATUS.md)). It refuses nothing.
 2. The gate `<main checkout>.gate` (`gate::gate_worktree`, the one function `approve`, `tmp` and
    `clean` use): created detached at OLD on first use; otherwise it must be registered at that
    exact path, detached, with no git operation in progress and no tracked change or untracked
