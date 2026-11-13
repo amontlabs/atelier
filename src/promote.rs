@@ -4,7 +4,8 @@
 //! into it, with `receive.denyCurrentBranch=updateInstead`, a lease on `OLD` and
 //! `denyNonFastForwards`, so git itself updates the files and refuses an unclean checkout.
 //! Immediately before each push atelier makes the five checks git does not make (a–e). A failed
-//! check or a refusal by git changes nothing, so only the promotion is repeated, for
+//! check changes nothing, and neither does a refusal by git that left the main checkout exactly
+//! as it was (judged by content, not by git's words), so only the promotion is repeated, for
 //! `promotion_wait_seconds`, then exit 7 with the record kept.
 //!
 //! The push runs as its own process group, recorded under the gate lock, and is never signalled
@@ -545,14 +546,21 @@ fn push(
     })
 }
 
-/// True when git refused the ref for a reason it reports (`--porcelain`: a `!` line for the
-/// ref, then `Done`): git ran to its end and wrote nothing.
-fn clean_refusal(output: &str) -> bool {
-    let lines: Vec<&str> = output.lines().map(str::trim_end).collect();
-    lines
+/// True when the main checkout shows that a push that left the ref at `OLD` wrote nothing, by
+/// content, whatever git said: every path that differs between `OLD` and `M`, and every other
+/// tracked path `git status` reports, holds `OLD`'s content ([`classify`]; so none of `M`'s
+/// added paths is there), and the index is `OLD`'s tree. git can refuse the ref after it wrote
+/// files (`updateInstead` runs `read-tree -u -m` before it moves the ref, and reports a
+/// failure there as a refusal), so its words cannot tell.
+fn wrote_nothing(root: &Path, rec: &Promotion) -> Result<bool> {
+    if classify(root, &rec.old, &rec.m)?
         .iter()
-        .any(|l| l.starts_with("!\t") || l.starts_with("! "))
-        && lines.contains(&"Done")
+        .any(|c| c.held != Held::Old)
+    {
+        return Ok(false);
+    }
+    let index = git::output(root, ["diff-index", "--cached", "--quiet", &rec.old, "--"])?;
+    Ok(index.status.success())
 }
 
 /// git's reason for refusing a push, from its output: the lines that say why.
@@ -638,12 +646,11 @@ pub fn promote(
                 }
                 Facts::Pending => {}
             }
-            // Checks d and e passed just before the push. A refusal git reports for the ref
-            // changed nothing (git writes the files only for a ref it accepts), whatever the
-            // checkout holds now. A push killed, or one that ended otherwise while the checkout
-            // changed, did not end cleanly: the record keeps `push_started` without
-            // `push_ended`, and the report below applies.
-            let refused = !pushed.signalled && clean_refusal(&pushed.output);
+            // Checks d and e passed just before the push. A push that ended with the checkout
+            // exactly as before (by content: `wrote_nothing`) is a clean refusal. Anything
+            // else, a push killed or one that changed the checkout, did not end cleanly: the
+            // record keeps `push_started` without `push_ended`, and the report below applies.
+            let refused = !pushed.signalled && wrote_nothing(&root, &rec)?;
             if !refused && (pushed.signalled || disturbed(&root, &rec)?) {
                 return Err(interrupted_report(&root, &rec, caller)?);
             }

@@ -280,10 +280,17 @@ impl Search<'_> {
                 );
                 (*v, failed.clone())
             } else {
-                let names_needed: Vec<String> =
-                    self.failures.iter().map(|f| f.platform.clone()).collect();
-                if let Err(e) = gate::pinned_installed(&settings, &names_needed, &m, root) {
-                    stopped = Some(format!("prefix {label}: {}", e.message));
+                // A failure re-runs on this computer when it failed here: the check there
+                // runs through the prefix's pinned atelier. Another machine is asked at its
+                // probe.
+                let home = gate::home()?;
+                if let Some(why) = self
+                    .failures
+                    .iter()
+                    .filter(|f| f.machine.is_none())
+                    .find_map(|f| gate::pin_missing_here(&settings, &f.platform, &home))
+                {
+                    stopped = Some(format!("prefix {label}: {why}"));
                     break;
                 }
                 let mut all = true;
@@ -309,7 +316,7 @@ impl Search<'_> {
                                 format!("{} ({what})", failures.describe())
                             });
                         }
-                        PlatformOutcome::NoMachine(why) => {
+                        PlatformOutcome::NoMachine(why) | PlatformOutcome::Cancelled(why) => {
                             stopped = Some(format!("prefix {label}: {why}"));
                             break 'prefixes;
                         }

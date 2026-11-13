@@ -203,6 +203,16 @@ The source hash makes a development build at the same version count as different
 with other source is `not ready` until `machines init` replaces it. The machine still needs Rust
 (the version in `rust-toolchain.toml`) and access to crates.io or a mirror.
 
+**A pin change.** `init` installs the version of the atelier that runs it. A machine keeps
+every version installed side by side, and `merge` runs each platform there through the merged
+commit's own pinned atelier (docs/MERGE.md, "Platforms on machines"): its probe asks whether
+that version is installed, and a machine without it is `not ready: atelier <pin> is not
+installed there: run atelier machines init <name> with atelier <pin>`. So before merging a
+commit that changes the pin, run `atelier machines init <name>` with the new version (the one
+the commit pins, installed here first) for each machine that is to run its platforms. For
+another version than its own, the probe can check only the version the installed program
+reports, not its source.
+
 **What the identity proves.** The identity is what the installed program prints about itself.
 It catches a stale or different build, not a tampered one: a run executes the worker's commit
 as the account that owns the install, and that code could replace the binary with one that

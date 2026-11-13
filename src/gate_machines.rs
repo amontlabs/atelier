@@ -4,25 +4,28 @@
 //! Without a machines file, the platform this computer runs runs here and every other platform
 //! has no machine. With one, each platform's machine is chosen as `atelier test` chooses it
 //! ([`machines::candidates`], [`machines::select`]): this computer runs its platform in the gate
-//! worktree under the machine lock, through `M`'s pinned atelier; another machine gets `M`
-//! pushed and runs the platform's whole `run` there (`remote-run`), and its results must record
-//! `M` and `M`'s tree. Every platform runs at the same time: one thread per platform chooses
-//! its machine and follows a remote session; the run on this computer happens on the caller's
-//! thread, as a step of the gate's run.
+//! worktree, through `M`'s pinned atelier; another machine gets `M` pushed and runs the
+//! platform's whole `run` there (`remote-run`) with `M`'s pinned atelier, and its results must
+//! record `M` and `M`'s tree. Every platform runs at the same time: one thread per platform
+//! chooses its machine and follows a remote session; the run on this computer happens on the
+//! caller's thread, as a step of the gate's run. When it fails, the gate is RED whatever the
+//! other machines say: their sessions are stopped and their platforms reported as cancelled.
 //!
-//! Step 1's check is lighter than a run: this computer is available for its platform; another
-//! machine is when its probe answers ready or busy (a busy one is waited for).
+//! Every run on this computer (the gate's, bisection's re-runs, with or without a machines
+//! file) holds this computer's machine lock, waiting while another atelier holds it.
 //!
-//! A remote machine runs the atelier of the version that starts it (the probe checks it is
-//! built from this source), so a merged commit that pins another version cannot run there: the
-//! machine is not ready for it.
+//! Step 1's check is lighter than a run: this computer is available for its platform when it
+//! can run `M`'s pin; another machine is when its probe answers ready or busy (a busy one is
+//! waited for), and its probe says whether `M`'s pinned atelier is installed there. A pin
+//! change therefore needs `atelier machines init <name>`, with the new version, on each machine
+//! first.
 
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
 use crate::bisect::Failures;
-use crate::dispatch::VERSION;
 use crate::exit::{Failure, Result};
 use crate::gate::{self, Availability, GateRun, PlatformOutcome, Platforms};
 use crate::git::{self, Checkout};
@@ -57,6 +60,33 @@ impl Machines {
         })
     }
 
+    /// Takes this computer's machine lock for a run of the gate here, waiting while another
+    /// atelier holds it, as a busy machine is waited for. `None` when a stop signal ended the
+    /// wait.
+    fn lock_here(&self, gate: &Checkout, platform: &str) -> Result<Option<MachineLock>> {
+        let holder = format!("{} (merge gate)", gate.root.display());
+        let mut told = false;
+        loop {
+            if let Some(l) = MachineLock::try_take(&self.home, &holder)? {
+                return Ok(Some(l));
+            }
+            if !told {
+                println!(
+                    "  {platform}: waiting for this computer's machine lock: {}",
+                    MachineLock::holder(&self.home)
+                );
+                told = true;
+            }
+            let until = Instant::now() + LOCK_POLL;
+            while Instant::now() < until {
+                if signals::received().is_some() {
+                    return Ok(None);
+                }
+                std::thread::sleep(Duration::from_millis(50));
+            }
+        }
+    }
+
     fn no_file(&self, platform: &str) -> String {
         format!(
             "{platform}: no machine: {} does not exist (it names the machines that run each platform)",
@@ -64,6 +94,9 @@ impl Machines {
         )
     }
 }
+
+/// How often this computer's machine lock is tried again while another atelier holds it.
+const LOCK_POLL: Duration = Duration::from_millis(500);
 
 /// What a machine that took a platform hands over.
 enum Taken {
@@ -80,6 +113,8 @@ struct GateProber<'a> {
     job: &'a Job,
     run_dir: &'a Path,
     told: bool,
+    /// Set when the run on this computer failed: nothing more is started or waited for.
+    cancel: &'a AtomicBool,
 }
 
 impl Prober for GateProber<'_> {
@@ -102,6 +137,9 @@ impl Prober for GateProber<'_> {
             {
                 return Attempt::NotReady(first);
             }
+            if let Some(why) = gate::pin_missing_here(self.settings, &platform, self.home) {
+                return Attempt::NotReady(why);
+            }
             let holder = format!("{} (merge gate)", self.gate.root.display());
             return match MachineLock::try_take(self.home, &holder) {
                 Ok(Some(l)) => Attempt::Taken(Taken::Local(l)),
@@ -109,13 +147,7 @@ impl Prober for GateProber<'_> {
                 Err(f) => Attempt::NotReady(f.message),
             };
         }
-        if self.settings.atelier != VERSION {
-            return Attempt::NotReady(format!(
-                "the merged commit pins atelier {}, and this gate runs {VERSION}: another machine runs the atelier of the version that starts it",
-                self.settings.atelier
-            ));
-        }
-        let r = Remote::new(&c.name, &c.machine, self.gate);
+        let r = Remote::new(&c.name, &c.machine, self.gate).pinned(&self.settings.atelier);
         match remote::attempt(
             &r,
             self.gate,
@@ -131,7 +163,7 @@ impl Prober for GateProber<'_> {
     }
 
     fn stopped(&self) -> bool {
-        signals::received().is_some()
+        signals::received().is_some() || self.cancel.load(Ordering::SeqCst)
     }
 
     fn pause(&mut self, busy: &[&str]) -> bool {
@@ -145,12 +177,12 @@ impl Prober for GateProber<'_> {
         }
         let until = Instant::now() + BUSY_POLL;
         while Instant::now() < until {
-            if signals::received().is_some() {
+            if self.stopped() {
                 return false;
             }
             std::thread::sleep(Duration::from_millis(100));
         }
-        signals::received().is_none()
+        !self.stopped()
     }
 }
 
@@ -183,6 +215,7 @@ fn choose(
     run_dir: &Path,
     platform: &str,
     cands: &[std::result::Result<Candidate, (String, Skip)>],
+    cancel: &AtomicBool,
 ) -> Chosen {
     let Some(p) = Platform::parse(platform) else {
         return Chosen::Done(
@@ -203,10 +236,22 @@ fn choose(
         job: &job,
         run_dir,
         told: false,
+        cancel,
     };
     let sel = machines::select(cands, &mut prober);
     let skips = skipped_text(&sel.skipped);
     match sel.taken {
+        None if cancel.load(Ordering::SeqCst) => {
+            println!(
+                "  {platform}: cancelled, no machine started: the run on this computer failed"
+            );
+            Chosen::Done(
+                platform.to_owned(),
+                PlatformOutcome::Cancelled(format!(
+                    "{platform}: cancelled before a machine took it"
+                )),
+            )
+        }
         None => {
             let details = if sel.skipped.is_empty() {
                 format!("no machine of {platform} in machines.toml")
@@ -231,7 +276,24 @@ fn choose(
         }
         Some((c, Taken::Remote(session))) => {
             println!("  {platform}: running on {}{skips}", c.name);
-            let end = session.finish(m, tree);
+            let end = session.finish_unless(m, tree, &|| cancel.load(Ordering::SeqCst));
+            if cancel.load(Ordering::SeqCst) && end.verdict == Verdict::Interrupted {
+                let runs: Vec<&str> = end.runs.iter().map(|(id, _)| id.as_str()).collect();
+                let what = format!(
+                    "cancelled on {}{}: the run on this computer failed",
+                    c.name,
+                    if runs.is_empty() {
+                        String::new()
+                    } else {
+                        format!(", run {}", runs.join(", "))
+                    }
+                );
+                println!("  {platform}: {what}");
+                return Chosen::Done(
+                    platform.to_owned(),
+                    PlatformOutcome::Cancelled(format!("{platform}: {what}")),
+                );
+            }
             Chosen::Done(platform.to_owned(), remote_outcome(platform, &c.name, end))
         }
     }
@@ -302,12 +364,18 @@ impl Platforms for Machines {
             match c {
                 Err((name, skip)) => why.push(format!("{name} {}", skip.detail())),
                 Ok(c) if c.machine.local => {
-                    if gate::is_local(platform) {
+                    if !gate::is_local(platform) {
+                        why.push(format!("{} is this computer, not {platform}", c.name));
+                    } else if let Some(w) = gate::pin_missing_here(settings, platform, &self.home) {
+                        why.push(format!("{} not ready: {w}", c.name));
+                    } else {
                         return Availability::Local;
                     }
-                    why.push(format!("{} is this computer, not {platform}", c.name));
                 }
-                Ok(c) => match Remote::new(&c.name, &c.machine, checkout).probe(platform) {
+                Ok(c) => match Remote::new(&c.name, &c.machine, checkout)
+                    .pinned(&settings.atelier)
+                    .probe(platform)
+                {
                     Probe::Ready | Probe::Busy(_) => return Availability::Machine(c.name),
                     Probe::Offline(d) => why.push(format!("{} offline ({d})", c.name)),
                     Probe::NotReady(l) => why.push(format!("{} not ready: {l}", c.name)),
@@ -329,7 +397,16 @@ impl Platforms for Machines {
             let mut out = Vec::new();
             for p in platforms {
                 let o = if gate::is_local(p) {
-                    gate::run_local(g, &self.home, p)?
+                    match self.lock_here(g.gate, p)? {
+                        Some(lock) => {
+                            let o = gate::run_local(g, &self.home, p)?;
+                            drop(lock);
+                            o
+                        }
+                        None => PlatformOutcome::NoMachine(format!(
+                            "{p}: interrupted while waiting for this computer's machine lock"
+                        )),
+                    }
                 } else {
                     PlatformOutcome::NoMachine(self.no_file(p))
                 };
@@ -355,12 +432,15 @@ impl Platforms for Machines {
         let (tx, rx) = mpsc::channel::<Chosen>();
         let mut results: Vec<(String, PlatformOutcome)> = Vec::new();
         let mut error: Option<Failure> = None;
+        let cancel = AtomicBool::new(false);
         std::thread::scope(|s| {
             for (name, cands) in &plans {
                 let tx = tx.clone();
-                let (tree, run_dir) = (tree.as_str(), run_dir.as_path());
+                let (tree, run_dir, cancel) = (tree.as_str(), run_dir.as_path(), &cancel);
                 s.spawn(move || {
-                    let chosen = choose(home, gate_co, settings, m, tree, run_dir, name, cands);
+                    let chosen = choose(
+                        home, gate_co, settings, m, tree, run_dir, name, cands, cancel,
+                    );
                     let _ = tx.send(chosen);
                 });
             }
@@ -369,12 +449,13 @@ impl Platforms for Machines {
                 match chosen {
                     Chosen::Done(p, o) => results.push((p, o)),
                     Chosen::Local(p, lock) => {
-                        let o = if error.is_none() {
-                            gate::run_local(g, home, &p)
-                        } else {
-                            Ok(PlatformOutcome::NoMachine(format!("{p}: not run")))
-                        };
+                        let o = gate::run_local(g, home, &p);
                         drop(lock);
+                        // A failure here makes the gate RED whatever the other machines say:
+                        // their sessions are stopped rather than waited for.
+                        if !matches!(o, Ok(PlatformOutcome::Passed { .. })) {
+                            cancel.store(true, Ordering::SeqCst);
+                        }
                         match o {
                             Ok(o) => results.push((p, o)),
                             Err(e) => error = Some(e),
@@ -393,8 +474,14 @@ impl Platforms for Machines {
     fn rerun(&mut self, g: &mut GateRun<'_>, f: &Failures) -> Result<PlatformOutcome> {
         let only = (!f.whole).then_some(&f.only);
         let Some(machine) = &f.machine else {
+            let Some(lock) = self.lock_here(g.gate, &f.platform)? else {
+                return Ok(PlatformOutcome::NoMachine(format!(
+                    "{}: interrupted while waiting for this computer's machine lock",
+                    f.platform
+                )));
+            };
             let runs_dir = g.ctx.state.runs_dir();
-            return gate::run_local_in(
+            let o = gate::run_local_in(
                 g.run,
                 &runs_dir,
                 &g.gate.root,
@@ -403,6 +490,8 @@ impl Platforms for Machines {
                 &f.platform,
                 only,
             );
+            drop(lock);
+            return o;
         };
         let Some(file) = &self.file else {
             return Ok(PlatformOutcome::NoMachine(self.no_file(&f.platform)));
@@ -430,6 +519,7 @@ impl Platforms for Machines {
             &run_dir,
             &f.platform,
             &cands,
+            &AtomicBool::new(false),
         ) {
             Chosen::Done(_, o) => Ok(o),
             Chosen::Local(p, lock) => {

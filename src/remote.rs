@@ -152,6 +152,9 @@ pub struct Remote {
     pub machine: Machine,
     /// The project's checkout there, `~/…` or absolute.
     pub checkout: String,
+    /// The atelier version that runs there: this program's, or the one a merged commit pins
+    /// ([`Remote::pinned`]).
+    version: String,
 }
 
 /// What the probe found.
@@ -202,7 +205,18 @@ impl Remote {
                 machine.checkouts().trim_end_matches('/'),
                 project_id(checkout)
             ),
+            version: VERSION.to_owned(),
         }
+    }
+
+    /// The same machine running atelier `version` (DESIGN §3 `merge` step 5: every platform runs
+    /// through the merged commit's own pinned atelier). The probe asks the machine whether that
+    /// version is installed: the version itself, and, for this program's version, this
+    /// program's own source ([`crate::source::identity`]). Another version's source cannot be
+    /// checked from here.
+    pub fn pinned(mut self, version: &str) -> Remote {
+        self.version = version.to_owned();
+        self
     }
 
     fn dest(&self) -> &str {
@@ -240,7 +254,10 @@ impl Remote {
     }
 
     fn bin(&self) -> String {
-        shell_path(&format!("~/.local/share/atelier/{VERSION}/bin/atelier"))
+        shell_path(&format!(
+            "~/.local/share/atelier/{}/bin/atelier",
+            self.version
+        ))
     }
 
     /// `PATH=… ` as the machine's `path` says, or nothing to keep the machine's own.
@@ -268,9 +285,15 @@ impl Remote {
             path = self.path_assignment(),
             args = args.join(" "),
             msg = sq(&format!(
-                "{}not-ready atelier {VERSION} is not installed there: run atelier machines init {}",
+                "{}not-ready atelier {} is not installed there: run atelier machines init {}{}",
                 tag(nonce),
-                self.name
+                self.version,
+                self.name,
+                if self.version == VERSION {
+                    String::new()
+                } else {
+                    format!(" with atelier {}", self.version)
+                }
             )),
         )
     }
@@ -322,14 +345,30 @@ impl Remote {
             } else if let Some(h) = l.strip_prefix("busy") {
                 return Probe::Busy(h.trim().to_owned());
             } else if l == "ready" {
-                return match identity {
-                    Some(id) if id == source::identity() => Probe::Ready,
-                    other => Probe::NotReady(format!(
+                let installed = identity.as_deref().is_some_and(|id| {
+                    if self.version == VERSION {
+                        id == source::identity()
+                    } else {
+                        id.split(' ').next() == Some(self.version.as_str())
+                    }
+                });
+                return if installed {
+                    Probe::Ready
+                } else if self.version == VERSION {
+                    Probe::NotReady(format!(
                         "atelier there is {}, here {}: run atelier machines init {}",
-                        other.as_deref().unwrap_or("unknown"),
+                        identity.as_deref().unwrap_or("unknown"),
                         source::identity(),
                         self.name
-                    )),
+                    ))
+                } else {
+                    Probe::NotReady(format!(
+                        "the atelier {} installed there says it is {}: run atelier machines init {} with atelier {}",
+                        self.version,
+                        identity.as_deref().unwrap_or("unknown"),
+                        self.name,
+                        self.version
+                    ))
                 };
             }
         }
@@ -793,8 +832,21 @@ impl Session {
     /// Waits for the session to end and reads the verdict. A stop signal here closes the
     /// connection, which stops the remote run. A pass needs at least one run, each recording
     /// `commit`, its `tree` and no uncommitted change.
-    pub fn finish(mut self, commit: &str, tree: &str) -> SessionEnd {
+    pub fn finish(self, commit: &str, tree: &str) -> SessionEnd {
+        self.finish_unless(commit, tree, &|| false)
+    }
+
+    /// [`Session::finish`], also stopped when `cancel` turns true: the connection is closed,
+    /// which stops the remote run, and the session ends at once with the runs it announced and
+    /// no result read (verdict [`Verdict::Interrupted`], failure `<machine>: cancelled`).
+    pub fn finish_unless(
+        mut self,
+        commit: &str,
+        tree: &str,
+        cancel: &dyn Fn() -> bool,
+    ) -> SessionEnd {
         let mut stopped = false;
+        let mut cancelled = false;
         let ssh_status = loop {
             while let Ok(ev) = self.events.try_recv() {
                 self.handle(ev);
@@ -808,8 +860,21 @@ impl Session {
                 self.stop();
                 stopped = true;
             }
+            if !stopped && cancel() {
+                self.stop();
+                stopped = true;
+                cancelled = true;
+            }
             sleep(Duration::from_millis(50));
         };
+        if cancelled {
+            let name = &self.remote.name;
+            return SessionEnd {
+                verdict: Verdict::Interrupted,
+                runs: self.runs.iter().map(|id| (id.clone(), None)).collect(),
+                failures: vec![format!("{name}: cancelled")],
+            };
+        }
         // The stream ends with the connection; with a stand-in for ssh, when the remote ends.
         let until = Instant::now() + Duration::from_secs(15);
         while !self.eof && Instant::now() < until {

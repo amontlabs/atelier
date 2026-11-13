@@ -101,6 +101,9 @@ pub enum PlatformOutcome {
     },
     /// No machine could take it: the reasons, per machine.
     NoMachine(String),
+    /// Stopped before its verdict because another platform failed on this computer, which
+    /// already makes the gate RED: what was running, and where.
+    Cancelled(String),
 }
 
 /// Where a platform can run, as checked before anything runs.
@@ -243,32 +246,26 @@ pub fn run_with(
     })?;
     let items = preconditions(ctx, &v, &stack, branches, &old_settings)?;
 
-    // A waiver names a platform of OLD's settings, or, for an item that changes the settings,
-    // possibly one the merged settings add: that one is checked after the merge.
-    let rules_item = items.iter().any(|i| i.rules);
+    // The settings the batch produces decide the platforms and the pin from the start, so a
+    // missing machine costs seconds, not a whole run. A waiver names a platform of OLD's
+    // settings or of the merged ones.
+    let merged = batch_settings(&root, &items, &old_settings)?;
     for w in waivers {
-        if !rules_item && !old_settings.platforms.contains_key(&w.platform) {
+        if !old_settings.platforms.contains_key(&w.platform)
+            && !merged.platforms.contains_key(&w.platform)
+        {
             return Err(Failure::refused(format!(
                 "--waive {}: not a platform of this project (it has: {})",
                 w.platform,
-                platform_names(&old_settings).join(", ")
+                platform_names(&merged).join(", ")
             )));
         }
     }
-
-    // Machines first, so an unavailable platform costs seconds, not a whole run.
-    let mut missing = Vec::new();
-    for p in platform_names(&old_settings) {
-        if waived(waivers, &p).is_some() {
-            continue;
-        }
-        if let Availability::None(why) = platforms.availability(&ctx.checkout, &old_settings, &p) {
-            missing.push(why);
-        }
-    }
-    if !missing.is_empty() {
-        return Err(no_machine(&integration, &missing));
-    }
+    let names: Vec<String> = platform_names(&merged)
+        .into_iter()
+        .filter(|p| waived(waivers, p).is_none())
+        .collect();
+    require_machines(platforms, &ctx.checkout, &merged, &names, &integration)?;
 
     let end = gate(
         ctx,
@@ -376,6 +373,62 @@ fn no_machine(integration: &str, missing: &[String]) -> Failure {
             missing.join("\n  ")
         ),
     )
+}
+
+/// The settings the batch produces, read before anything merges: a rules item merges alone, so
+/// its approved commit's committed settings are the merged ones; any other batch keeps OLD's.
+pub fn batch_settings(root: &Path, items: &[Item], old_settings: &Settings) -> Result<Settings> {
+    match items.iter().find(|i| i.rules) {
+        Some(i) => Ok(settings_at(root, &i.commit)?.unwrap_or_else(|| old_settings.clone())),
+        None => Ok(old_settings.clone()),
+    }
+}
+
+/// Every one of `names` has a machine for `settings` (exit 3, listing why not), and one that
+/// this computer takes can run `settings`' pin there (refused, 4: [`pin_missing_here`]).
+fn require_machines(
+    platforms: &dyn Platforms,
+    checkout: &Checkout,
+    settings: &Settings,
+    names: &[String],
+    integration: &str,
+) -> Result<()> {
+    let mut missing = Vec::new();
+    let mut here = Vec::new();
+    for p in names {
+        match platforms.availability(checkout, settings, p) {
+            Availability::None(why) => missing.push(why),
+            Availability::Local => here.push(p.clone()),
+            Availability::Machine(_) => {}
+        }
+    }
+    if !missing.is_empty() {
+        return Err(no_machine(integration, &missing));
+    }
+    let home = home()?;
+    for p in here {
+        if let Some(why) = pin_missing_here(settings, &p, &home) {
+            return Err(Failure::refused(format!("{p}: {why}")));
+        }
+    }
+    Ok(())
+}
+
+/// Why this computer cannot run `platform` of `settings`, when it runs `atelier check` and the
+/// atelier those settings pin is not installed here: the check runs through that atelier.
+/// Another machine is asked the same at its probe ([`crate::remote::Remote::pinned`]).
+pub fn pin_missing_here(settings: &Settings, platform: &str, home: &Path) -> Option<String> {
+    let check = settings
+        .platforms
+        .get(platform)
+        .is_some_and(|ps| matches!(ps.run, PlatformRun::Named(_)));
+    let pin = &settings.atelier;
+    (check && !dispatch::binary_for(home, pin).is_file()).then(|| {
+        format!(
+            "atelier {pin}, pinned by the merged commit, is not installed on this computer, so its check cannot run here: {}",
+            dispatch::install_command(pin)
+        )
+    })
 }
 
 /// How one gate over a batch ended.
@@ -566,14 +619,18 @@ pub fn gate(
     let head = git::run(&gate.root, ["rev-parse", "HEAD^{tree}"])?;
     run.set_tree(head, Some(m.clone()), false);
 
-    // The merged settings decide the platforms and the waivers (a rules item may change them);
-    // a platform they add or change is checked for a machine before anything runs.
+    // The merged settings decide the platforms; step 1 checked the settings the batch was to
+    // produce, so a platform (or a pin) that differs from those is checked for a machine
+    // before anything runs.
+    let expected = batch_settings(&root, items, old_settings)?;
     for w in waivers {
-        if !settings.platforms.contains_key(&w.platform) {
+        if !old_settings.platforms.contains_key(&w.platform)
+            && !settings.platforms.contains_key(&w.platform)
+        {
             return refuse_in(
                 run,
                 Failure::refused(format!(
-                    "--waive {}: not a platform of the merged commit's settings (they have: {}); {integration} has not moved",
+                    "--waive {}: not a platform of {integration}'s settings or the merged commit's (they have: {}); {integration} has not moved",
                     w.platform,
                     platform_names(&settings).join(", ")
                 )),
@@ -584,21 +641,21 @@ pub fn gate(
         .into_iter()
         .filter(|p| waived(waivers, p).is_none())
         .collect();
-    let mut missing = Vec::new();
-    for p in &names {
-        if old_settings.platforms.get(p) == settings.platforms.get(p) {
-            continue;
-        }
-        if let Availability::None(why) = platforms.availability(&ctx.checkout, &settings, p) {
-            missing.push(why);
-        }
-    }
-    if !missing.is_empty() {
-        run.fail(format!("no machine: {}", missing.join("; ")));
-        let _ = run.finish(false);
-        return Err(no_machine(&integration, &missing));
-    }
-    if let Err(e) = pinned_installed(&settings, &names, &m, &root) {
+    let changed: Vec<String> = names
+        .iter()
+        .filter(|p| {
+            expected.atelier != settings.atelier
+                || expected.platforms.get(*p) != settings.platforms.get(*p)
+        })
+        .cloned()
+        .collect();
+    if let Err(e) = require_machines(
+        &*platforms,
+        &ctx.checkout,
+        &settings,
+        &changed,
+        &integration,
+    ) {
         return refuse_in(run, e);
     }
 
@@ -607,6 +664,14 @@ pub fn gate(
     for p in platform_names(&settings) {
         if let Some(w) = waived(waivers, &p) {
             println!("  {p}: WAIVED ({})", w.reason);
+        }
+    }
+    for w in waivers {
+        if !settings.platforms.contains_key(&w.platform) {
+            println!(
+                "  {}: WAIVED ({}); the merged settings no longer have it",
+                w.platform, w.reason
+            );
         }
     }
     let outcomes = {
@@ -656,7 +721,9 @@ pub fn gate(
             Some(PlatformOutcome::Failed { what, failures, .. }) => {
                 failed.push((p.clone(), what, failures))
             }
-            Some(PlatformOutcome::NoMachine(why)) => no_machines.push(why),
+            Some(PlatformOutcome::NoMachine(why) | PlatformOutcome::Cancelled(why)) => {
+                no_machines.push(why)
+            }
             None => no_machines.push(format!("{p}: not run")),
         }
     }
@@ -757,30 +824,6 @@ pub fn gate(
         lock,
         run_dir,
     })
-}
-
-/// Refuses (4) when a platform this computer runs with `run = "check"` needs the atelier `M`
-/// pins and it is not installed: the check runs through `M`'s own pinned atelier.
-pub fn pinned_installed(settings: &Settings, names: &[String], m: &str, root: &Path) -> Result<()> {
-    let needs = names.iter().any(|p| {
-        is_local(p)
-            && settings
-                .platforms
-                .get(p)
-                .is_some_and(|ps| matches!(ps.run, PlatformRun::Named(_)))
-    });
-    if !needs {
-        return Ok(());
-    }
-    let pin = &settings.atelier;
-    if dispatch::binary_for(&home()?, pin).is_file() {
-        return Ok(());
-    }
-    Err(Failure::refused(format!(
-        "atelier {pin}, pinned by the merged commit {}, is not installed, so its check cannot run: {}",
-        short(root, m),
-        dispatch::install_command(pin)
-    )))
 }
 
 /// Step 1's per-branch preconditions, in batch order. Refuses (4), changing nothing.
@@ -1141,8 +1184,11 @@ fn merge_args<'a>(commit: &'a str, message: &'a str) -> Vec<&'a str> {
     ]
 }
 
-/// git's own merge drivers; any other runs a command from the git configuration.
-const BUILT_IN_DRIVERS: &[&str] = &["text", "binary", "union"];
+/// The merge drivers the gate lets merge a path both sides changed: git's own text and binary
+/// merges, which conflict where both sides changed the same lines. `union` is git's own too,
+/// but it never conflicts: it keeps both sides' lines, settling every overlap without a word.
+/// Any other driver runs a command from the git configuration.
+const BUILT_IN_DRIVERS: &[&str] = &["text", "binary"];
 
 /// A value of the effective git configuration in `dir`, if set.
 fn config_value(dir: &Path, key: &str) -> Result<Option<String>> {
@@ -1219,10 +1265,10 @@ fn merge_attributes(
 }
 
 /// Refuses (4) a merge in which a path changed on both sides would be merged by a merge
-/// driver that is not git's own (`text`, `binary`, `union`): one that `.gitattributes` (either
-/// side's) or `info/attributes` assigns, that `merge.default` names, or a built-in name the git
-/// configuration redefines. Such a driver could settle a conflict without a word (DESIGN §8.2:
-/// the gate never resolves anything).
+/// driver other than git's text and binary merges ([`BUILT_IN_DRIVERS`]): `union` or a
+/// configured driver, which `.gitattributes` (either side's) or `info/attributes` assigns or
+/// `merge.default` names, or a built-in name the git configuration redefines. Such a driver
+/// could settle a conflict without a word (DESIGN §8.2: the gate never resolves anything).
 pub fn refuse_merge_drivers(dir: &Path, head: &str, commit: &str, name: &str) -> Result<()> {
     let both = changed_on_both_sides(dir, head, commit)?;
     if both.is_empty() {
@@ -1241,7 +1287,9 @@ pub fn refuse_merge_drivers(dir: &Path, head: &str, commit: &str, name: &str) ->
                 },
                 other => other.to_owned(),
             };
-            let line = if !BUILT_IN_DRIVERS.contains(&driver.as_str()) {
+            let line = if driver == "union" {
+                format!("{path}: merge=union, which keeps both sides' lines and never conflicts")
+            } else if !BUILT_IN_DRIVERS.contains(&driver.as_str()) {
                 format!("{path}: merge driver {driver:?}")
             } else if config_value(dir, &format!("merge.{driver}.driver"))?.is_some() {
                 format!(
@@ -1259,7 +1307,7 @@ pub fn refuse_merge_drivers(dir: &Path, head: &str, commit: &str, name: &str) ->
         return Ok(());
     }
     Err(Failure::refused(format!(
-        "merging {name}: paths changed on both sides would be merged by a merge driver other than git's own (text, binary, union); the gate never lets anything resolve a conflict:\n  {}\nremove that merge attribute (.gitattributes, .git/info/attributes) or merge.default, or the driver from the git configuration; nothing was merged",
+        "merging {name}: paths changed on both sides would be merged by a merge driver other than git's text and binary merges; the gate never lets anything resolve a conflict:\n  {}\nremove that merge attribute (.gitattributes, .git/info/attributes) or merge.default, or the driver from the git configuration; nothing was merged",
         problems.join("\n  ")
     )))
 }

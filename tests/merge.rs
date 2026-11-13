@@ -1529,7 +1529,7 @@ fn r1_a_merge_driver_other_than_gits_own_for_a_path_both_sides_changed_is_refuse
     assert_eq!(code(&out), 4, "{}", both(&out));
     let e = stderr(&out);
     assert!(
-        e.contains("merging b: paths changed on both sides would be merged by a merge driver other than git's own"),
+        e.contains("merging b: paths changed on both sides would be merged by a merge driver other than git's text and binary merges"),
         "{e}"
     );
     assert!(e.contains("x.txt: merge driver \"keepmine\""), "{e}");
@@ -1548,16 +1548,16 @@ fn r1_a_merge_driver_other_than_gits_own_for_a_path_both_sides_changed_is_refuse
     git(p.main(), &["config", "--unset", "merge.default"]);
 
     // A built-in name the configuration redefines.
-    fs::write(&attributes, "x.txt merge=union\n").unwrap();
-    git(p.main(), &["config", "merge.union.driver", "true"]);
+    fs::write(&attributes, "x.txt merge=text\n").unwrap();
+    git(p.main(), &["config", "merge.text.driver", "true"]);
     let out = p.merge(&["a", "b"]);
     assert_eq!(code(&out), 4, "{}", both(&out));
     assert!(
-        stderr(&out).contains("which the git configuration redefines (merge.union.driver)"),
+        stderr(&out).contains("which the git configuration redefines (merge.text.driver)"),
         "{}",
         both(&out)
     );
-    git(p.main(), &["config", "--unset", "merge.union.driver"]);
+    git(p.main(), &["config", "--unset", "merge.text.driver"]);
 
     // A global attributes file is not read by the gate: git's own merge conflicts.
     fs::write(&attributes, "").unwrap();
@@ -1576,12 +1576,59 @@ fn r1_a_merge_driver_other_than_gits_own_for_a_path_both_sides_changed_is_refuse
     );
     assert_eq!(p.main_tip(), old);
 
-    // git's own union merge is allowed.
+    // git's own union merge is refused too: it never conflicts.
+    git(p.main(), &["config", "--unset", "core.attributesFile"]);
     fs::write(&attributes, "x.txt merge=union\n").unwrap();
     let out = p.merge(&["a", "b"]);
-    assert_eq!(code(&out), 0, "{}", both(&out));
-    let x = fs::read_to_string(p.main().join("x.txt")).unwrap();
-    assert!(x.contains("from a") && x.contains("from b"), "{x}");
+    assert_eq!(code(&out), 4, "{}", both(&out));
+    assert!(
+        stderr(&out)
+            .contains("x.txt: merge=union, which keeps both sides' lines and never conflicts"),
+        "{}",
+        both(&out)
+    );
+    assert_eq!(p.main_tip(), old);
+}
+
+#[test]
+fn r34b_union_is_refused_from_merge_default_and_committed_attributes() {
+    // The probe: merge.default=union settled a and b's change of one line by keeping both.
+    let p = Proj::with_files(&[("x.txt", "base\n")], "");
+    git(p.main(), &["config", "merge.default", "union"]);
+    p.ready("a", "x.txt", "from a\n");
+    p.ready("b", "x.txt", "from b\n");
+    let old = p.main_tip();
+    let out = p.merge(&["a", "b"]);
+    assert_eq!(code(&out), 4, "{}", both(&out));
+    let e = stderr(&out);
+    assert!(e.contains("merging b: paths changed on both sides"), "{e}");
+    assert!(
+        e.contains("x.txt: merge=union, which keeps both sides' lines and never conflicts"),
+        "{e}"
+    );
+    assert_eq!(p.main_tip(), old);
+    assert_eq!(
+        fs::read_to_string(p.main().join("x.txt")).unwrap(),
+        "base\n"
+    );
+
+    // From a committed .gitattributes as well.
+    let q = Proj::with_files(
+        &[
+            ("x.txt", "base\n"),
+            (".gitattributes", "x.txt merge=union\n"),
+        ],
+        "",
+    );
+    q.ready("a", "x.txt", "from a\n");
+    q.ready("b", "x.txt", "from b\n");
+    let out = q.merge(&["a", "b"]);
+    assert_eq!(code(&out), 4, "{}", both(&out));
+    assert!(
+        stderr(&out).contains("x.txt: merge=union"),
+        "{}",
+        both(&out)
+    );
 }
 
 #[test]
@@ -1886,9 +1933,9 @@ fn r7_no_recorded_push_group_means_git_never_ran() {
 }
 
 #[test]
-fn r7_a_clean_refusal_by_git_ends_the_push_even_when_the_checkout_changed() {
+fn r7_a_refusal_by_git_after_the_checkout_changed_is_an_interrupted_promotion() {
     let p = Proj::new();
-    let (c, _) = pending(&p);
+    let (c, rec) = pending(&p);
     // A `git` whose first `read-tree` (the push writing the files) edits a tracked file and
     // fails: git refuses the ref, and the checkout changed meanwhile.
     let real = git(p.main(), &["--exec-path"]);
@@ -1909,16 +1956,69 @@ fn r7_a_clean_refusal_by_git_ends_the_push_even_when_the_checkout_changed() {
         &["promote"],
         &[("GIT_EXEC_PATH", shim.to_str().unwrap())],
     );
-    assert_eq!(code(&out), 7, "{}", both(&out));
+    // git's words say refused; the checkout says something was written: interrupted.
+    assert_eq!(code(&out), 4, "{}", both(&out));
     assert!(mark.exists(), "git refused once");
-    assert!(
-        !stderr(&out).contains("interrupted"),
-        "a refusal is not an interruption: {}",
-        both(&out)
-    );
+    let e = stderr(&out);
+    assert!(e.contains("a promotion was interrupted"), "{e}");
+    assert!(e.contains("  README ("), "README holds something else: {e}");
     let r = p.promotion().unwrap();
-    assert!(r.push_ended.is_some(), "the push ended: {r:?}");
+    assert!(
+        r.push_ended.is_none(),
+        "the push did not end cleanly: {r:?}"
+    );
+    assert_eq!(p.main_tip(), rec.old);
+    assert_eq!(
+        fs::read_to_string(p.main().join("README")).unwrap(),
+        "owner\n",
+        "nothing reset"
+    );
     git(p.main(), &["checkout", "--", "README"]);
+    let out = p.run(&["promote"]);
+    assert_eq!(code(&out), 0, "{}", both(&out));
+    p.assert_merged("feat", &c);
+}
+
+/// The probe of round 2's N1: git refuses the ref after writing part of M.
+#[test]
+fn r34b_a_refused_push_that_wrote_files_is_an_interrupted_promotion() {
+    use std::os::unix::fs::PermissionsExt;
+    let p = Proj::with_files(&[("a.txt", "a\n"), ("ro/f", "f\n"), ("z.txt", "z\n")], "");
+    let wt = p.start("feat", None);
+    fs::write(wt.join("a.txt"), "a from feat\n").unwrap();
+    fs::write(wt.join("ro/f"), "f from feat\n").unwrap();
+    fs::remove_file(wt.join("z.txt")).unwrap();
+    git(&wt, &["add", "-A"]);
+    git(&wt, &["commit", "-q", "-m", "feat"]);
+    let c = git(&wt, &["rev-parse", "HEAD"]);
+    p.approve("feat", &c);
+    let old = p.main_tip();
+    let ro = p.main().join("ro");
+    fs::set_permissions(&ro, fs::Permissions::from_mode(0o555)).unwrap();
+    let out = p.merge(&["feat"]);
+    let promote = p.run(&["promote"]);
+    let status = p.main_status();
+    let rec = p.promotion();
+    fs::set_permissions(&ro, fs::Permissions::from_mode(0o755)).unwrap();
+    assert_eq!(code(&out), 4, "{}", both(&out));
+    let e = stderr(&out);
+    assert!(e.contains("a promotion was interrupted"), "{e}");
+    assert!(!stdout(&out).contains("NOT PROMOTED"), "{}", both(&out));
+    assert_eq!(p.main_tip(), old);
+    assert!(
+        status.lines().any(|l| l.trim() == "M a.txt"),
+        "M's a.txt was written: {status}"
+    );
+    let rec = rec.expect("the record is kept");
+    assert!(
+        rec.push_started.is_some() && rec.push_ended.is_none(),
+        "{rec:?}"
+    );
+    // promote says the same, never "the owner's changes".
+    assert_eq!(code(&promote), 4, "{}", both(&promote));
+    assert!(stderr(&promote).contains("a promotion was interrupted"));
+    // The route the report names: reset to M, then promote records it.
+    git(p.main(), &["reset", "-q", "--hard", &rec.m]);
     let out = p.run(&["promote"]);
     assert_eq!(code(&out), 0, "{}", both(&out));
     p.assert_merged("feat", &c);

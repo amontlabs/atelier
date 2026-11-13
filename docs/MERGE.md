@@ -59,10 +59,16 @@ Under the gate lock, in this order:
    approved at a commit containing the upper's base. A branch whose own commits (`base..commit`)
    touch `.atelier/`, `AGENTS.md` or an import file merges alone (a *rules item*). OLD's
    settings are read from OLD itself (`git show OLD:.atelier/atelier.toml`), never from the main
-   checkout's file. Every platform of OLD's settings has a machine or is waived (exit 3
-   otherwise, before the gate). `--waive <platform> --reason "<words>"` repeats, each `--waive`
-   with its own `--reason` in the same order; a waiver names a platform of OLD's settings, or,
-   for a rules item, one its merged settings add (checked after the merge).
+   checkout's file. The settings the batch produces are known before anything merges: a rules
+   item merges alone, so its approved commit's committed settings are the merged ones
+   (`gate::batch_settings`); any other batch keeps OLD's. Every platform of those settings has a
+   machine or is waived (exit 3 otherwise, before the gate), and the pin is theirs: this
+   computer takes a `run = "check"` platform only with that atelier installed here (refused, 4,
+   naming the install command, when no other machine is listed), and another machine only when
+   its probe says that atelier is installed there. `--waive <platform> --reason "<words>"`
+   repeats, each `--waive` with its own `--reason` in the same order; a waiver names a platform
+   of OLD's settings or of the merged ones, so a rules item that drops a platform whose machine
+   is gone merges with or without a waiver for it.
 2. The gate `<main checkout>.gate` (`gate::gate_worktree`, the one function `approve`, `tmp` and
    `clean` use): created detached at OLD on first use; otherwise it must be registered at that
    exact path, detached, with no git operation in progress and no tracked change or untracked
@@ -74,10 +80,13 @@ Under the gate lock, in this order:
    command of the gate's merges, `merge-tree` and `check-attr` included). Before each merge,
    the paths both sides changed are looked up with `git check-attr merge` (the checkout's
    `.gitattributes`, the incoming commit's with `--source`, and `info/attributes`): a merge
-   driver other than git's own `text`, `binary` and `union` (named by the attribute or by
+   driver other than git's `text` and `binary` merges (named by the attribute or by
    `merge.default`), or one of those names the git configuration redefines
    (`merge.<name>.driver`), refuses (4), naming each path and driver, before anything is merged.
    Such a driver (mergiraf's documented install is one) would settle a conflict without a word.
+   So does git's own `union`, wherever it is set (a committed `.gitattributes` included): it
+   never conflicts, keeping both sides' lines (`<path>: merge=union, which keeps both sides'
+   lines and never conflicts`).
 
    When every conflicted path is a *regenerated path*, atelier takes **the incoming branch's
    side** for those paths (`git checkout --theirs`, or removes the path when that side deleted
@@ -100,10 +109,11 @@ Under the gate lock, in this order:
    proves the generated file only if the project tests it against a fresh generation: a
    `regenerates` hook must always rewrite its files (one that skips work by timestamp is caught
    here as RED).
-5. Platforms, from the merged settings: a waiver must name one of them (refused, 4, otherwise),
-   and a platform they add or change is checked for a machine first (exit 3). A platform this
-   computer runs with `run = "check"` needs the atelier M pins installed (refused, 4, naming the
-   install command, otherwise). Then every platform runs at the same time
+5. Platforms, from the merged settings: a waiver must name one of OLD's or theirs (refused, 4,
+   otherwise; one the merged settings no longer have prints `WAIVED (<words>); the merged
+   settings no longer have it`), and a platform that differs from step 1's settings (or every
+   platform, when the pin differs) is checked for a machine first, as in step 1. Then every
+   platform runs at the same time
    (`gate_machines::Machines`, below). `run = "check"` here runs
    `<~/.local/share/atelier/<M's pin>/bin/atelier> check` as a step of the gate run, passing it
    `ATELIER_RUN_ID=<a new id>`, the id its run takes, so the gate reads exactly that run's result
@@ -134,9 +144,15 @@ check b still refuses a `push-to-checkout` hook before the gate.
 The push is started through the step trampoline as its own process group, recorded under the gate
 lock (and its `push_pgid` in the record) before git runs, never signalled and never time-limited:
 atelier waits for the group to be empty. The record holds `push_started` before and `push_ended`
-after a push that ended cleanly: git accepted the ref, git refused it for a reason it reports
-(`--porcelain`'s `!` line and `Done`; git wrote nothing, whatever the checkout holds since), or the
-push left the checkout as checks d and e want it. A stop signal ends only the wait. Exit 7 prints
+after a push that ended cleanly: git accepted the ref, or the ref stayed at OLD and the main
+checkout shows the push wrote nothing, judged by content and never by git's words (every path
+that differs between OLD and M, and every other tracked path `git status` reports, holds OLD's
+content, so none of M's added paths is there, and the index is OLD's tree), or, failing that,
+the push left the checkout as checks d and e want it. git's words cannot tell: with
+`updateInstead`, receive-pack runs `read-tree -u -m` before it moves the ref, and a failure part
+way through (a folder without write permission) is reported as `! … [remote rejected] (Could not
+update working tree to new HEAD)` and `Done`, with files already written. That case, and any
+other change, is an interrupted promotion (below). A stop signal ends only the wait. Exit 7 prints
 `merge: GREEN, NOT PROMOTED — run <id>; <reasons>; run `atelier promote` when it is clean`.
 
 An interrupted promotion (`push_started` with a recorded `push_pgid` and without `push_ended`,
@@ -189,13 +205,30 @@ runs here and every other platform has no machine. With one, each platform's mac
 as `atelier test` chooses it (`machines::candidates`, `machines::select`: the project's order or
 the priorities, offline, not ready, busy, the wait for a busy one):
 
-- step 1 is a probe only: this computer is available for its platform; another machine is when
-  its probe answers ready or busy;
+- step 1 is a probe only, with the settings the batch produces (step 1 above): this computer is
+  available for its platform when it can run their pin; another machine is when its probe
+  answers ready or busy;
 - step 5 runs every platform at the same time: one thread per platform chooses its machine;
-  this computer runs its platform in the gate worktree under the machine lock, as a step of the
-  gate run (its machine preflight first, as `test`); another machine gets M pushed and runs the
-  platform's whole `run` (`remote-run`), and passes only when every run there records M, M's
-  tree and no uncommitted change (`remote::Session::finish`). A lost connection gives no
-  verdict: no machine, exit 3. The record names the machine (`<platform>=pass@<machine>`);
-- a machine runs the atelier of the version that starts it, built from the same source, so a
-  merged commit that pins another version cannot run there: the machine is not ready for it.
+  this computer runs its platform in the gate worktree, as a step of the gate run (its machine
+  preflight first, as `test`); another machine gets M pushed and runs the platform's whole `run`
+  (`remote-run`), and passes only when every run there records M, M's tree and no uncommitted
+  change (`remote::Session::finish`). A lost connection gives no verdict: no machine, exit 3.
+  The record names the machine (`<platform>=pass@<machine>`);
+- every run on this computer holds its machine lock (`~/.local/state/atelier/machine.lock`):
+  the gate's, with or without a machines file, and bisection's re-runs. While another atelier
+  holds it (`test`, a `remote-run` from another computer) the gate waits, printing
+  `<platform>: waiting for this computer's machine lock: <holder>` once; a stop signal ends the
+  wait;
+- when the platform on this computer fails (or cannot run), the gate is RED whatever the other
+  machines say: their sessions are stopped at once (closing the connection stops the remote
+  run) and the gate does not wait for them. Each is printed and recorded as `cancelled on
+  <machine>, run <id>: the run on this computer failed` (`cancelled, no machine started` when
+  none had taken it yet), and bisection searches only this computer's failures;
+- every machine runs M's own pinned atelier (DESIGN §3 step 5): `~/.local/share/atelier/<pin>/
+  bin/atelier` there. The probe asks the machine whether that version is installed (for this
+  program's own version, also built from this program's source); otherwise the machine is not
+  ready: `atelier <pin> is not installed there: run atelier machines init <name> with atelier
+  <pin>`. A merged commit that changes the pin therefore needs `atelier machines init <name>`,
+  run with the new version, on each machine that is to run it, before the merge: step 1 finds
+  out in seconds, before anything merges. This computer needs the pin installed only for a
+  platform it runs itself.
