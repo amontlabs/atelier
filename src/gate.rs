@@ -234,7 +234,6 @@ pub fn run_with(
 
     let stack = Stack::new(&ctx.checkout, &ctx.state, &integration);
     let old = stack.integration_tip()?;
-    let items = preconditions(ctx, &v, &stack, branches)?;
     let old_settings = settings_at(&root, &old)?.ok_or_else(|| {
         Failure::refused(format!(
             "{integration} ({}) has no {}",
@@ -242,6 +241,7 @@ pub fn run_with(
             crate::settings::SETTINGS_PATH
         ))
     })?;
+    let items = preconditions(ctx, &v, &stack, branches, &old_settings)?;
 
     // A waiver names a platform of OLD's settings, or, for an item that changes the settings,
     // possibly one the merged settings add: that one is checked after the merge.
@@ -789,6 +789,7 @@ fn preconditions(
     v: &crate::state::Versioned,
     stack: &Stack,
     branches: &[String],
+    old_settings: &Settings,
 ) -> Result<Vec<Item>> {
     let root = &ctx.checkout.root;
     let mut items: Vec<Item> = Vec::new();
@@ -839,7 +840,7 @@ fn preconditions(
                 )));
             }
         }
-        let rules = changes_rules(root, &ctx.settings, &me.record.base, &approval.commit)?;
+        let rules = changes_rules(root, old_settings, &me.record.base, &approval.commit)?;
         items.push(Item {
             name: b.clone(),
             lifetime: me.record.lifetime.clone(),
