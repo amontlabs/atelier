@@ -1141,6 +1141,7 @@ fn a_platform_whose_run_is_check_runs_atelier_check_here_and_there() {
     );
     let log = fs::read_to_string(run_dir.join("remote-box.log")).unwrap();
     assert!(log.contains("linted"), "{log}");
+    assert_eq!(remote[0].outcome, atelier::runs::Outcome::Passed);
 
     // Here: the same two runs in this worktree.
     w.machines_file(Some(""));
@@ -1165,4 +1166,82 @@ fn a_platform_whose_run_is_check_runs_atelier_check_here_and_there() {
         .map(|r| r.kind.as_str().to_owned())
         .collect();
     assert_eq!(kinds, ["test-full", "check"]);
+    let here_runs = w.results(&w.repo.root);
+    let (platform, check) = (&here_runs[1], &here_runs[2]);
+    assert_eq!(platform.outcome, atelier::runs::Outcome::Passed);
+    assert_eq!(
+        fs::read_to_string(
+            w.repo
+                .root
+                .join(".git/atelier/runs")
+                .join(&platform.id)
+                .join("check-run")
+        )
+        .unwrap(),
+        format!("{}\n", check.id)
+    );
+}
+
+#[test]
+fn a_failing_check_fails_the_platforms_recorded_run_here_and_there() {
+    let w = World::new("");
+    w.repo.write(
+        ".atelier/atelier.toml",
+        &format!(
+            "atelier = \"{VERSION}\"\n\n[platforms.{}]\nrun = \"check\"\nmachines = [\"here\"]\n\n[[check.steps]]\nname = \"lint\"\nrun = [\"sh\", \"-c\", \"echo lint fails; exit 1\"]\n",
+            here()
+        ),
+    );
+    w.repo.write_rules();
+    w.repo.commit_all("a failing check");
+
+    // Here: the platform's run is the one a reader takes for this tree; it names the check's
+    // run and records its outcome.
+    let out = w.run(&["test", &here()]);
+    assert_eq!(code(&out), 1, "{}", both(&out));
+    assert_eq!(
+        stdout(&out).trim().lines().last().unwrap(),
+        format!("{}: FAIL on here (local)", here())
+    );
+    let local = w.results(&w.repo.root);
+    let kinds: Vec<&str> = local.iter().map(|r| r.kind.as_str()).collect();
+    assert_eq!(kinds, ["test-full", "check"], "{local:?}");
+    let (platform, check) = (&local[0], &local[1]);
+    assert_eq!(check.outcome, atelier::runs::Outcome::Failed);
+    assert_eq!(platform.outcome, atelier::runs::Outcome::Failed);
+    assert_eq!(
+        platform.failures,
+        [format!("atelier check failed (run {})", check.id)]
+    );
+    let run_dir = w.repo.root.join(".git/atelier/runs").join(&platform.id);
+    assert_eq!(
+        fs::read_to_string(run_dir.join("check-run")).unwrap(),
+        format!("{}\n", check.id)
+    );
+    assert!(platform.ended >= check.ended, "written after the check");
+
+    // On box: the machine's platform run says the same.
+    let settings = fs::read_to_string(w.repo.root.join(".atelier/atelier.toml")).unwrap();
+    w.repo.write(
+        ".atelier/atelier.toml",
+        &settings.replace("machines = [\"here\"]", "machines = [\"box\"]"),
+    );
+    w.repo.write_rules();
+    w.repo.commit_all("on box");
+    w.init_box();
+    let out = w.run(&["test", &here()]);
+    assert_eq!(code(&out), 1, "{}", both(&out));
+    let remote = w.results(&w.box_checkout());
+    let kinds: Vec<&str> = remote.iter().map(|r| r.kind.as_str()).collect();
+    assert_eq!(kinds, ["test-full", "check"], "{remote:?}");
+    assert_eq!(remote[0].outcome, atelier::runs::Outcome::Failed);
+    assert_eq!(
+        remote[0].failures,
+        [format!("atelier check failed (run {})", remote[1].id)]
+    );
+    let caller = w.results(&w.repo.root);
+    assert_eq!(
+        caller.last().unwrap().outcome,
+        atelier::runs::Outcome::Failed
+    );
 }

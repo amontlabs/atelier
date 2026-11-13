@@ -45,7 +45,7 @@ use crate::platform::Platform;
 use crate::preflight::{self, Needs};
 use crate::procs;
 use crate::remote::tag;
-use crate::runs::{Run, RunInfo};
+use crate::runs::{FollowUp, Run, RunInfo};
 use crate::signals;
 use crate::source;
 use crate::tree;
@@ -551,14 +551,18 @@ fn run_job(
             Ok(())
         }
         Ok(Ending::ThenCheck) => {
-            run.finish(true).map_err(|f| f.message)?;
-            if lost() {
-                return Ok(());
-            }
-            match jobs::full_check(ctx) {
-                Ok(_) => Ok(()),
-                Err(f) => Err(f.message),
-            }
+            let dir = run.dir().to_path_buf();
+            run.finish_after(true, || {
+                if lost() {
+                    return FollowUp {
+                        passed: false,
+                        failures: vec!["connection lost".to_owned()],
+                    };
+                }
+                jobs::full_check(ctx, &dir)
+            })
+            .map_err(|f| f.message)?;
+            Ok(())
         }
         Err(f) => {
             run.fail(f.message.clone());

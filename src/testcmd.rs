@@ -415,21 +415,10 @@ fn run_platform(
             };
             let ended = match ending {
                 Ok(Ending::Done(passed)) => outcome_of(&run.finish(passed)?.outcome),
-                Ok(Ending::ThenCheck) => {
-                    let prep = run.finish(true)?;
-                    if prep.outcome != Outcome::Passed {
-                        outcome_of(&prep.outcome)
-                    } else {
-                        match jobs::full_check(ctx) {
-                            Ok(Exit::Ok) => Ended::Pass,
-                            Ok(_) => Ended::Fail,
-                            Err(f) => {
-                                eprintln!("atelier: {}", f.message);
-                                Ended::Fail
-                            }
-                        }
-                    }
-                }
+                Ok(Ending::ThenCheck) => outcome_of(
+                    &run.finish_after(true, || jobs::full_check(ctx, &run_dir))?
+                        .outcome,
+                ),
                 Err(f) => {
                     run.fail(f.message.clone());
                     let _ = run.finish(false);

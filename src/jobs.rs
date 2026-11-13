@@ -16,7 +16,7 @@
 //! run: its platform, then `atelier check`'s own prerequisites ([`crate::prereq::verify`]) for the
 //! files of the commit it runs (r4 §4.4, §6).
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use crate::check;
 use crate::exit::{Exit, Failure, Result};
@@ -24,7 +24,7 @@ use crate::git::Checkout;
 use crate::platform::Platform;
 use crate::preflight::Context;
 use crate::prereq;
-use crate::runs::{self, Run, RunKind, StepStatus};
+use crate::runs::{self, FollowUp, Run, RunKind, StepStatus};
 use crate::settings::{PlatformRun, PlatformSettings, Settings};
 use crate::tree;
 
@@ -64,8 +64,8 @@ impl Job {
 pub enum Ending {
     /// The run is complete; true when every step passed.
     Done(bool),
-    /// The preparation passed and the platform runs `atelier check`: finish this run, then run
-    /// the check ([`full_check`]).
+    /// The preparation passed and the platform runs `atelier check`: finish this run with the
+    /// check as its follow-up ([`full_check`]).
     ThenCheck,
 }
 
@@ -183,9 +183,33 @@ pub fn run_steps(ctx: &Context, run: &mut Run, job: &Job) -> Result<Ending> {
 }
 
 /// The full `atelier check` of the checkout (module 3.2): its own run (kind `check`), its own
-/// lock, its own report.
-pub fn full_check(ctx: &Context) -> Result<Exit> {
-    check::run(ctx, false)
+/// lock, its own report. Meant as the follow-up of the platform's run
+/// ([`Run::finish_after`]): the platform's run passes only when the check does, and its folder
+/// names the check's run in `check-run`.
+pub fn full_check(ctx: &Context, platform_run: &Path) -> FollowUp {
+    let mut id = None;
+    let result = check::run_noting(ctx, false, &mut id);
+    if let Some(id) = &id {
+        let _ = std::fs::write(platform_run.join("check-run"), format!("{id}\n"));
+    }
+    let named = id
+        .as_deref()
+        .map(|i| format!(" (run {i})"))
+        .unwrap_or_default();
+    match result {
+        Ok(Exit::Ok) => FollowUp {
+            passed: true,
+            failures: Vec::new(),
+        },
+        Ok(_) => FollowUp {
+            passed: false,
+            failures: vec![format!("atelier check failed{named}")],
+        },
+        Err(f) => FollowUp {
+            passed: false,
+            failures: vec![format!("atelier check{named}: {}", f.message)],
+        },
+    }
 }
 
 /// `<os>-<arch>` of the machine this program runs on, from `uname`.

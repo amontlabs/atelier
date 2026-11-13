@@ -260,6 +260,14 @@ fn read_toml<T: serde::de::DeserializeOwned>(path: &Path) -> Result<Option<T>> {
 /// The survivor scan a run uses: [`procs::marker_survivors`] unless a test replaces it.
 pub type SurvivorScan = fn(&[String]) -> std::io::Result<Vec<(procs::ProcInfo, String)>>;
 
+/// What a run's follow-up gave ([`Run::finish_after`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FollowUp {
+    pub passed: bool,
+    /// Lines for the run's failures.
+    pub failures: Vec<String>,
+}
+
 /// A run in progress.
 #[derive(Debug)]
 pub struct Run {
@@ -646,7 +654,28 @@ impl Run {
     /// caller's verdict; failed steps, survivors, a failed scan and a stop signal each make the
     /// run fail. The run stays recorded under its lock while survivors live, and when the scan
     /// failed, so the next taker of the lock scans for it again.
-    pub fn finish(mut self, passed: bool) -> Result<RunResult> {
+    pub fn finish(self, passed: bool) -> Result<RunResult> {
+        self.finish_then(
+            passed,
+            || unreachable!("not called without a follow-up"),
+            false,
+        )
+    }
+
+    /// As [`Run::finish`], then, when the run would pass, `then` runs before the result is
+    /// written: this run's lock is released first (`then` is the platform's `atelier check`,
+    /// which takes the same lock), and the result includes `then`'s verdict and lines. Until
+    /// then the run has no result, so no reader takes it for a pass.
+    pub fn finish_after(self, passed: bool, then: impl FnOnce() -> FollowUp) -> Result<RunResult> {
+        self.finish_then(passed, then, true)
+    }
+
+    fn finish_then(
+        mut self,
+        passed: bool,
+        then: impl FnOnce() -> FollowUp,
+        follow: bool,
+    ) -> Result<RunResult> {
         let (survivors, scanned) = match (self.scan)(std::slice::from_ref(&self.id)) {
             Ok(found) => (
                 found
@@ -684,14 +713,31 @@ impl Run {
             self.failures
                 .push(format!("left processes behind: {}", survivors.join("; ")));
         }
-        let interrupted = self.interrupted();
-        let outcome = if interrupted.is_some() {
+        let mut interrupted = self.interrupted();
+        let mut outcome = if interrupted.is_some() {
             Outcome::Interrupted
         } else if passed && self.failures.is_empty() {
             Outcome::Passed
         } else {
             Outcome::Failed
         };
+        let mut lock = Some(self.lock);
+        if follow && outcome == Outcome::Passed {
+            // Passing means no survivor and a scan that worked: the run leaves the lock.
+            if let Some(mut l) = lock.take() {
+                l.remove_run(&self.id)?;
+            }
+            let f = then();
+            self.failures.extend(f.failures);
+            interrupted = self.interrupted.or_else(signals::received);
+            outcome = if interrupted.is_some() {
+                Outcome::Interrupted
+            } else if f.passed && self.failures.is_empty() {
+                Outcome::Passed
+            } else {
+                Outcome::Failed
+            };
+        }
         let result = RunResult {
             id: self.id.clone(),
             kind: self.kind.clone(),
@@ -718,8 +764,11 @@ impl Run {
         fsutil::write_atomic(&self.dir.join("result"), text.as_bytes()).ctx("result")?;
         // Survivors keep the run recorded under the lock, so the next taker refuses while they
         // live; so does a scan that failed. Groups that could not be emptied stay recorded too.
-        if scanned && survivors.is_empty() {
-            self.lock.remove_run(&self.id)?;
+        if let Some(mut l) = lock
+            && scanned
+            && survivors.is_empty()
+        {
+            l.remove_run(&self.id)?;
         }
         Ok(result)
     }

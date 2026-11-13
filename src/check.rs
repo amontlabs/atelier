@@ -26,6 +26,11 @@ const TEST_RESULTS: &str = "tests.tsv";
 
 /// Runs the check; the exit code is 0 for GREEN (or `compile: OK`) and 1 for RED.
 pub fn run(ctx: &Context, compile_only: bool) -> Result<Exit> {
+    run_noting(ctx, compile_only, &mut None)
+}
+
+/// As [`run`], and sets `id` to the check's run id once the run has started.
+pub fn run_noting(ctx: &Context, compile_only: bool, id: &mut Option<String>) -> Result<Exit> {
     let checkout = &ctx.checkout;
     // The prerequisite commands carry the id the run then takes, so any of them that leaves a
     // process behind is found by the marker scan.
@@ -48,6 +53,7 @@ pub fn run(ctx: &Context, compile_only: bool) -> Result<Exit> {
         Some(&marker),
     )?;
     let run_id = run.id().to_owned();
+    *id = Some(run_id.clone());
     let run_dir = run.dir().to_path_buf();
 
     let before = match tree::tree_id(checkout) {
