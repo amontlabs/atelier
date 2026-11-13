@@ -1,29 +1,32 @@
 # atelier
 
-**Keep `main` green while several coding agents build one project at once, each in its own git worktree.**
+**Several coding agents build one project in parallel: no waiting on CI, no waiting on each other's merges.**
 
 atelier is a command-line tool the agents run themselves: an *orchestrator* that plans, reviews
-and merges, and *workers* that each build one branch. It does the few things that plain git and
-written rules get wrong when nobody is watching:
+and merges, and *workers* that each build one branch in its own git worktree. It answers four
+problems, measured on the multi-agent builds that came before it:
 
-| What goes wrong | What atelier does |
+| The problem | What atelier does |
 |---|---|
-| Every branch is green, the merge is not, and `main` goes red | `merge` tests the **merged** tree in a separate worktree; `main` moves only if it is green |
-| "Reviewed" meant an older commit than the one merged | `approve` binds the review to one exact commit; a branch that moved is refused |
-| A rebase replays commits that were never the branch's own | `start` records what a branch is built on; `follow` rebases exactly its own commits |
-| Cleanup deletes a worktree that held unmerged work | `clean` deletes only what `merge` recorded, re-checked at the moment of deletion |
-| A retry hides a failing test | No retries. A test that fails, then passes on the same tree, is listed as flaky |
-| Each agent follows its own idea of the rules | `init` generates the rules agents read, with only the parts your project uses |
+| **Agents waited on CI.** A third to a half of all build time was agents polling CI until green (31% in one analysis, 49% in another). One Linux CI job failed 52 of 166 runs, at 16 minutes each. | **No CI in the loop.** `merge` checks the merged tree on your own machines, on every platform the project lists: this computer, and others over ssh, with the next machine tried when one is offline. `main` moves only when it is green. Nothing waits on GitHub. |
+| **Work ran one item at a time.** Builds averaged 1.4 workers at once, because each item waited for the previous one to merge. | **Parallel by default.** One worktree per item. An item that builds on another starts before that one is merged (`start --on`, `follow`). Approved branches merge as one batch; a red batch is split, and the branches before the one that breaks it land. `status` forecasts conflicts between open branches. |
+| **Test loops were slow and not trusted.** Full suites run by reflex, retries that hid failures, flaky tests nobody fixed. | **Fast feedback you can trust.** A worker runs only the tests that prove its change, then `check --compile-only`. The full check runs once per merge. Nothing is retried: a test that fails, then passes on the same tree, is listed as flaky, to be fixed. |
+| **Every agent followed its own idea of the rules.** Notes in several places, models picked ad hoc. | **One set of rules.** `init` and `rules` generate what agents read. `task` renders the same task templates every time. Agents are chosen by role, never by model name. |
 
-> **Status: early (0.1.0).** It has been used to build one real project, Silo. Expect rough edges
-> and changes. macOS and Linux only.
+A green `main` is the guard rail that lets agents merge with nobody watching: `merge` moves it
+only to a tree that passed, and only for the exact commits that were reviewed (`approve`).
+Nothing is best-effort: a platform with no machine is not passed, never silently skipped, and no
+verdict comes from a cache; the full check runs on the exact tree that lands.
+
+> **Status: early (0.1.0).** Used on one real project, Silo. The speed-up is not measured yet: a
+> measured trial build is next. Expect rough edges and changes. macOS and Linux only.
 
 ## Who it's for
 
 You run several coding agents (Claude Code, Codex) on one repository at the same time and want
-their work to land on `main` without breaking it. The orchestrator can be an agent or you. Rust
-projects get format, compile and [nextest](https://nexte.st/) built in; anything else runs as
-steps you declare.
+their work to land on `main` quickly, without CI in the way and without breaking it. The
+orchestrator can be an agent or you. Rust projects get format, compile and
+[nextest](https://nexte.st/) built in; anything else runs as steps you declare.
 
 ## A build, end to end
 
