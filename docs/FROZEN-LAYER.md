@@ -23,7 +23,7 @@ runs its pinned version beside the orchestrator's. These rules keep that safe.
 | `state.lock` | empty; `flock` shared by every command, exclusive during a conversion of the versioned layer |
 | `locks/gate.lock`, `locks/branch/<key>.lock`, `locks/worktree/<key>.lock` | empty; `flock` exclusive while an atelier holds the lock; a branch lock is held shared by `tmp` and by `check` in the branch's worktree, exclusive by `clean`, `follow` and `start` |
 | `locks/…/<same name>.procs` | the lock record, below |
-| `locks/…/<same name>.procs.lock` | empty; `flock` exclusive for the moment a shared holder rewrites the record |
+| `locks/update/…/<same name>.lock` | empty; `flock` exclusive for the moment a shared holder rewrites the record |
 | `runs/<run id>/run.toml` | written when a run starts |
 | `runs/<run id>/result` | written atomically when a run ends; absent for a run that was killed |
 | `runs/<run id>/<step key>.log` | a step's output |
@@ -75,7 +75,7 @@ group <pgid> <run id> <leader start time> [<later fields>...]
 Whoever takes the lock exclusive next reads the record and refuses (4) while any of these
 live, naming them. It never signals them. Shared holders of a branch lock run beside each other:
 one never refuses for what the record lists, and changes only its own lines, re-reading the file
-and writing it back under `<same name>.procs.lock`.
+and writing it back under `locks/update/…/<same name>.lock`.
 
 - A recorded group is alive and is still the one atelier started. If a process with pid == pgid
   exists and its start time differs from the recorded one, the pgid was reused: the line is not

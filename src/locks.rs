@@ -27,8 +27,8 @@
 //! An exclusive holder reads the record when it takes the lock, refuses while anything recorded
 //! lives, and then owns the file. Shared holders run beside each other, so a shared holder never
 //! refuses for what the record lists (it may be another holder's live run), and changes only its
-//! own lines: each change re-reads the file and writes it back while holding `<name>.procs.lock`
-//! exclusive for that moment. Survivors of a shared holder therefore stop the next exclusive
+//! own lines: each change re-reads the file and writes it back while holding
+//! `locks/update/<same name>.lock` exclusive for that moment. Survivors of a shared holder therefore stop the next exclusive
 //! taker (`clean`), not the next `tmp`.
 
 use std::fs::{self, File, OpenOptions};
@@ -253,6 +253,8 @@ pub struct HeldLock {
     /// Exclusive: the whole record. Shared: only this holder's lines.
     record: Record,
     shared: bool,
+    /// `locks/update/<id>.lock`: held while a shared holder rewrites the record.
+    update_lock: PathBuf,
 }
 
 /// `<locks>/<id><ext>`: the extension is appended, never put in place of a `.` the key has
@@ -300,6 +302,15 @@ impl HeldLock {
     fn take(state: &State, key: LockKey, shared: bool) -> Result<HeldLock> {
         let lock_path = lock_file(state, &key, ".lock");
         let record_path = lock_file(state, &key, ".procs");
+        let update_lock = {
+            let mut p = state
+                .locks_dir()
+                .join("update")
+                .join(key.rel())
+                .into_os_string();
+            p.push(".lock");
+            PathBuf::from(p)
+        };
         if let Some(parent) = lock_path.parent() {
             fs::create_dir_all(parent).ctx(parent.display())?;
         }
@@ -333,6 +344,7 @@ impl HeldLock {
             record_path,
             record: Record::default(),
             shared,
+            update_lock,
         })
     }
 
@@ -421,17 +433,18 @@ impl HeldLock {
     }
 
     /// Applies one change to this holder's lines and writes the record. A shared holder applies
-    /// it to the file as it is now, under `<name>.procs.lock`, so the other holders' lines stay.
+    /// it to the file as it is now, under its update lock, so the other holders' lines stay.
     fn change(&mut self, f: impl Fn(&mut Record)) -> Result<()> {
         f(&mut self.record);
         if !self.shared {
             return save(&self.record_path, &self.record);
         }
-        let mutex_path = {
-            let mut p = self.record_path.clone().into_os_string();
-            p.push(".lock");
-            PathBuf::from(p)
-        };
+        // In a folder of its own: no lock key's file can be this one (a branch `a.procs` has
+        // the lock file `branch/a.procs.lock`).
+        let mutex_path = self.update_lock.clone();
+        if let Some(parent) = mutex_path.parent() {
+            fs::create_dir_all(parent).ctx(parent.display())?;
+        }
         let mutex = OpenOptions::new()
             .read(true)
             .write(true)
@@ -690,6 +703,12 @@ mod tests {
         HeldLock::acquire(&state, LockKey::branch("v1.3")).unwrap();
         assert!(state.locks_dir().join("branch/v1.2.lock").is_file());
         assert!(state.locks_dir().join("branch/v1.3.lock").is_file());
+        // A shared holder's update lock is no other key's lock file (a branch `a.procs` has
+        // `branch/a.procs.lock`).
+        let mut held = HeldLock::acquire_shared(&state, LockKey::branch("a")).unwrap();
+        held.add_run(ID).unwrap();
+        assert!(state.locks_dir().join("update/branch/a.lock").is_file());
+        assert!(!state.locks_dir().join("branch/a.procs.lock").exists());
     }
 
     #[test]

@@ -1548,8 +1548,18 @@ fn check_holds_the_branch_lock_of_an_atelier_branch() {
     let out = p.run(&wt, &["check"]);
     refused(&out, "branch lock a is held by another atelier command");
     drop(held);
-    // Shared with tmp: a shared holder does not stop it at the lock.
-    let _shared = HeldLock::acquire_shared(&state, LockKey::branch("a")).unwrap();
+    // Shared with tmp: a shared holder does not stop it at the lock. Taken again with retries:
+    // a child another test thread is spawning holds a copy of the released descriptor until it
+    // execs.
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let _shared = loop {
+        match HeldLock::acquire_shared(&state, LockKey::branch("a")) {
+            Err(e) if e.message.contains("held by another") && Instant::now() < deadline => {
+                std::thread::sleep(Duration::from_millis(10))
+            }
+            other => break other.unwrap(),
+        }
+    };
     let out = p.run(&wt, &["check"]);
     assert!(
         !all_out(&out).contains("branch lock a"),

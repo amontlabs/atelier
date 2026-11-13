@@ -221,11 +221,16 @@ pub fn run(ctx: &Context, branches: &[String], yes: bool, discard: &[String]) ->
     };
     let mut discards: Vec<String> = Vec::new();
     for d in discard {
+        if d.starts_with('-') {
+            return Err(Failure::usage(format!(
+                "clean: --discard {d} is not a commit"
+            )));
+        }
         let full = git::output(
             &checkout.root,
             ["rev-parse", "-q", "--verify", &format!("{d}^{{commit}}")],
         )?;
-        if !full.status.success() || d.starts_with('-') {
+        if !full.status.success() {
             return Err(Failure::usage(format!(
                 "clean: --discard {d} is not a commit"
             )));
