@@ -159,10 +159,11 @@ impl State {
         }
         let result = (|| {
             let dir = self.versioned_dir();
-            loop {
-                let Some(f) = self.format()? else { break };
-                if f >= current {
-                    break;
+            while let Some(f) = self.format()?.filter(|f| *f < current) {
+                if f == 0 {
+                    return Err(Failure::refused(
+                        "versioned/format: 0 is not a format number",
+                    ));
                 }
                 (converters[(f - 1) as usize])(&dir)
                     .map_err(|e| e.context(format!("converting state format {f}")))?;

@@ -146,12 +146,12 @@ pub fn report(cwd: &Path) -> (Vec<Line>, Option<State>) {
             Ok(()) => push(true, "rules", "current".to_owned()),
             Err(e) => push(false, "rules", e.message),
         }
-        if let Some(state) = &state {
-            if require_main_version(&checkout, settings, "the versioned state").is_ok() {
-                match state.format_line(CURRENT_FORMAT) {
-                    Ok(()) => push(true, "state format", CURRENT_FORMAT.to_string()),
-                    Err(m) => push(false, "state format", m),
-                }
+        if let Some(state) = &state
+            && require_main_version(&checkout, settings, "the versioned state").is_ok()
+        {
+            match state.format_line(CURRENT_FORMAT) {
+                Ok(()) => push(true, "state format", CURRENT_FORMAT.to_string()),
+                Err(m) => push(false, "state format", m),
             }
         }
     }

@@ -63,6 +63,11 @@ pub fn tree_id(checkout: &Checkout) -> Result<String> {
     }
     let tree = String::from_utf8_lossy(&write.stdout).trim().to_owned();
     refuse_gitlinks(checkout, &tree)?;
+    // A committed submodule whose folder is missing drops out of the worktree's tree, but the
+    // project still has one.
+    if let Some(head) = head_tree(checkout)? {
+        refuse_gitlinks(checkout, &head)?;
+    }
     Ok(tree)
 }
 

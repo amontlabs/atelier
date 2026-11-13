@@ -246,12 +246,12 @@ impl Settings {
                     &mut problems,
                 );
             }
-            if let Some(machines) = &p.machines {
-                if machines.is_empty() || machines.iter().any(|m| m.trim().is_empty()) {
-                    problems.push(format!(
-                        "platforms.{name}.machines: empty name or empty list"
-                    ));
-                }
+            if let Some(machines) = &p.machines
+                && (machines.is_empty() || machines.iter().any(|m| m.trim().is_empty()))
+            {
+                problems.push(format!(
+                    "platforms.{name}.machines: empty name or empty list"
+                ));
             }
         }
 
@@ -325,12 +325,12 @@ impl Settings {
                 problems.push(format!("{at}: commit message is empty"));
             }
         }
-        if let Some(r) = &self.merge.resolver {
-            if r != "mergiraf" {
-                problems.push(format!(
-                    "merge.resolver: {r:?} is not a known resolver (mergiraf)"
-                ));
-            }
+        if let Some(r) = &self.merge.resolver
+            && r != "mergiraf"
+        {
+            problems.push(format!(
+                "merge.resolver: {r:?} is not a known resolver (mergiraf)"
+            ));
         }
 
         if problems.is_empty() {
