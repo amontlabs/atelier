@@ -32,6 +32,29 @@ pub struct Settings {
     pub merge: Merge,
     #[serde(default)]
     pub platforms: BTreeMap<String, PlatformSettings>,
+    #[serde(default)]
+    pub rules: RulesSettings,
+}
+
+/// `[rules]`: where the generated `@AGENTS.md` import line goes.
+#[derive(Debug, Clone, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct RulesSettings {
+    /// Files in the checkout root that must contain the line `@AGENTS.md`.
+    #[serde(default = "default_import_into")]
+    pub import_into: Vec<String>,
+}
+
+impl Default for RulesSettings {
+    fn default() -> Self {
+        RulesSettings {
+            import_into: default_import_into(),
+        }
+    }
+}
+
+fn default_import_into() -> Vec<String> {
+    vec!["CLAUDE.md".to_owned()]
 }
 
 fn default_integration_branch() -> String {
@@ -231,6 +254,14 @@ impl Settings {
                 "integration_branch {:?} is not a valid branch name",
                 self.integration_branch
             ));
+        }
+
+        for f in &self.rules.import_into {
+            if f.is_empty() || f.contains('/') || f == "." || f == ".." || f == "AGENTS.md" {
+                problems.push(format!(
+                    "rules.import_into: {f:?} must be a file name in the checkout root other than AGENTS.md"
+                ));
+            }
         }
 
         if self.platforms.is_empty() {

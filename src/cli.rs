@@ -10,8 +10,10 @@ use crate::dispatch::{self, DISPATCHED_VAR, Decision, VERSION};
 use crate::exit::{Exit, Failure, Result};
 use crate::git::Checkout;
 use crate::preflight::{self, Needs};
+use crate::rules;
 use crate::settings::{self, SETTINGS_PATH};
 use crate::state::State;
+use crate::task;
 
 #[derive(Debug, Parser)]
 #[command(
@@ -223,7 +225,47 @@ fn main_with(args: &[OsString]) -> Result<Exit> {
 /// Runs a parsed command in `cwd`.
 pub fn run(cmd: Cmd, cwd: &Path) -> Result<Exit> {
     match &cmd {
-        Cmd::Init { version } => init_preflight(cwd, version.as_deref())?,
+        Cmd::Init { version } => {
+            init_preflight(cwd, version.as_deref())?;
+            let checkout = Checkout::find(cwd)?.expect("checked by init_preflight");
+            let changed = task::init(&checkout, version.as_deref().unwrap_or(VERSION))?;
+            println!(
+                "initialized atelier {} in {}",
+                version.as_deref().unwrap_or(VERSION),
+                checkout.root.display()
+            );
+            for line in changed {
+                println!("  {line}");
+            }
+            return Ok(Exit::Ok);
+        }
+        Cmd::Rules => {
+            let context = preflight::run(cwd, cmd.name(), cmd.needs())?;
+            let changed = rules::write(&context.checkout, &context.settings)?;
+            if changed.is_empty() {
+                println!("rules are current");
+            }
+            for line in changed {
+                println!("{line}");
+            }
+            return Ok(Exit::Ok);
+        }
+        Cmd::Agents => {
+            let _context = preflight::run(cwd, cmd.name(), cmd.needs())?;
+            print!("{}", task::agents_table(&home()?)?);
+            return Ok(Exit::Ok);
+        }
+        Cmd::Task {
+            role,
+            branch,
+            fields,
+            fixes,
+        } => {
+            let context = preflight::run(cwd, cmd.name(), cmd.needs())?;
+            let path = task::task(&context, &home()?, cwd, role, branch, fields, *fixes)?;
+            println!("{}", task::prompt_line(&path));
+            return Ok(Exit::Ok);
+        }
         Cmd::Status => {
             let (lines, _state) = preflight::report(cwd);
             for l in &lines {
@@ -244,6 +286,12 @@ pub fn run(cmd: Cmd, cwd: &Path) -> Result<Exit> {
         cmd.name(),
         cmd.module()
     )))
+}
+
+fn home() -> Result<PathBuf> {
+    std::env::var_os("HOME")
+        .map(PathBuf::from)
+        .ok_or_else(|| Failure::refused("HOME is not set"))
 }
 
 /// `init` runs outside a project: it needs a git worktree without `.atelier/`, and its own version

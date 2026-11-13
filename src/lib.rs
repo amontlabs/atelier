@@ -23,4 +23,6 @@ pub mod runs;
 pub mod settings;
 pub mod signals;
 pub mod state;
+pub mod task;
+pub mod template;
 pub mod tree;

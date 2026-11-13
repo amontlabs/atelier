@@ -89,15 +89,10 @@ fn init_runs_the_named_version_outside_a_project() {
     let repo = Repo::new();
     repo.install_self(VERSION);
     let out = repo.atelier(&["init", "--version", VERSION]);
-    assert_eq!(code(&out), 2, "{}", stderr(&out));
-    assert!(
-        stderr(&out).contains("init: not built yet (module 3.7)"),
-        "{}",
-        stderr(&out)
-    );
+    assert_eq!(code(&out), 0, "{}", stderr(&out));
     assert!(repo.root.join(".git/atelier/state.lock").is_file());
+    assert!(repo.root.join(".atelier/atelier.toml").is_file());
 
-    repo.write_settings(VERSION);
     let out = repo.atelier(&["init"]);
     assert_eq!(code(&out), 4, "{}", stderr(&out));
     assert!(stderr(&out).contains(".atelier/ exists"));
@@ -200,9 +195,6 @@ fn stub_commands_preflight_then_exit_2() {
         (&["clean"], "3.5"),
         (&["test", "--all"], "3.6"),
         (&["machines"], "3.6"),
-        (&["rules"], "3.7"),
-        (&["task", "judge", "-"], "3.7"),
-        (&["agents"], "3.7"),
         (&["status"], "3.8"),
     ] {
         let out = repo.atelier(args);
@@ -367,6 +359,7 @@ fn a_symbolic_integration_branch_is_refused() {
         ".atelier/atelier.toml",
         &format!("atelier = \"{VERSION}\"\nintegration_branch = \"trunk\"\n[platforms.macos-aarch64]\nrun = \"check\"\n"),
     );
+    repo.write_rules();
     repo.commit_all("pin");
     git(
         &repo.root,

@@ -22,8 +22,15 @@ Built so far, with tests on throwaway git repositories:
   and `state.lock`;
 - locks, runs, process groups and the survivor scan, stop signals, the tree id, and plain refs.
 
-The command behaviour (`check`, `start`/`follow`, `merge`, `tmp`/`clean`, machines, rules,
-`status`) comes in later modules.
+Module 3.7 adds `init`, `rules`, `task` and `agents`: the generated rules (`WORKER.md`,
+`ORCHESTRATOR.md`, the `AGENTS.md` block, the `@AGENTS.md` import lines), verified byte for byte by
+every command's preflight, and the task templates in `assets/tasks/`. `src/template.rs` is a
+small Mustache subset (`{{x}}`, `{{#x}}…{{/x}}`) written here because the Mustache crates render
+derived Rust structs and implement the whole specification, where these templates have run-time
+fields and anything else must be an error.
+
+The other commands (`check`, `start`/`follow`, `merge`, `tmp`/`clean`, machines, `status`) come in
+later modules.
 
 ## Layout
 

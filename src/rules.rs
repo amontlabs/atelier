@@ -1,16 +1,403 @@
-//! Rules currency (DESIGN §3 `atelier rules`). Every command but `init`, `rules`, `--version` and
-//! `status` verifies the generated files byte for byte and refuses (4) with
-//! `rules are stale: run atelier rules`. The generator and the comparison come with module 3.7;
-//! until then every tree counts as current.
+//! The generated rules (DESIGN §2.2, §3 `rules`; r4 §2.3). For given settings the program knows
+//! the complete generated set:
+//!
+//! - `.atelier/rules/WORKER.md` and `.atelier/rules/ORCHESTRATOR.md`, each followed by the
+//!   project's own `.atelier/project/worker.md` / `orchestrator.md`;
+//! - the block between two marker lines in `AGENTS.md`, followed inside the markers by
+//!   `.atelier/project/binding.md`;
+//! - the line `@AGENTS.md` in each file of `[rules] import_into` (default `CLAUDE.md`).
+//!
+//! `write` produces all of them and deletes any other file under `.atelier/rules/`. `verify`
+//! rebuilds the set in memory and refuses (4) on any byte difference, missing file, extra file,
+//! missing or doubled marker, or missing import line. Every command but `init`, `rules`,
+//! `--version` and `status` verifies first.
 
-use crate::exit::Result;
+use std::collections::{BTreeMap, BTreeSet};
+use std::fs;
+use std::path::{Path, PathBuf};
+
+use crate::exit::{Failure, IoContext, Result};
+use crate::fsutil;
 use crate::git::Checkout;
 use crate::settings::Settings;
+use crate::template::Template;
 
 /// The refusal message for stale rules.
 pub const STALE: &str = "rules are stale: run atelier rules";
 
-/// Verifies the generated rules. Stub until module 3.7: always current.
-pub fn verify(_checkout: &Checkout, _settings: &Settings) -> Result<()> {
+pub const RULES_DIR: &str = ".atelier/rules";
+pub const PROJECT_DIR: &str = ".atelier/project";
+pub const AGENTS_FILE: &str = "AGENTS.md";
+pub const IMPORT_LINE: &str = "@AGENTS.md";
+pub const BEGIN_PREFIX: &str = "<!-- atelier:begin";
+pub const END_LINE: &str = "<!-- atelier:end -->";
+
+/// The project's own rule files, empty at `init`.
+pub const PROJECT_FILES: [&str; 3] = ["binding.md", "worker.md", "orchestrator.md"];
+
+const BLOCK_TEXT: &str = include_str!("../assets/rules/agents-block.md");
+const WORKER_TEXT: &str = include_str!("../assets/rules/WORKER.md");
+const ORCHESTRATOR_TEXT: &str = include_str!("../assets/rules/ORCHESTRATOR.md");
+
+/// What the rules should be for given settings and project text.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Generated {
+    /// File name under `.atelier/rules/` to contents.
+    pub rule_files: BTreeMap<String, String>,
+    /// The complete block, marker lines included, ending with a line break.
+    pub block: String,
+    /// Files that must contain [`IMPORT_LINE`].
+    pub import_into: Vec<String>,
+}
+
+/// The optional-section switches of the rule texts, from the settings.
+fn flags(settings: &Settings) -> BTreeMap<String, String> {
+    let mut f = BTreeMap::new();
+    if settings.rust.is_some() {
+        f.insert("rust".to_owned(), "yes".to_owned());
+    }
+    if settings.platforms.len() > 1 {
+        f.insert("multi_platform".to_owned(), "yes".to_owned());
+    }
+    f
+}
+
+fn fill(name: &str, text: &str, flags: &BTreeMap<String, String>) -> Result<String> {
+    let t = Template::parse(text)
+        .map_err(|m| Failure::refused(format!("built-in rule text {name}: {m}")))?;
+    Ok(t.render(flags))
+}
+
+/// `body` followed by the project's text, which is trimmed and added after one blank line.
+fn with_project(body: &str, project: &str) -> String {
+    let mut out = body.trim_end().to_owned();
+    out.push('\n');
+    let extra = project.trim();
+    if !extra.is_empty() {
+        out.push('\n');
+        out.push_str(extra);
+        out.push('\n');
+    }
+    out
+}
+
+fn read_project(root: &Path, name: &str) -> Result<String> {
+    let path = root.join(PROJECT_DIR).join(name);
+    match fs::read_to_string(&path) {
+        Ok(t) => Ok(t),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(String::new()),
+        Err(e) => Err(Failure::refused(format!("{}: {e}", path.display()))),
+    }
+}
+
+/// Builds the generated set in memory.
+pub fn generate(root: &Path, settings: &Settings) -> Result<Generated> {
+    let flags = flags(settings);
+    let mut rule_files = BTreeMap::new();
+    rule_files.insert(
+        "WORKER.md".to_owned(),
+        with_project(
+            &fill("WORKER.md", WORKER_TEXT, &flags)?,
+            &read_project(root, "worker.md")?,
+        ),
+    );
+    rule_files.insert(
+        "ORCHESTRATOR.md".to_owned(),
+        with_project(
+            &fill("ORCHESTRATOR.md", ORCHESTRATOR_TEXT, &flags)?,
+            &read_project(root, "orchestrator.md")?,
+        ),
+    );
+    let inner = with_project(
+        &fill("agents-block.md", BLOCK_TEXT, &flags)?,
+        &read_project(root, "binding.md")?,
+    );
+    let block = format!(
+        "{BEGIN_PREFIX} (generated by atelier {}; edit .atelier/, then run `atelier rules`) -->\n{inner}{END_LINE}\n",
+        settings.atelier
+    );
+    Ok(Generated {
+        rule_files,
+        block,
+        import_into: settings.rules.import_into.clone(),
+    })
+}
+
+/// Where the block sits in `AGENTS.md` text.
+#[derive(Debug, PartialEq, Eq)]
+enum BlockAt {
+    /// No marker line at all.
+    None,
+    /// Byte range from the begin line through the end line, line break included.
+    Found(usize, usize),
+    /// Missing or doubled markers, or the end before the begin.
+    Broken(String),
+}
+
+fn locate_block(text: &str) -> BlockAt {
+    let mut begins = Vec::new();
+    let mut ends = Vec::new();
+    let mut offset = 0;
+    for line in text.split_inclusive('\n') {
+        let bare = line.trim_end_matches(['\n', '\r']);
+        if bare.starts_with(BEGIN_PREFIX) {
+            begins.push(offset);
+        } else if bare == END_LINE {
+            ends.push(offset + line.len());
+        }
+        offset += line.len();
+    }
+    match (begins.as_slice(), ends.as_slice()) {
+        ([], []) => BlockAt::None,
+        ([b], [e]) if b < e => BlockAt::Found(*b, *e),
+        ([_], []) => BlockAt::Broken("the begin marker has no end marker".to_owned()),
+        ([], [_]) => BlockAt::Broken("the end marker has no begin marker".to_owned()),
+        (b, e) if b.len() > 1 || e.len() > 1 => BlockAt::Broken(format!(
+            "markers are doubled ({} begin, {} end)",
+            b.len(),
+            e.len()
+        )),
+        _ => BlockAt::Broken("the end marker comes before the begin marker".to_owned()),
+    }
+}
+
+fn has_import_line(text: &str) -> bool {
+    text.lines().any(|l| l.trim_end() == IMPORT_LINE)
+}
+
+fn read_opt(path: &Path) -> Result<Option<String>> {
+    match fs::read(path) {
+        Ok(b) => String::from_utf8(b)
+            .map(Some)
+            .map_err(|_| Failure::refused(format!("{} is not UTF-8 text", path.display()))),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(Failure::refused(format!("{}: {e}", path.display()))),
+    }
+}
+
+/// Every file under `dir`, relative to it; a symlink or special file counts as a file.
+fn list_files(dir: &Path) -> Result<BTreeSet<PathBuf>> {
+    fn walk(base: &Path, dir: &Path, out: &mut BTreeSet<PathBuf>) -> Result<()> {
+        let entries = match fs::read_dir(dir) {
+            Ok(e) => e,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(e) => return Err(Failure::refused(format!("{}: {e}", dir.display()))),
+        };
+        for entry in entries {
+            let entry = entry.ctx(dir.display())?;
+            let path = entry.path();
+            let kind = entry.file_type().ctx(path.display())?;
+            if kind.is_dir() {
+                walk(base, &path, out)?;
+            } else {
+                out.insert(path.strip_prefix(base).unwrap_or(&path).to_path_buf());
+            }
+        }
+        Ok(())
+    }
+    let mut out = BTreeSet::new();
+    walk(dir, dir, &mut out)?;
+    Ok(out)
+}
+
+/// Compares the tree with the generated set. Empty means current.
+pub fn problems(root: &Path, settings: &Settings) -> Result<Vec<String>> {
+    let want = generate(root, settings)?;
+    let mut out = Vec::new();
+    let rules_dir = root.join(RULES_DIR);
+    for (name, text) in &want.rule_files {
+        match read_opt(&rules_dir.join(name))? {
+            None => out.push(format!("{RULES_DIR}/{name} is missing")),
+            Some(have) if have != *text => out.push(format!("{RULES_DIR}/{name} differs")),
+            Some(_) => {}
+        }
+    }
+    for extra in list_files(&rules_dir)? {
+        let name = extra.to_string_lossy().into_owned();
+        if !want.rule_files.contains_key(&name) {
+            out.push(format!("{RULES_DIR}/{name} is not a generated file"));
+        }
+    }
+    match read_opt(&root.join(AGENTS_FILE))? {
+        None => out.push(format!("{AGENTS_FILE} is missing")),
+        Some(text) => match locate_block(&text) {
+            BlockAt::None => out.push(format!("{AGENTS_FILE} has no atelier block")),
+            BlockAt::Broken(why) => out.push(format!("{AGENTS_FILE}: {why}")),
+            BlockAt::Found(b, e) if text[b..e] != want.block => {
+                out.push(format!("{AGENTS_FILE}: the atelier block differs"))
+            }
+            BlockAt::Found(..) => {}
+        },
+    }
+    for file in &want.import_into {
+        match read_opt(&root.join(file))? {
+            None => out.push(format!("{file} is missing (it must contain {IMPORT_LINE})")),
+            Some(text) if !has_import_line(&text) => {
+                out.push(format!("{file} has no {IMPORT_LINE} line"))
+            }
+            Some(_) => {}
+        }
+    }
+    Ok(out)
+}
+
+/// Verifies the generated rules. Refuses (4) with [`STALE`] and the list of differences.
+pub fn verify(checkout: &Checkout, settings: &Settings) -> Result<()> {
+    let found = problems(&checkout.root, settings)?;
+    if found.is_empty() {
+        Ok(())
+    } else {
+        Err(Failure::refused(format!(
+            "{STALE}\n  {}",
+            found.join("\n  ")
+        )))
+    }
+}
+
+/// Refuses (4) when `AGENTS.md` has markers `write` cannot work with, before anything is written.
+pub fn check_agents_file(root: &Path) -> Result<()> {
+    if let Some(text) = read_opt(&root.join(AGENTS_FILE))?
+        && let BlockAt::Broken(why) = locate_block(&text)
+    {
+        return Err(Failure::refused(format!(
+            "{AGENTS_FILE}: {why}; fix the marker lines by hand first"
+        )));
+    }
     Ok(())
+}
+
+/// Writes the generated set and deletes any other file under `.atelier/rules/`. Returns what
+/// changed, one line each. Refuses, changing nothing, when `AGENTS.md` has broken markers.
+pub fn write(checkout: &Checkout, settings: &Settings) -> Result<Vec<String>> {
+    let root = &checkout.root;
+    let want = generate(root, settings)?;
+    let agents_path = root.join(AGENTS_FILE);
+    let agents_old = read_opt(&agents_path)?;
+    let agents_new = match &agents_old {
+        None => want.block.clone(),
+        Some(text) => match locate_block(text) {
+            BlockAt::Broken(why) => {
+                return Err(Failure::refused(format!(
+                    "{AGENTS_FILE}: {why}; fix the marker lines by hand, then run atelier rules"
+                )));
+            }
+            BlockAt::Found(b, e) => format!("{}{}{}", &text[..b], want.block, &text[e..]),
+            BlockAt::None => {
+                let mut t = text.clone();
+                if !t.is_empty() {
+                    if !t.ends_with('\n') {
+                        t.push('\n');
+                    }
+                    t.push('\n');
+                }
+                t.push_str(&want.block);
+                t
+            }
+        },
+    };
+    let mut imports = Vec::new();
+    for file in &want.import_into {
+        let path = root.join(file);
+        let old = read_opt(&path)?;
+        let new = match &old {
+            None => format!("{IMPORT_LINE}\n"),
+            Some(t) if has_import_line(t) => t.clone(),
+            Some(t) if t.is_empty() || t.ends_with('\n') => format!("{t}{IMPORT_LINE}\n"),
+            Some(t) => format!("{t}\n{IMPORT_LINE}\n"),
+        };
+        imports.push((file.clone(), path, old, new));
+    }
+
+    let mut changed = Vec::new();
+    let rules_dir = root.join(RULES_DIR);
+    fs::create_dir_all(&rules_dir).ctx(rules_dir.display())?;
+    for (name, text) in &want.rule_files {
+        let path = rules_dir.join(name);
+        if read_opt(&path)?.as_deref() != Some(text.as_str()) {
+            fsutil::write_atomic(&path, text.as_bytes()).ctx(path.display())?;
+            changed.push(format!("wrote {RULES_DIR}/{name}"));
+        }
+    }
+    for extra in list_files(&rules_dir)? {
+        let name = extra.to_string_lossy().into_owned();
+        if !want.rule_files.contains_key(&name) {
+            let path = rules_dir.join(&extra);
+            fs::remove_file(&path).ctx(path.display())?;
+            changed.push(format!("removed {RULES_DIR}/{name}"));
+        }
+    }
+    prune_empty_dirs(&rules_dir)?;
+    if agents_old.as_deref() != Some(agents_new.as_str()) {
+        fsutil::write_atomic(&agents_path, agents_new.as_bytes()).ctx(agents_path.display())?;
+        changed.push(format!("wrote {AGENTS_FILE}"));
+    }
+    for (file, path, old, new) in imports {
+        if old.as_deref() != Some(new.as_str()) {
+            fsutil::write_atomic(&path, new.as_bytes()).ctx(path.display())?;
+            changed.push(format!("wrote {file}"));
+        }
+    }
+    Ok(changed)
+}
+
+/// Removes folders left empty under `dir` (not `dir` itself).
+fn prune_empty_dirs(dir: &Path) -> Result<()> {
+    let entries = fs::read_dir(dir).ctx(dir.display())?;
+    for entry in entries {
+        let entry = entry.ctx(dir.display())?;
+        let path = entry.path();
+        if entry.file_type().ctx(path.display())?.is_dir() {
+            prune_empty_dirs(&path)?;
+            let _ = fs::remove_dir(&path);
+        }
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_shipped_texts_parse() {
+        for (n, t) in [
+            ("block", BLOCK_TEXT),
+            ("worker", WORKER_TEXT),
+            ("orchestrator", ORCHESTRATOR_TEXT),
+        ] {
+            let tpl = Template::parse(t).unwrap_or_else(|e| panic!("{n}: {e}"));
+            for name in tpl.names() {
+                assert!(
+                    ["rust", "multi_platform"].contains(&name.as_str()),
+                    "{n}: {name}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn markers_are_located() {
+        let block = format!("{BEGIN_PREFIX} (x) -->\nbody\n{END_LINE}\n");
+        let text = format!("top\n{block}bottom\n");
+        assert_eq!(locate_block(&text), BlockAt::Found(4, 4 + block.len()));
+        assert_eq!(locate_block("none\n"), BlockAt::None);
+        assert!(matches!(
+            locate_block(&format!("{block}{block}")),
+            BlockAt::Broken(_)
+        ));
+        assert!(matches!(
+            locate_block(&format!("{BEGIN_PREFIX} -->\n")),
+            BlockAt::Broken(_)
+        ));
+        assert!(matches!(
+            locate_block(&format!("{END_LINE}\n{BEGIN_PREFIX} -->\n")),
+            BlockAt::Broken(_)
+        ));
+    }
+
+    #[test]
+    fn project_text_follows_after_one_blank_line() {
+        assert_eq!(with_project("a\n\n", ""), "a\n");
+        assert_eq!(with_project("a\n", "\n b \n\n"), "a\n\nb\n");
+    }
 }

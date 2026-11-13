@@ -3,7 +3,7 @@
 //!
 //! ```toml
 //! [roles.build]
-//! purpose = "Implementation and fixes, one topic per agent"
+//! for = "an ordinary item or fix"
 //! start = "lastdrop agent `build` through delegate_task or Agent"
 //! template = "build"
 //! ```
@@ -37,6 +37,7 @@ pub struct AgentsFile {
 #[serde(deny_unknown_fields)]
 pub struct Role {
     /// What the role is for.
+    #[serde(rename = "for")]
     pub purpose: String,
     /// How the orchestrator starts it in this owner's harness.
     pub start: String,
@@ -63,7 +64,7 @@ impl AgentsFile {
                 problems.push(format!("roles.{name}: role names use a-z, 0-9 and '-'"));
             }
             for (field, value) in [
-                ("purpose", &role.purpose),
+                ("for", &role.purpose),
                 ("start", &role.start),
                 ("template", &role.template),
             ] {
@@ -106,7 +107,7 @@ mod tests {
     #[test]
     fn parses_roles() {
         let f = AgentsFile::parse(
-            "[roles.build]\npurpose = \"p\"\nstart = \"s\"\ntemplate = \"build\"\n[roles.review]\npurpose = \"r\"\nstart = \"s\"\ntemplate = \"review\"\n",
+            "[roles.build]\nfor = \"p\"\nstart = \"s\"\ntemplate = \"build\"\n[roles.review]\nfor = \"r\"\nstart = \"s\"\ntemplate = \"review\"\n",
         )
         .unwrap();
         assert_eq!(f.roles.len(), 2);
@@ -116,11 +117,11 @@ mod tests {
     #[test]
     fn rejects_unknown_keys_and_empty_fields() {
         for bad in [
-            "[roles.build]\npurpose = \"p\"\nstart = \"s\"\ntemplate = \"build\"\nmodel = \"x\"\n",
-            "[roles.build]\npurpose = \"\"\nstart = \"s\"\ntemplate = \"build\"\n",
-            "[roles.Build]\npurpose = \"p\"\nstart = \"s\"\ntemplate = \"build\"\n",
-            "[roles.build]\npurpose = \"p\"\nstart = \"s\"\ntemplate = \"../x\"\n",
-            "[roles.build]\npurpose = \"p\"\nstart = \"s\"\n",
+            "[roles.build]\nfor = \"p\"\nstart = \"s\"\ntemplate = \"build\"\nmodel = \"x\"\n",
+            "[roles.build]\nfor = \"\"\nstart = \"s\"\ntemplate = \"build\"\n",
+            "[roles.Build]\nfor = \"p\"\nstart = \"s\"\ntemplate = \"build\"\n",
+            "[roles.build]\nfor = \"p\"\nstart = \"s\"\ntemplate = \"../x\"\n",
+            "[roles.build]\nfor = \"p\"\nstart = \"s\"\n",
             "[agents]\n",
         ] {
             assert!(AgentsFile::parse(bad).is_err(), "{bad}");

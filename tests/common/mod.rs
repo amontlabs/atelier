@@ -96,6 +96,20 @@ impl Repo {
             ".atelier/atelier.toml",
             &format!("atelier = \"{pin}\"\n\n[platforms.macos-aarch64]\nrun = \"check\"\n"),
         );
+        self.write_rules();
+    }
+
+    /// Writes the generated rules for the settings in the checkout.
+    pub fn write_rules(&self) {
+        let settings = atelier::settings::Settings::load(&self.root).unwrap();
+        atelier::rules::write(&self.checkout(), &settings).unwrap();
+    }
+
+    /// The owner's agents file in this HOME.
+    pub fn write_agents_file(&self, text: &str) {
+        let p = self.home.join(".config/atelier/agents.toml");
+        fs::create_dir_all(p.parent().unwrap()).unwrap();
+        fs::write(p, text).unwrap();
     }
 
     /// Makes the binary under test the installed copy of `version` in this HOME.
