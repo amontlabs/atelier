@@ -40,8 +40,11 @@ on `PATH`, bypass variables and the build folder cargo really uses, read again a
 the fixed no-retry flags, `check.steps`, the survivor scan. Per-test results are kept in the run
 folder (`tests.tsv`, nextest's libtest JSON in `tests-<workspace>.jsonl`).
 
-The other commands (`merge`, `tmp`/`clean`, machines, `status`) come in later
-modules.
+Module 3.6, machines: the owner's machines file, `atelier machines`, `atelier machines init
+<name>`, `atelier test <platform>|--all [-- <command>…]`, and remote runs over ssh (`ssh -tt`,
+the hang-up watcher, the result read with a second ssh). See [docs/MACHINES.md](docs/MACHINES.md).
+
+The other commands (`merge`, `tmp`/`clean`, `status`) come in later modules.
 
 ## Layout
 
@@ -62,8 +65,11 @@ modules.
 | `stack` | branch record rules: settling `follow`, the base check, targets, "current", dependents |
 | `start`, `follow` | the two commands |
 | `rules` | rules currency check (stub until module 3.7) |
-| `rules` | rules currency check (stub until module 3.7) |
 | `check`, `prereq`, `nextest` | the `check` command; tool and mbx prerequisites; nextest flags, file refusals and result parsing |
+| `testcmd` | `test`, `machines`, `machines init` |
+| `jobs` | a platform's job (preparation, command or run) and the machine preflight |
+| `remote`, `remote_run` | this computer's side of a remote run over ssh, and the machine's side (`remote-run`) |
+| `source` | the program's own source, embedded, for `machines init` to build on another machine |
 
 ## Dependencies
 

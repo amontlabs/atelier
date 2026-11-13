@@ -749,11 +749,16 @@ impl Session {
             Verdict::Failed
         } else if connection_lost(self.done, ssh_status, &results) {
             let why = last_line(ssh_err.as_bytes());
-            failures.push(if why.is_empty() {
-                format!("{name}: connection lost")
-            } else {
-                format!("{name}: connection lost ({why})")
-            });
+            if !failures
+                .iter()
+                .any(|f| f == &format!("{name}: connection lost"))
+            {
+                failures.push(if why.is_empty() {
+                    format!("{name}: connection lost")
+                } else {
+                    format!("{name}: connection lost ({why})")
+                });
+            }
             Verdict::ConnectionLost
         } else if results.iter().all(|r| {
             r.as_ref()
