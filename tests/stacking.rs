@@ -34,6 +34,7 @@ impl Proj {
                 "atelier = \"{VERSION}\"\n\n[platforms.macos-aarch64]\nrun = \"check\"\n{extra}"
             ),
         );
+        repo.write_rules();
         repo.commit_all("pin");
         let base = repo.root.parent().unwrap().to_path_buf();
         Proj { repo, base }
