@@ -2,7 +2,8 @@
 //!
 //! Module 3.1, the skeleton: exit codes, the dispatcher and pin, settings and the owner's files,
 //! the shared state and its locks, runs with process groups and the survivor scan, the tree id,
-//! and plain refs. Commands themselves come in later modules.
+//! and plain refs. Module 3.3: `start`, `follow` and the branch record rules (`stack`). Other
+//! commands come in later modules.
 
 pub mod agents;
 pub mod check;

@@ -133,6 +133,18 @@ When nothing lives, the record is removed.
 
 Commit ids are checked when a record is read and when it is written.
 
+Lifecycle, the same for every version:
+
+- `start` writes a new record, with a new lifetime, only when the branch does not exist and no
+  `active` record names the old lifetime as its lower; it then replaces the old record whole.
+- `follow` writes `pending` before its rebase and settles it from ancestry alone. Once the lower
+  branch is merged (or gone, with its base in the integration branch), `follow` sets `lower` to
+  the integration branch (`lower_is_integration = true`, no `lower_lifetime`).
+- A record is removed only in state `cleaned`, and only when no `active` record names it, by
+  name and lifetime, as its lower.
+- A writer holds the branch's lock (`locks/branch/<key>.lock`) while it reads and writes the
+  record.
+
 ## Temp-folder registry entries
 
 | Field | Type | Meaning |

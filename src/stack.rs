@@ -481,7 +481,8 @@ impl<'s> Stack<'s> {
     ///
     /// `merge` uses it for the rule that a lower branch lands only when approved: every
     /// `chain[i + 1]` must be in the same batch, earlier, approved at a commit that contains
-    /// `chain[i].record.base`.
+    /// `chain[i].record.base`. Call [`Stack::require_current`] first: the chain also ends at a
+    /// lower branch whose record is missing or of another lifetime, which only that refuses.
     pub fn chain(&self, branch: &str) -> Result<Vec<Link>> {
         let mut out = Vec::new();
         let mut seen = BTreeSet::new();

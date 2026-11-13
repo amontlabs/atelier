@@ -125,16 +125,28 @@ impl Repo {
 
     /// The program, started like the dispatcher on PATH, in `dir`, with this HOME.
     pub fn atelier_in(&self, dir: &Path, args: &[&str]) -> Output {
-        Command::new(atelier_bin())
-            .args(args)
+        self.atelier_env(dir, args, &[])
+    }
+
+    /// The program in `dir` with extra environment variables (`PATH`, for one). Commits it
+    /// makes (a rebase) get the test identity.
+    pub fn atelier_env(&self, dir: &Path, args: &[&str], env: &[(&str, &str)]) -> Output {
+        let mut c = Command::new(atelier_bin());
+        c.args(args)
             .current_dir(dir)
             .env("HOME", &self.home)
             .env("GIT_CONFIG_GLOBAL", "/dev/null")
             .env("GIT_CONFIG_NOSYSTEM", "1")
+            .env("GIT_AUTHOR_NAME", "atelier-test")
+            .env("GIT_AUTHOR_EMAIL", "test@atelier.invalid")
+            .env("GIT_COMMITTER_NAME", "atelier-test")
+            .env("GIT_COMMITTER_EMAIL", "test@atelier.invalid")
             .env_remove("ATELIER_DISPATCHED")
-            .env_remove("ATELIER_RUN")
-            .output()
-            .expect("atelier runs")
+            .env_remove("ATELIER_RUN");
+        for (k, v) in env {
+            c.env(k, v);
+        }
+        c.output().expect("atelier runs")
     }
 
     pub fn atelier(&self, args: &[&str]) -> Output {

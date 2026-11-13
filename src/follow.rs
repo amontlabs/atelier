@@ -91,8 +91,11 @@ pub fn run(ctx: &Context) -> Result<Exit> {
         rec.lower_lifetime = None;
     }
 
-    // Nothing to replay: the target is already below this branch's own commits.
-    if is_ancestor(root, &target.commit, &tip)? {
+    // Nothing to replay: the target moved forward from the base and is already below this
+    // branch's own commits. A target that is not a descendant of the base (the lower branch was
+    // reset or rewritten) always needs the rebase, even when the branch contains it: the
+    // commits between them are no longer the lower branch's (REVIEW-4 finding 1).
+    if is_ancestor(root, &rec.base, &target.commit)? && is_ancestor(root, &target.commit, &tip)? {
         let moved = rec.base != target.commit;
         if moved || target.repoint {
             rec.base = target.commit.clone();

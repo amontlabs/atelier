@@ -10,7 +10,7 @@ parts the project uses.
 The design is kept outside this repository (`DESIGN.md`, revision 5, with mechanics in
 `DESIGN-r4.md`). The formats every version shares are in [docs/FROZEN-LAYER.md](docs/FROZEN-LAYER.md).
 
-## Status: skeleton (module 3.1) and `check` (module 3.2)
+## Status: modules 3.1, 3.2, 3.3 and 3.7
 
 Built so far, with tests on throwaway git repositories:
 
@@ -20,7 +20,10 @@ Built so far, with tests on throwaway git repositories:
 - parsing of `.atelier/atelier.toml`, the owner's `machines.toml` and the owner's `agents.toml`;
 - the shared state in `.git/atelier/`: a frozen layer, a versioned layer with a format number,
   and `state.lock`;
-- locks, runs, process groups and the survivor scan, stop signals, the tree id, and plain refs.
+- locks, runs, process groups and the survivor scan, stop signals, the tree id, and plain refs;
+- `start` and `follow` (module 3.3): branch records with lifetime ids, the base kept in the
+  branch, `follow`'s pending rebase settled from ancestry alone, the transitive "current" guard,
+  and optional Mergiraf resolution of conflicted code files in `follow`.
 
 Module 3.7 adds `init`, `rules`, `task` and `agents`: the generated rules (`WORKER.md`,
 `ORCHESTRATOR.md`, the `AGENTS.md` block, the `@AGENTS.md` import lines), verified byte for byte by
@@ -37,7 +40,7 @@ on `PATH`, bypass variables and the build folder cargo really uses, read again a
 the fixed no-retry flags, `check.steps`, the survivor scan. Per-test results are kept in the run
 folder (`tests.tsv`, nextest's libtest JSON in `tests-<workspace>.jsonl`).
 
-The other commands (`start`/`follow`, `merge`, `tmp`/`clean`, machines, `status`) come in later
+The other commands (`merge`, `tmp`/`clean`, machines, `status`) come in later
 modules.
 
 ## Layout
@@ -56,6 +59,9 @@ modules.
 | `runs`, `signals` | run ids, folders, steps, atomic results; TERM/INT/HUP |
 | `tree` | tree id via a temporary index; submodule refusal |
 | `refs`, `names`, `git` | plain refs and `--no-deref` updates; branch names and file keys; running git |
+| `stack` | branch record rules: settling `follow`, the base check, targets, "current", dependents |
+| `start`, `follow` | the two commands |
+| `rules` | rules currency check (stub until module 3.7) |
 | `rules` | rules currency check (stub until module 3.7) |
 | `check`, `prereq`, `nextest` | the `check` command; tool and mbx prerequisites; nextest flags, file refusals and result parsing |
 
