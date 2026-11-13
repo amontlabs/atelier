@@ -35,6 +35,21 @@ pub struct Pending {
     pub later: toml::Table,
 }
 
+/// A `start` that has not finished. Written with the record before the branch ref exists and
+/// removed once the branch is checked out, so a later `start` of the same name can finish or
+/// undo it (`docs/FROZEN-LAYER.md`).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct Starting {
+    /// The worktree the branch is checked out in: an absolute path, UTF-8 only.
+    pub worktree: String,
+    /// True when `start` creates that worktree (`--path`); false when it switches the detached
+    /// worktree it runs in.
+    pub new_worktree: bool,
+    /// Fields written by a later version, kept as they are.
+    #[serde(flatten)]
+    pub later: toml::Table,
+}
+
 /// One fact per branch: what it is built on (DESIGN §2.4).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct BranchRecord {
@@ -52,6 +67,8 @@ pub struct BranchRecord {
     pub base: String,
     pub state: BranchState,
     pub pending: Option<Pending>,
+    /// Set while the branch's `start` has not finished.
+    pub starting: Option<Starting>,
     /// Fields written by a later version, kept as they are.
     #[serde(flatten)]
     pub later: toml::Table,
@@ -242,6 +259,11 @@ mod tests {
                 old_base: "a".repeat(40),
                 later: toml::Table::new(),
             }),
+            starting: Some(Starting {
+                worktree: "/w/disk-ui".into(),
+                new_worktree: true,
+                later: toml::Table::new(),
+            }),
             later: toml::Table::new(),
         };
         r.write(&state).unwrap();
@@ -260,7 +282,7 @@ mod tests {
         fs::write(
             &path,
             format!(
-                "name = \"x\"\nlifetime = \"00ff\"\nlower = \"y\"\nlower_is_integration = false\nlower_lifetime = \"11ee\"\nbase = \"{a}\"\nstate = \"active\"\nreviewed_by = \"later\"\n\n[pending]\ntarget = \"{b}\"\nold_base = \"{a}\"\nstep = 3\n\n[extra]\nkey = [1, 2]\n"
+                "name = \"x\"\nlifetime = \"00ff\"\nlower = \"y\"\nlower_is_integration = false\nlower_lifetime = \"11ee\"\nbase = \"{a}\"\nstate = \"active\"\nreviewed_by = \"later\"\n\n[pending]\ntarget = \"{b}\"\nold_base = \"{a}\"\nstep = 3\n\n[starting]\nworktree = \"/w/x\"\nnew_worktree = true\nhint = 7\n\n[extra]\nkey = [1, 2]\n"
             ),
         )
         .unwrap();
@@ -271,11 +293,16 @@ mod tests {
             r.pending.as_ref().unwrap().later["step"].as_integer(),
             Some(3)
         );
+        assert_eq!(
+            r.starting.as_ref().unwrap().later["hint"].as_integer(),
+            Some(7)
+        );
         r.write(&state).unwrap();
         assert_eq!(BranchRecord::read(&state, "x").unwrap().unwrap(), r);
         let text = fs::read_to_string(&path).unwrap();
         assert!(text.contains("reviewed_by = \"later\""), "{text}");
         assert!(text.contains("step = 3"), "{text}");
+        assert!(text.contains("hint = 7"), "{text}");
     }
 
     #[test]

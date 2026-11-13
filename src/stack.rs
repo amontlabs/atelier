@@ -5,8 +5,11 @@
 //! lower branch (by name and lifetime id) and its base, the exact commit it is built on. From
 //! those facts and git's ancestry alone, this module decides:
 //!
-//! - how a pending `follow` ended ([`settle_view`]): finished, aborted, or not decidable;
-//! - whether the base is still in the branch, and the one allowed repair ([`Stack::check_base`]);
+//! - how a pending `follow` ended ([`Stack::settle_view`]): finished, aborted, or not decidable;
+//! - whether the base is still in the branch ([`Stack::check_base`]); there is no automatic
+//!   repair: ancestry cannot prove which commits are the worker's own (DESIGN §2.4);
+//! - whether a rebase of a branch is open in any worktree of the clone ([`Stack::rebase_open`]),
+//!   whether or not a `follow` started it;
 //! - what `follow` rebases onto ([`Stack::target`]);
 //! - whether a branch is *current*, transitively up to the integration branch
 //!   ([`Stack::currency`]), which `approve` and `merge` require;
@@ -73,15 +76,6 @@ pub struct Target {
     pub repoint: bool,
 }
 
-/// The outcome of the base check.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum BaseCheck {
-    /// The base is an ancestor of the tip.
-    Contained,
-    /// It is not, but the lower branch's tip is: that tip becomes the base.
-    Repair(String),
-}
-
 /// Why a branch is not current: the first branch of its chain that must `atelier follow`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Behind {
@@ -98,7 +92,7 @@ pub enum Why {
     LowerGone { lower: String },
     /// Its lower branch's record is missing or belongs to another lifetime.
     LowerRestarted { lower: String },
-    /// Its base is no longer in it and the lower tip is not either.
+    /// Its base is no longer in it.
     BaseLost { base: String },
     /// A rebase of it is open.
     RebaseOpen,
@@ -106,6 +100,8 @@ pub enum Why {
     Unsettled { target: String, old_base: String },
     /// No active record, or no branch ref.
     NotStarted,
+    /// Its `start` did not finish.
+    StartUnfinished,
 }
 
 impl Behind {
@@ -122,14 +118,13 @@ impl Behind {
             Why::LowerRestarted { lower } => format!(
                 "{b} is built on an earlier {lower}, whose record is gone: start {b} again on what it needs"
             ),
-            Why::BaseLost { base } => format!(
-                "{b} no longer contains its base {base}: rebase only its own commits, above it"
-            ),
+            Why::BaseLost { base } => format!("{b}: {}", base_lost(base).message),
             Why::RebaseOpen => format!("{b} has a rebase open: {FINISH_REBASE}"),
             Why::Unsettled { target, old_base } => format!(
                 "{b}: cannot tell whether its follow onto {target} (from {old_base}) finished or was aborted"
             ),
             Why::NotStarted => not_started(b).message,
+            Why::StartUnfinished => start_unfinished(b).message,
         }
     }
 }
@@ -144,8 +139,7 @@ pub enum Currency {
 /// One branch of a chain, from [`Stack::chain`].
 #[derive(Debug, Clone, PartialEq)]
 pub struct Link {
-    /// The record as every reading command sees it: pending settled, base repaired (not
-    /// written).
+    /// The record as every reading command sees it: pending settled (not written).
     pub record: BranchRecord,
     /// The branch's tip.
     pub tip: String,
@@ -194,13 +188,16 @@ impl<'s> Stack<'s> {
         BranchRecord::read(self.state, branch)
     }
 
-    /// The active record of a branch that exists; refuses (4) `start it with atelier start`
+    /// The active record of a branch that exists and whose `start` finished; refuses (4)
     /// otherwise. Returns the record and the tip.
     pub fn started(&self, branch: &str) -> Result<(BranchRecord, String)> {
         let rec = self.record(branch)?;
         let Some(rec) = rec.filter(|r| r.state == BranchState::Active) else {
             return Err(not_started(branch));
         };
+        if rec.starting.is_some() {
+            return Err(start_unfinished(branch));
+        }
         let tip = self.tip(branch)?.ok_or_else(|| not_started(branch))?;
         Ok((rec, tip))
     }
@@ -235,7 +232,8 @@ impl<'s> Stack<'s> {
     }
 
     /// The active branches whose record names `lower` with this lifetime as their lower
-    /// branch: while any exists, `clean` keeps `lower`'s record and `start` refuses its name.
+    /// branch, unfinished starts included: while any exists, `clean` keeps `lower`'s record and
+    /// `start` refuses its name.
     pub fn dependents(&self, lower: &str, lifetime: &str) -> Result<Vec<String>> {
         Ok(self
             .all_records()?
@@ -289,7 +287,7 @@ impl<'s> Stack<'s> {
 
     /// The worktree folder in which a rebase of `branch` is open, if any: the git folder of
     /// some worktree of the clone names the branch in `rebase-merge/head-name` or
-    /// `rebase-apply/head-name`.
+    /// `rebase-apply/head-name`. A hand rebase counts as much as one `follow` started.
     pub fn rebase_open(&self, branch: &str) -> Result<Option<PathBuf>> {
         let want = names::branch_ref(branch);
         let mut git_dirs = vec![self.common_dir.clone()];
@@ -312,6 +310,17 @@ impl<'s> Stack<'s> {
             }
         }
         Ok(None)
+    }
+
+    /// Refuses (4) while a rebase of `branch` is open in any worktree of the clone.
+    pub fn refuse_rebase_open(&self, branch: &str) -> Result<()> {
+        match self.rebase_open(branch)? {
+            None => Ok(()),
+            Some(wt) => Err(Failure::refused(format!(
+                "{branch}: a rebase is open in {}: {FINISH_REBASE}",
+                wt.display()
+            ))),
+        }
     }
 
     /// How a branch's pending follow ended, from ancestry alone (DESIGN §2.4, S4). Pure.
@@ -413,35 +422,32 @@ impl<'s> Stack<'s> {
     }
 
     /// The base check every command that reads a record makes (DESIGN §2.4, REV4 2). Pure.
-    /// Refuses (4) a base that is no longer in the branch when the lower tip is not either.
-    pub fn check_base(&self, rec: &BranchRecord, tip: &str) -> Result<BaseCheck> {
+    /// Refuses (4) a base that is no longer in the branch. There is no repair: a lower tip in
+    /// the branch also holds after a wrong hand rebase that replayed commits the lower branch
+    /// dropped (3.3 review 9).
+    pub fn check_base(&self, rec: &BranchRecord, tip: &str) -> Result<()> {
         if is_ancestor(&self.dir, &rec.base, tip)? {
-            return Ok(BaseCheck::Contained);
+            Ok(())
+        } else {
+            Err(base_lost(&rec.base))
         }
-        if let Ok(t) = self.target(rec)
-            && is_ancestor(&self.dir, &t.commit, tip)?
-        {
-            return Ok(BaseCheck::Repair(t.commit));
-        }
-        Err(base_lost(&rec.base))
     }
 
     /// What every command that reads a branch's record does first: requires an active record
-    /// and the branch, settles a pending follow, checks the base (repairing it when the lower
-    /// tip is in the branch), and writes the record when either changed. Returns the record
-    /// and the tip. The caller holds the branch lock.
+    /// of a finished start and the branch, refuses a rebase of it open in any worktree, settles
+    /// a pending follow (writing the record) and checks the base. Returns the record and the
+    /// tip. The caller holds the branch lock.
     pub fn prepare(&self, branch: &str) -> Result<(BranchRecord, String)> {
         let (rec, tip) = self.started(branch)?;
-        let mut rec = self.settle(rec, &tip)?;
-        if let BaseCheck::Repair(new) = self.check_base(&rec, &tip)? {
-            rec.base = new;
-            rec.write(self.state)?;
-        }
+        self.refuse_rebase_open(branch)?;
+        let rec = self.settle(rec, &tip)?;
+        self.check_base(&rec, &tip)?;
         Ok((rec, tip))
     }
 
-    /// The record as every reading command would leave it, without writing: pending settled
-    /// and base repaired. A branch that cannot be read that way is returned as [`Behind`].
+    /// The record as every reading command would leave it, without writing: pending settled.
+    /// A branch that cannot be read that way (not started, start unfinished, a rebase open in
+    /// any worktree, pending not settleable, base lost) is returned as [`Behind`].
     fn view(&self, branch: &str) -> Result<std::result::Result<Link, Behind>> {
         let behind = |why| Behind {
             branch: branch.to_owned(),
@@ -453,6 +459,12 @@ impl<'s> Stack<'s> {
         let (Some(mut rec), Some(tip)) = (rec, self.tip(branch)?) else {
             return Ok(Err(behind(Why::NotStarted)));
         };
+        if rec.starting.is_some() {
+            return Ok(Err(behind(Why::StartUnfinished)));
+        }
+        if self.rebase_open(branch)?.is_some() {
+            return Ok(Err(behind(Why::RebaseOpen)));
+        }
         match self.settle_view(&rec, &tip)? {
             Settlement::None | Settlement::Aborted => {}
             Settlement::Finished { target } => rec.base = target,
@@ -462,21 +474,17 @@ impl<'s> Stack<'s> {
             }
         }
         rec.pending = None;
-        match self.check_base(&rec, &tip) {
-            Ok(BaseCheck::Contained) => {}
-            Ok(BaseCheck::Repair(new)) => rec.base = new,
-            Err(_) => {
-                return Ok(Err(behind(Why::BaseLost {
-                    base: rec.base.clone(),
-                })));
-            }
+        if !is_ancestor(&self.dir, &rec.base, &tip)? {
+            return Ok(Err(behind(Why::BaseLost {
+                base: rec.base.clone(),
+            })));
         }
         Ok(Ok(Link { record: rec, tip }))
     }
 
     /// The branch and its unmerged lower branches, from the branch down to (not including)
     /// the integration branch or the first merged lower branch. Each record is as every
-    /// reading command sees it (pending settled, base repaired; nothing written). Refuses (4)
+    /// reading command sees it (pending settled; nothing written). Refuses (4)
     /// a branch of the chain that is not readable that way, and records that form a cycle.
     ///
     /// `merge` uses it for the rule that a lower branch lands only when approved: every
@@ -646,10 +654,17 @@ fn cycle(out: &[Link], again: &str) -> Failure {
     Failure::refused(format!("branch records form a cycle: {}", path.join(" → ")))
 }
 
-/// The refusal for a base the branch no longer contains.
+/// The refusal for a base the branch no longer contains (DESIGN §2.4, word for word).
 pub fn base_lost(base: &str) -> Failure {
     Failure::refused(format!(
-        "your branch no longer contains its base {base}: rebase only your own commits, above it"
+        "your branch no longer contains its base {base}: restore it (git reflog, then git reset --hard <the commit before your rebase>) and use atelier follow"
+    ))
+}
+
+/// The refusal for a branch whose `start` did not finish.
+pub fn start_unfinished(branch: &str) -> Failure {
+    Failure::refused(format!(
+        "the start of {branch} did not finish: run atelier start {branch} again to finish or undo it"
     ))
 }
 

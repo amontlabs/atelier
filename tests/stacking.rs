@@ -309,7 +309,7 @@ fn follow_moves_onto_the_moved_lower_branch() {
     assert_eq!(code(&out), 0, "{}", stderr(&out));
     assert_eq!(
         stdout(&out),
-        format!("follow: b now on {} (1 commits)\n", short(p.main(), &m2))
+        format!("follow: b now on {} (1 commit)\n", short(p.main(), &m2))
     );
     let r = p.record("b");
     assert_eq!(r.base, m2);
@@ -319,10 +319,7 @@ fn follow_moves_onto_the_moved_lower_branch() {
     assert_eq!(code(&out), 0, "{}", stderr(&out));
     assert_eq!(
         stdout(&out),
-        format!(
-            "follow: b already on {} (1 commits)\n",
-            short(p.main(), &m2)
-        )
+        format!("follow: b already on {} (1 commit)\n", short(p.main(), &m2))
     );
 }
 
@@ -549,33 +546,72 @@ fn an_unsettleable_pending_follow_is_refused_naming_both_commits() {
 // ---------------------------------------------------------------------------------------------
 // REVIEW-4 finding 2: the base must stay in the branch.
 
+/// The exact refusal of DESIGN §2.4 for a base the branch no longer contains.
+fn base_lost(base: &str) -> String {
+    format!(
+        "your branch no longer contains its base {base}: restore it (git reflog, then git reset --hard <the commit before your rebase>) and use atelier follow"
+    )
+}
+
 #[test]
-fn a_hand_rebase_onto_the_lower_tip_repairs_the_base() {
+fn a_hand_rebase_onto_the_lower_tip_is_refused_until_restored() {
     let p = Proj::new();
     let wt_a = p.start("a", None);
     let a1 = commit(&wt_a, "a1", "1\n", "A1");
     let wt_b = p.start("b", Some("a"));
     commit(&wt_b, "b", "1\n", "B1");
+    let b2 = commit(&wt_b, "b2", "1\n", "B2");
     // A rewritten (A1 amended to A2); the worker rebases B onto it by hand.
     fs::write(wt_a.join("a1"), "1 amended\n").unwrap();
     git(&wt_a, &["commit", "-q", "-a", "--amend", "-m", "A2"]);
     let a2 = head(&wt_a);
     git(&wt_b, &["rebase", "-q", "--onto", &a2, &a1]);
+    let rebased = head(&wt_b);
+    // No automatic repair: the base is not in the branch, so every reader refuses.
+    let out = p.follow(&wt_b);
+    assert_eq!(code(&out), 4, "{}", stderr(&out));
+    assert_eq!(stderr(&out), format!("atelier: {}\n", base_lost(&a1)));
+    assert_eq!(head(&wt_b), rebased);
+    assert_eq!(p.record("b").base, a1);
+    assert_eq!(
+        p.currency("b"),
+        behind("b", Why::BaseLost { base: a1.clone() })
+    );
+    // Restored as the message says, follow moves exactly B's two commits.
+    git(&wt_b, &["reset", "-q", "--hard", &b2]);
     let out = p.follow(&wt_b);
     assert_eq!(code(&out), 0, "{}", stderr(&out));
-    assert!(
-        stdout(&out).contains("its base is now the a tip"),
-        "{}",
-        stdout(&out)
+    assert_eq!(
+        stdout(&out),
+        format!("follow: b now on {} (2 commits)\n", short(p.main(), &a2))
     );
     assert_eq!(p.record("b").base, a2);
+    assert_eq!(read(&wt_b, "a1").as_deref(), Some("1 amended\n"));
+}
 
-    // A3 deletes A2's file; following keeps the deletion (it is not replayed as B's work).
-    remove(&wt_a, "a1", "A3 deletes a1");
+/// 3.3 review 9: a wrong-range hand rebase replays a commit the lower branch dropped. The lower
+/// tip is in the branch, but that does not make the range the worker's own: refused.
+#[test]
+fn a_wrong_hand_rebase_that_replays_dropped_lower_commits_is_refused() {
+    let p = Proj::new();
+    let wt_a = p.start("a", None);
+    let a1 = commit(&wt_a, "a1", "1\n", "A1");
+    let a2 = commit(&wt_a, "removed", "1\n", "A2 adds removed");
+    let wt_b = p.start("b", Some("a"));
+    commit(&wt_b, "b", "1\n", "B1");
+    // A drops A2 and moves on with A3.
+    git(&wt_a, &["reset", "-q", "--hard", &a1]);
+    commit(&wt_a, "a3", "1\n", "A3");
+    // The worker rebases from A1 instead of from the recorded base A2: A2 is replayed.
+    git(&wt_b, &["rebase", "-q", "--onto", "a", &a1]);
+    assert_eq!(read(&wt_b, "removed").as_deref(), Some("1\n"));
+    let before = head(&wt_b);
     let out = p.follow(&wt_b);
-    assert_eq!(code(&out), 0, "{}", stderr(&out));
-    assert_eq!(read(&wt_b, "a1"), None);
-    assert_eq!(read(&wt_b, "b").as_deref(), Some("1\n"));
+    assert_eq!(code(&out), 4, "{}", stderr(&out));
+    assert_eq!(stderr(&out), format!("atelier: {}\n", base_lost(&a2)));
+    assert_eq!(head(&wt_b), before);
+    assert_eq!(p.record("b").base, a2);
+    assert_eq!(p.currency("b"), behind("b", Why::BaseLost { base: a2 }));
 }
 
 #[test]
@@ -594,11 +630,7 @@ fn a_base_lost_below_a_newer_lower_tip_is_refused() {
     let before = head(&wt_b);
     let out = p.follow(&wt_b);
     assert_eq!(code(&out), 4, "{}", stderr(&out));
-    assert!(
-        stderr(&out).contains(&format!("your branch no longer contains its base {a1}")),
-        "{}",
-        stderr(&out)
-    );
+    assert!(stderr(&out).contains(&base_lost(&a1)), "{}", stderr(&out));
     assert_eq!(head(&wt_b), before);
     assert_eq!(p.record("b").base, a1);
     assert_eq!(
@@ -874,7 +906,8 @@ fn an_upper_branch_names_its_unmerged_lower_branches() {
 // Mergiraf (DESIGN §8.2).
 
 /// A stand-in for mergiraf on `PATH`: `--version` works; `solve` drops the marker lines and
-/// keeps both sides, except in a file containing UNSOLVABLE, which it garbles and fails.
+/// keeps both sides, writing the file in place as mergiraf does, except in a file containing
+/// UNSOLVABLE, which it garbles and fails. It follows a symbolic link, as mergiraf does.
 fn fake_mergiraf(dir: &Path) -> String {
     let bin = dir.join("fake-bin");
     fs::create_dir_all(&bin).unwrap();
@@ -887,7 +920,8 @@ fn fake_mergiraf(dir: &Path) -> String {
 for f; do :; done
 echo "$f" >> "$(dirname "$0")/calls"
 if grep -q UNSOLVABLE "$f"; then echo partial > "$f"; exit 1; fi
-grep -v -e '^<<<<<<<' -e '^|||||||' -e '^=======$' -e '^>>>>>>>' "$f" > "$f.tmp" && mv "$f.tmp" "$f"
+grep -v -e '^<<<<<<<' -e '^|||||||' -e '^=======$' -e '^>>>>>>>' "$f" > "$f.tmp"
+cat "$f.tmp" > "$f" && rm "$f.tmp"
 "#,
     )
     .unwrap();
@@ -896,7 +930,11 @@ grep -v -e '^<<<<<<<' -e '^|||||||' -e '^=======$' -e '^>>>>>>>' "$f" > "$f.tmp"
     format!("{}:{}", bin.display(), std::env::var("PATH").unwrap())
 }
 
+/// Three files changed on both sides from a common base (ordinary three-way conflicts).
 fn conflicting_pair(p: &Proj) -> PathBuf {
+    commit(p.main(), "src/x.rs", "fn x() { 0 }\n", "base: x");
+    commit(p.main(), "notes.md", "base notes\n", "base: notes");
+    commit(p.main(), "y.rs", "UNSOLVABLE base\n", "base: y");
     let wt = p.start("b", None);
     commit(&wt, "src/x.rs", "fn x() { 2 }\n", "b: x");
     commit(&wt, "notes.md", "b notes\n", "b: notes");
@@ -954,6 +992,8 @@ fn mergiraf_resolves_only_code_files_and_leaves_them_staged() {
 fn a_file_mergiraf_cannot_resolve_stays_as_gits_conflict() {
     let p = Proj::with_settings("\n[merge]\nresolver = \"mergiraf\"\n");
     let path = fake_mergiraf(&p.base);
+    commit(p.main(), "y.rs", "UNSOLVABLE base\n", "base: y");
+    commit(p.main(), "notes.md", "base notes\n", "base: notes");
     let wt = p.start("b", None);
     commit(&wt, "y.rs", "UNSOLVABLE b\n", "b: y");
     commit(&wt, "notes.md", "b notes\n", "b: notes");
@@ -1004,4 +1044,492 @@ fn mergiraf_is_off_by_default_and_required_when_on() {
     assert_eq!(head(&wt), before);
     assert!(!rebase_open(&wt));
     assert_eq!(p.record("b").pending, None);
+}
+
+// ---------------------------------------------------------------------------------------------
+// The 3.3 review's probes.
+
+/// Review 1: a conflicted symbolic link is never given to mergiraf, and the file it points to
+/// is never read or written; the link conflict stays git's.
+#[test]
+fn mergiraf_never_follows_a_conflicted_symbolic_link() {
+    let p = Proj::with_settings("\n[merge]\nresolver = \"mergiraf\"\n");
+    let path = fake_mergiraf(&p.base);
+    let markers = "fn a() {}\n<<<<<<< left\nfn b() { 1 }\n=======\nfn b() { 2 }\n>>>>>>> right\n";
+    commit(p.main(), "one.md", "one\n", "one");
+    commit(p.main(), "two.md", "two\n", "two");
+    commit(p.main(), "three.md", markers, "three");
+    std::os::unix::fs::symlink("one.md", p.main().join("x.rs")).unwrap();
+    git(p.main(), &["add", "x.rs"]);
+    git(p.main(), &["commit", "-q", "-m", "x.rs -> one.md"]);
+    let wt = p.start("b", None);
+    fs::remove_file(wt.join("x.rs")).unwrap();
+    std::os::unix::fs::symlink("two.md", wt.join("x.rs")).unwrap();
+    git(&wt, &["add", "x.rs"]);
+    git(&wt, &["commit", "-q", "-m", "b: x.rs -> two.md"]);
+    fs::remove_file(p.main().join("x.rs")).unwrap();
+    std::os::unix::fs::symlink("three.md", p.main().join("x.rs")).unwrap();
+    git(p.main(), &["add", "x.rs"]);
+    git(p.main(), &["commit", "-q", "-m", "main: x.rs -> three.md"]);
+
+    let out = p.repo.atelier_env(&wt, &["follow"], &[("PATH", &path)]);
+    assert_eq!(code(&out), 5, "{}", stderr(&out));
+    assert_eq!(stdout(&out), "");
+    assert!(stderr(&out).contains("\n  x.rs\n"), "{}", stderr(&out));
+    assert!(!p.base.join("fake-bin/calls").exists(), "mergiraf ran");
+    assert_eq!(read(&wt, "three.md").as_deref(), Some(markers));
+    assert_eq!(
+        git(&wt, &["diff", "--name-only", "--diff-filter=U"]),
+        "x.rs"
+    );
+}
+
+/// Review 4: a modify/delete conflict and an add/add without a base stay git's conflicts,
+/// unmerged, even on code files the resolver would take.
+#[test]
+fn mergiraf_leaves_missing_side_conflicts_to_git() {
+    let p = Proj::with_settings("\n[merge]\nresolver = \"mergiraf\"\n");
+    let path = fake_mergiraf(&p.base);
+    commit(p.main(), "x.rs", "fn x() -> i32 { 0 }\n", "base: x");
+    let wt = p.start("b", None);
+    fs::write(wt.join("x.rs"), "fn x() -> i32 { 2 }\n").unwrap();
+    fs::write(wt.join("z.rs"), "fn z() -> i32 { 2 }\n").unwrap();
+    git(&wt, &["add", "-A"]);
+    git(&wt, &["commit", "-q", "-m", "b: change x, add z"]);
+    git(p.main(), &["rm", "-q", "x.rs"]);
+    fs::write(p.main().join("z.rs"), "fn z() -> i32 { 1 }\n").unwrap();
+    git(p.main(), &["add", "-A"]);
+    git(p.main(), &["commit", "-q", "-m", "main: delete x, add z"]);
+
+    let out = p.repo.atelier_env(&wt, &["follow"], &[("PATH", &path)]);
+    assert_eq!(code(&out), 5, "{}", stderr(&out));
+    assert_eq!(stdout(&out), "");
+    assert!(
+        stderr(&out).contains("\n  x.rs\n") && stderr(&out).contains("\n  z.rs\n"),
+        "{}",
+        stderr(&out)
+    );
+    assert!(!p.base.join("fake-bin/calls").exists(), "mergiraf ran");
+    assert_eq!(
+        git(&wt, &["diff", "--name-only", "--diff-filter=U"]),
+        "x.rs\nz.rs"
+    );
+}
+
+/// Review 2: a branch whose ref is an alias of another branch is refused, and the other
+/// branch is left alone.
+#[test]
+fn follow_refuses_a_branch_that_is_an_alias_of_another() {
+    let p = Proj::new();
+    let wt_a = p.start("a", None);
+    let wt_b = p.start("b", None);
+    git(p.main(), &["symbolic-ref", "refs/heads/b", "refs/heads/a"]);
+    commit(p.main(), "m", "1\n", "main moves");
+    let a_before = (head(&wt_a), p.record("a"));
+    let b_before = p.record("b");
+    let out = p.follow(&wt_b);
+    assert_eq!(code(&out), 4, "{}", stderr(&out));
+    assert!(
+        stderr(&out).contains("refs/heads/b is a symbolic ref"),
+        "{}",
+        stderr(&out)
+    );
+    assert_eq!((head(&wt_a), p.record("a")), a_before);
+    assert_eq!(p.record("b"), b_before);
+}
+
+/// Review 3: a detached worktree with commits of its own is not fresh; `start` there would
+/// drop them from its history.
+#[test]
+fn start_refuses_a_detached_worktree_with_its_own_commits() {
+    let p = Proj::new();
+    let wt = p.base.join("t3-own");
+    git(
+        p.main(),
+        &["worktree", "add", "-q", "--detach", wt.to_str().unwrap()],
+    );
+    let own = commit(&wt, "own", "1\n", "own work");
+    let out = p.run(&wt, &["start", "b"]);
+    assert_eq!(code(&out), 4, "{}", stderr(&out));
+    assert!(
+        stderr(&out).contains(&format!(
+            "it has commits main does not contain ({})",
+            short(&wt, &own)
+        )),
+        "{}",
+        stderr(&out)
+    );
+    assert_eq!(head(&wt), own);
+    assert!(git(p.main(), &["branch", "--list", "b"]).is_empty());
+    assert!(BranchRecord::read(&p.state(), "b").unwrap().is_none());
+}
+
+/// Review 5: a hand rebase open in a lower branch's worktree, with no pending follow, makes
+/// every branch above it not current, ends `chain`, and refuses `start --on` and `follow`.
+#[test]
+fn an_open_hand_rebase_of_a_lower_branch_is_seen_by_every_reader() {
+    let p = Proj::new();
+    commit(p.main(), "f", "root\n", "f");
+    let wt_a = p.start("a", None);
+    commit(&wt_a, "f", "a\n", "A: f");
+    let wt_b = p.start("b", Some("a"));
+    commit(&wt_b, "own", "1\n", "B: own");
+    commit(p.main(), "f", "main\n", "main: f");
+    let out = git_cmd(&wt_a).args(["rebase", "main"]).output().unwrap();
+    assert!(!out.status.success());
+    assert!(rebase_open(&wt_a));
+    assert_eq!(p.record("a").pending, None);
+
+    assert_eq!(p.currency("a"), behind("a", Why::RebaseOpen));
+    assert_eq!(p.currency("b"), behind("a", Why::RebaseOpen));
+    let e = p.with_stack(|s| s.chain("b")).unwrap_err();
+    assert!(e.message.contains("a has a rebase open"), "{}", e.message);
+
+    let wt_c = p.wt("c");
+    let out = p.run(
+        p.main(),
+        &["start", "c", "--on", "a", "--path", wt_c.to_str().unwrap()],
+    );
+    assert_eq!(code(&out), 4, "{}", stderr(&out));
+    assert!(
+        stderr(&out).contains("finish the rebase"),
+        "{}",
+        stderr(&out)
+    );
+    assert!(git(p.main(), &["branch", "--list", "c"]).is_empty());
+    assert!(BranchRecord::read(&p.state(), "c").unwrap().is_none());
+
+    let out = p.follow(&wt_b);
+    assert_eq!(code(&out), 4, "{}", stderr(&out));
+    assert!(
+        stderr(&out).contains("a has a rebase open"),
+        "{}",
+        stderr(&out)
+    );
+
+    // Its own rebase open in another worktree counts too, with no pending follow.
+    git(&wt_a, &["rebase", "--abort"]);
+    assert_eq!(p.currency("b"), Currency::Current);
+    let wt_b2 = p.base.join("b-second");
+    git(
+        p.main(),
+        &[
+            "worktree",
+            "add",
+            "-q",
+            "--detach",
+            wt_b2.to_str().unwrap(),
+            "b",
+        ],
+    );
+    git(&wt_b, &["switch", "-q", "--detach"]);
+    git(&wt_b2, &["switch", "-q", "b"]);
+    let out = git_cmd(&wt_b2)
+        .args(["rebase", "-x", "false", "a~1"])
+        .output()
+        .unwrap();
+    assert!(!out.status.success());
+    assert!(rebase_open(&wt_b2));
+    assert_eq!(p.currency("b"), behind("b", Why::RebaseOpen));
+}
+
+/// Writes an executable hook into the clone's hooks folder (the tests' own git commands do not
+/// run hooks).
+fn hook(p: &Proj, name: &str, body: &str) {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = p.main().join(".git/hooks");
+    fs::create_dir_all(&dir).unwrap();
+    let path = dir.join(name);
+    fs::write(&path, format!("#!/bin/sh\n{body}\n")).unwrap();
+    fs::set_permissions(&path, fs::Permissions::from_mode(0o755)).unwrap();
+}
+
+fn unhook(p: &Proj, name: &str) {
+    fs::remove_file(p.main().join(".git/hooks").join(name)).unwrap();
+}
+
+fn worktree_listed(p: &Proj, wt: &Path) -> bool {
+    git(p.main(), &["worktree", "list", "--porcelain"])
+        .lines()
+        .any(|l| l == format!("worktree {}", wt.display()))
+}
+
+/// Review 6: a checkout that fails after git registered the worktree on the branch keeps the
+/// branch and its unfinished record; `start` again finishes it, or undoes it once the worktree
+/// is removed.
+#[test]
+fn a_failed_checkout_on_the_branch_keeps_it_and_start_again_finishes_or_undoes() {
+    let p = Proj::new();
+    let base = head(p.main());
+    hook(&p, "post-checkout", "exit 1");
+    let wt = p.wt("b");
+    let path = wt.to_str().unwrap();
+    let out = p.run(p.main(), &["start", "b", "--path", path]);
+    assert_eq!(code(&out), 4, "{}", stderr(&out));
+    assert!(
+        stderr(&out).contains(&format!("b is checked out in {path}")),
+        "{}",
+        stderr(&out)
+    );
+    assert!(worktree_listed(&p, &wt));
+    assert_eq!(git(p.main(), &["rev-parse", "refs/heads/b"]), base);
+    let rec = p.record("b");
+    assert_eq!(rec.starting.as_ref().unwrap().worktree, path);
+    let out = p.follow(&wt);
+    assert_eq!(code(&out), 4, "{}", stderr(&out));
+    assert!(
+        stderr(&out).contains("the start of b did not finish"),
+        "{}",
+        stderr(&out)
+    );
+    assert_eq!(p.currency("b"), behind("b", Why::StartUnfinished));
+    unhook(&p, "post-checkout");
+    let out = p.run(p.main(), &["start", "b", "--path", path]);
+    assert_eq!(code(&out), 0, "{}", stderr(&out));
+    assert!(
+        stdout(&out).contains("finished the interrupted start of b"),
+        "{}",
+        stdout(&out)
+    );
+    let done = p.record("b");
+    assert_eq!(done.starting, None);
+    assert_eq!(done.lifetime, rec.lifetime);
+    assert_eq!(code(&p.follow(&wt)), 0);
+
+    // Undone instead: the worktree removed by hand, then start again.
+    hook(&p, "post-checkout", "exit 1");
+    let wt_c = p.wt("c");
+    let path_c = wt_c.to_str().unwrap();
+    assert_eq!(code(&p.run(p.main(), &["start", "c", "--path", path_c])), 4);
+    unhook(&p, "post-checkout");
+    git(p.main(), &["worktree", "remove", "--force", path_c]);
+    let out = p.run(p.main(), &["start", "c", "--path", path_c]);
+    assert_eq!(code(&out), 0, "{}", stderr(&out));
+    assert!(
+        stdout(&out).contains("undid an earlier start of c")
+            && stdout(&out).contains("start: c on main"),
+        "{}",
+        stdout(&out)
+    );
+    assert_eq!(p.record("c").starting, None);
+}
+
+/// Review 6, second variant: the failing hook commits first. The branch moved, so it is kept
+/// with its record, and start again finishes it with the commit in it.
+#[test]
+fn a_failed_checkout_that_moved_the_branch_keeps_branch_and_record() {
+    let p = Proj::new();
+    let base = head(p.main());
+    hook(
+        &p,
+        "post-checkout",
+        "echo own > own && git add own && git commit -q -m own && exit 1",
+    );
+    let wt = p.wt("b");
+    let path = wt.to_str().unwrap();
+    let out = p.run(p.main(), &["start", "b", "--path", path]);
+    assert_eq!(code(&out), 4, "{}", stderr(&out));
+    unhook(&p, "post-checkout");
+    let tip = git(p.main(), &["rev-parse", "refs/heads/b"]);
+    assert_ne!(tip, base);
+    assert!(p.record("b").starting.is_some());
+    let out = p.run(p.main(), &["start", "b", "--path", path]);
+    assert_eq!(code(&out), 0, "{}", stderr(&out));
+    assert_eq!(p.record("b").base, base);
+    assert_eq!(p.record("b").starting, None);
+    commit(p.main(), "m", "1\n", "main moves");
+    let out = p.follow(&wt);
+    assert_eq!(code(&out), 0, "{}", stderr(&out));
+    assert_eq!(read(&wt, "own").as_deref(), Some("own\n"));
+}
+
+/// A `git` on `PATH` that runs the real one and kills its caller (atelier) with SIGKILL just
+/// before (`KILL_BEFORE`) or just after (`KILL_AFTER`) a call whose arguments contain the
+/// variable's text.
+fn killing_git(p: &Proj) -> String {
+    use std::os::unix::fs::PermissionsExt;
+    let real = std::process::Command::new("sh")
+        .args(["-c", "command -v git"])
+        .output()
+        .unwrap();
+    let real = String::from_utf8(real.stdout).unwrap().trim().to_owned();
+    let bin = p.base.join("killing-bin");
+    fs::create_dir_all(&bin).unwrap();
+    let script = bin.join("git");
+    fs::write(
+        &script,
+        format!(
+            r#"#!/bin/sh
+if [ -n "$KILL_BEFORE" ]; then case "$*" in *"$KILL_BEFORE"*) kill -9 $PPID; exit 1;; esac; fi
+"{real}" "$@"; rc=$?
+if [ -n "$KILL_AFTER" ]; then case "$*" in *"$KILL_AFTER"*) kill -9 $PPID; sleep 1;; esac; fi
+exit $rc
+"#
+        ),
+    )
+    .unwrap();
+    fs::set_permissions(&script, fs::Permissions::from_mode(0o755)).unwrap();
+    format!("{}:{}", bin.display(), std::env::var("PATH").unwrap())
+}
+
+fn killed(out: &Output) -> bool {
+    use std::os::unix::process::ExitStatusExt;
+    out.status.signal() == Some(9)
+}
+
+/// Review 7: atelier killed between the steps of `start` leaves an unfinished record that the
+/// same `start` finishes or undoes.
+#[test]
+fn start_killed_between_its_steps_is_finished_or_undone_by_start_again() {
+    let p = Proj::new();
+    let base = head(p.main());
+    let path = killing_git(&p);
+    const CREATE_REF: &str = "update-ref --no-deref -m atelier start";
+
+    // Killed before the ref exists: the record alone is undone.
+    let wt = p.wt("b");
+    let args = ["start", "b", "--path", wt.to_str().unwrap()];
+    let out = p.repo.atelier_env(
+        p.main(),
+        &args,
+        &[("PATH", &path), ("KILL_BEFORE", CREATE_REF)],
+    );
+    assert!(killed(&out), "{}", stderr(&out));
+    assert!(p.record("b").starting.is_some());
+    assert!(git(p.main(), &["branch", "--list", "b"]).is_empty());
+    let out = p.run(p.main(), &args);
+    assert_eq!(code(&out), 0, "{}", stderr(&out));
+    assert!(
+        stdout(&out).contains("undid an earlier start of b"),
+        "{}",
+        stdout(&out)
+    );
+    assert_eq!(p.record("b").starting, None);
+
+    // Killed just after the ref was created (the review's probe): no worktree has it, it
+    // still holds the base, so start again deletes it and starts afresh.
+    let wt = p.wt("c");
+    let args = ["start", "c", "--path", wt.to_str().unwrap()];
+    let out = p.repo.atelier_env(
+        p.main(),
+        &args,
+        &[("PATH", &path), ("KILL_AFTER", CREATE_REF)],
+    );
+    assert!(killed(&out), "{}", stderr(&out));
+    let first = p.record("c");
+    assert!(first.starting.is_some());
+    assert_eq!(git(p.main(), &["rev-parse", "refs/heads/c"]), base);
+    assert_eq!(p.currency("c"), behind("c", Why::StartUnfinished));
+    let out = p.run(p.main(), &args);
+    assert_eq!(code(&out), 0, "{}", stderr(&out));
+    assert!(
+        stdout(&out).contains("undid an earlier start of c")
+            && stdout(&out).contains("start: c on main"),
+        "{}",
+        stdout(&out)
+    );
+    let second = p.record("c");
+    assert_eq!(second.starting, None);
+    assert_ne!(second.lifetime, first.lifetime);
+    assert_eq!(git(&wt, &["symbolic-ref", "HEAD"]), "refs/heads/c");
+
+    // Killed after the worktree was created: start again finishes it.
+    let wt = p.wt("d");
+    let args = ["start", "d", "--path", wt.to_str().unwrap()];
+    let out = p.repo.atelier_env(
+        p.main(),
+        &args,
+        &[("PATH", &path), ("KILL_AFTER", "worktree add")],
+    );
+    assert!(killed(&out), "{}", stderr(&out));
+    let first = p.record("d");
+    assert!(first.starting.is_some());
+    let out = p.run(p.main(), &args);
+    assert_eq!(code(&out), 0, "{}", stderr(&out));
+    assert!(
+        stdout(&out).contains("finished the interrupted start of d"),
+        "{}",
+        stdout(&out)
+    );
+    assert_eq!(p.record("d").lifetime, first.lifetime);
+    assert_eq!(p.record("d").starting, None);
+    assert_eq!(code(&p.follow(&wt)), 0);
+}
+
+fn wait_for(what: &str, mut ready: impl FnMut() -> bool) {
+    let until = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    while !ready() {
+        assert!(
+            std::time::Instant::now() < until,
+            "timed out waiting for {what}"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+}
+
+/// Review 8: atelier killed while follow's rebase runs. The rebase's process group is recorded
+/// under the branch lock, so the next follow refuses while git lives, and settles once it ended.
+#[test]
+fn a_killed_follow_keeps_its_rebase_recorded_until_git_ends() {
+    let p = Proj::new();
+    let wt = p.start("b", None);
+    commit(&wt, "b", "1\n", "B1");
+    let m = commit(p.main(), "m", "1\n", "main moves");
+    let pid_file = p.base.join("hook.pid");
+    let release = p.base.join("release");
+    // Releases the paused hook however the test ends, before the temp folder goes.
+    struct Release(PathBuf);
+    impl Drop for Release {
+        fn drop(&mut self) {
+            let _ = fs::write(&self.0, "");
+        }
+    }
+    let _release = Release(release.clone());
+    // Pauses the first rebase only, for at most a minute.
+    hook(
+        &p,
+        "pre-rebase",
+        &format!(
+            "[ -e '{0}' ] && exit 0\necho $$ > '{0}'\nn=0\nwhile [ ! -e '{1}' ] && [ $n -lt 1200 ]; do sleep 0.05; n=$((n + 1)); done",
+            pid_file.display(),
+            release.display()
+        ),
+    );
+    let mut first = p
+        .repo
+        .atelier_cmd(&wt, &["follow"], &[])
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .unwrap();
+    wait_for("the pre-rebase hook", || pid_file.exists());
+    first.kill().unwrap();
+    first.wait().unwrap();
+
+    let out = p.follow(&wt);
+    assert_eq!(code(&out), 4, "{}", stderr(&out));
+    assert!(
+        stderr(&out).contains("processes of an earlier run are still alive"),
+        "{}",
+        stderr(&out)
+    );
+    assert!(p.record("b").pending.is_some());
+
+    fs::write(&release, "").unwrap();
+    let mut last = None;
+    wait_for("the orphaned rebase to end", || {
+        let out = p.follow(&wt);
+        let done = code(&out) == 0;
+        last = Some(out);
+        done
+    });
+    unhook(&p, "pre-rebase");
+    let out = last.unwrap();
+    assert_eq!(
+        stdout(&out),
+        format!("follow: b already on {} (1 commit)\n", short(p.main(), &m))
+    );
+    let rec = p.record("b");
+    assert_eq!(rec.pending, None);
+    assert_eq!(rec.base, m);
 }

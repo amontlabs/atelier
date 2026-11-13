@@ -286,6 +286,7 @@ fn start_branch(repo: &Repo, name: &str, lower: &str) -> std::path::PathBuf {
         base,
         state: BranchState::Active,
         pending: None,
+        starting: None,
         later: Default::default(),
     }
     .write(&state)

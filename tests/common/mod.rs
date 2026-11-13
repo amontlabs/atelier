@@ -131,6 +131,13 @@ impl Repo {
     /// The program in `dir` with extra environment variables (`PATH`, for one). Commits it
     /// makes (a rebase) get the test identity.
     pub fn atelier_env(&self, dir: &Path, args: &[&str], env: &[(&str, &str)]) -> Output {
+        self.atelier_cmd(dir, args, env)
+            .output()
+            .expect("atelier runs")
+    }
+
+    /// The command [`Repo::atelier_env`] runs, for a test that spawns it.
+    pub fn atelier_cmd(&self, dir: &Path, args: &[&str], env: &[(&str, &str)]) -> Command {
         let mut c = Command::new(atelier_bin());
         c.args(args)
             .current_dir(dir)
@@ -146,7 +153,7 @@ impl Repo {
         for (k, v) in env {
             c.env(k, v);
         }
-        c.output().expect("atelier runs")
+        c
     }
 
     pub fn atelier(&self, args: &[&str]) -> Output {

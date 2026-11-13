@@ -314,7 +314,33 @@ impl Run {
     ) -> Result<Run> {
         let guard = signals::install()
             .map_err(|e| Failure::refused(format!("cannot install signal handlers: {e}")))?;
-        let mut lock = HeldLock::acquire(state, key)?;
+        let lock = HeldLock::acquire(state, key)?;
+        Self::begin(state, lock, guard, kind, command, worktree, preferred)
+    }
+
+    /// As [`Run::start`], under a lock the caller already holds: for a command that reads and
+    /// writes records under the lock before its run starts (`follow`).
+    pub fn start_held(
+        state: &State,
+        lock: HeldLock,
+        kind: RunKind,
+        command: &str,
+        worktree: &Path,
+    ) -> Result<Run> {
+        let guard = signals::install()
+            .map_err(|e| Failure::refused(format!("cannot install signal handlers: {e}")))?;
+        Self::begin(state, lock, guard, kind, command, worktree, None)
+    }
+
+    fn begin(
+        state: &State,
+        mut lock: HeldLock,
+        guard: signals::RunSignals,
+        kind: RunKind,
+        command: &str,
+        worktree: &Path,
+        preferred: Option<&str>,
+    ) -> Result<Run> {
         let (id, dir) = create_run_dir(&state.runs_dir(), preferred)?;
         let started = fsutil::rfc3339(fsutil::now_secs());
         let mut chain = procs::inherited_runs();

@@ -130,14 +130,44 @@ When nothing lives, the record is removed.
 | `base` | string | full commit id (40 or 64 lowercase hex digits) of what it is built on |
 | `state` | string | `active`, `merged` or `cleaned` |
 | `pending` | table, optional | a `follow` not settled yet: `target` and `old_base`, full commit ids |
+| `starting` | table, optional | a `start` not finished yet: `worktree` (absolute path, UTF-8, where the branch is checked out) and `new_worktree` (boolean: `start` creates that worktree, or switches the detached worktree it ran in) |
 
 Commit ids are checked when a record is read and when it is written.
 
 Lifecycle, the same for every version:
 
 - `start` writes a new record, with a new lifetime, only when the branch does not exist and no
-  `active` record names the old lifetime as its lower; it then replaces the old record whole.
-- `follow` writes `pending` before its rebase and settles it from ancestry alone. Once the lower
+  `active` record names the old lifetime as its lower; it then replaces the old record whole. Its
+  steps, in this order: write the record with `starting` set; create the branch ref at the base
+  (`update-ref --no-deref`, expected absent); check the branch out (`git worktree add`, or
+  `git switch` in the detached worktree); write the record again without `starting`. A record
+  with `starting` is not started: every command that reads records refuses it (`run atelier
+  start <branch> again`), and it counts as a dependent of its lower branch.
+- A `start` of a name whose record has `starting` (atelier died between the steps, or a step
+  failed) first reconciles it, under the branch's lock:
+  - a registered worktree has the branch checked out (`git worktree list`, prunable ones
+    included): if it is the recorded worktree, the ref exists, and this start asks for the same
+    lower branch and place, `starting` is cleared and the start is finished; otherwise it
+    refuses (4), changing nothing, and says how to finish it or undo it (remove the worktree);
+  - no worktree has it, and the ref is absent: the record is removed;
+  - no worktree has it, and the ref holds the recorded base: the ref is deleted (expected value
+    the base), then the record is removed;
+  - no worktree has it, and the ref holds another commit: refused (4), ref and record kept; the
+    message says to delete the branch by hand if nothing in it is needed.
+
+  After an undo the new start proceeds as if the name were free. The record a rolled-back start
+  replaced is not restored: `start` replaces only a record that no active record names as its
+  lower, so nothing depended on it. A step that fails while `start` is still running is undone
+  the same way at once (the replaced record is then restored), except that a ref this `start`
+  did not create is never deleted. A branch ref that a registered worktree has checked out is
+  never deleted.
+- `follow` writes `pending` before its rebase and settles it from ancestry alone. The rebase
+  is the one step of a `follow` run held under the branch's lock, so its process group is
+  recorded (`locks/branch/<key>.procs`) before git starts, and the next command that takes the
+  lock refuses while that group lives, even when atelier died meanwhile. A rebase of the branch
+  open in any worktree, whether `follow` started it or not, makes every reader refuse.
+- No command repairs a base the branch no longer contains: it refuses (4) until the worker
+  restores the branch. Once the lower
   branch is merged (or gone, with its base in the integration branch), `follow` sets `lower` to
   the integration branch (`lower_is_integration = true`, no `lower_lifetime`).
 - A record is removed only in state `cleaned`, and only when no `active` record names it, by
