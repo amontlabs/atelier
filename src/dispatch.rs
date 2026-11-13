@@ -80,6 +80,14 @@ fn classify(args: &[OsString]) -> Ask {
         .skip(1)
         .map(|a| a.to_str().unwrap_or("\u{0}"))
         .collect();
+    // `--help` of any command only prints text.
+    if rest
+        .iter()
+        .take_while(|a| **a != "--")
+        .any(|a| *a == "--help" || *a == "-h")
+    {
+        return Ask::Harmless;
+    }
     match rest.as_slice() {
         [] | ["--version"] | ["-V"] | ["--help"] | ["-h"] | ["help", ..] => Ask::Harmless,
         // A harness hook runs in any folder; outside a project it only lets the agent stop.
@@ -170,6 +178,9 @@ mod tests {
     fn classifies_what_runs_outside_a_project() {
         assert_eq!(classify(&args(&["--version"])), Ask::Harmless);
         assert_eq!(classify(&args(&[])), Ask::Harmless);
+        assert_eq!(classify(&args(&["init", "--help"])), Ask::Harmless);
+        assert_eq!(classify(&args(&["clean", "-h"])), Ask::Harmless);
+        assert_eq!(classify(&args(&["tmp", "--", "ls", "-h"])), Ask::Other);
         assert_eq!(
             classify(&args(&["init", "--version", "0.2.0"])),
             Ask::Init(Some("0.2.0".into()))

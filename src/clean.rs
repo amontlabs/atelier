@@ -34,6 +34,9 @@
 //!    lets them go. Deleted with `update-ref --no-deref -d` at the merged commit;
 //! 4. `mbx clean --under <worktree>` when mbx is a prerequisite and the worktree's path is gone.
 //!
+//! After every branch, with `[prerequisites.mbx]`, one `mbx gc` runs as its own step (printed in
+//! the plan, skipped without `--yes`). Its failure is reported (exit 1) and undoes nothing.
+//!
 //! Then the record becomes `cleaned` and its facts are removed. A step that fails (a file that
 //! cannot be deleted, a check that no longer holds, a git error) stops `clean` for the branch
 //! (exit 1): what was deleted stays deleted, the record stays `merged`, and running `clean`
@@ -252,8 +255,32 @@ pub fn run(ctx: &Context, branches: &[String], yes: bool, discard: &[String]) ->
             println!("clean: --discard {given} names no lost commit of these branches: ignored");
         }
     }
+    let mut gc_failed = false;
+    if cx.ctx.settings.prerequisites.mbx.is_some() {
+        if yes {
+            println!("mbx gc");
+            match Command::new("mbx").arg("gc").current_dir(&cx.main).status() {
+                Ok(s) if s.success() => {}
+                Ok(s) => {
+                    gc_failed = true;
+                    println!("  failed: mbx gc failed ({s}); nothing else was undone");
+                }
+                Err(e) => {
+                    gc_failed = true;
+                    println!("  failed: cannot run mbx gc: {e}; nothing else was undone");
+                }
+            }
+        } else {
+            println!("run mbx gc once, after the branches");
+        }
+    }
     if !yes {
         println!("clean: this is the plan; nothing was changed. Run again with --yes to do it");
+    }
+    if failed == 0 && gc_failed {
+        return Err(Failure::fail(
+            "clean: mbx gc failed (the branches are cleaned)",
+        ));
     }
     if failed > 0 {
         return Err(Failure::fail(format!(

@@ -26,7 +26,7 @@ use std::path::{Path, PathBuf};
 
 use crate::exit::{Failure, IoContext, Result};
 use crate::fsutil;
-use crate::git::Checkout;
+use crate::git::{self, Checkout};
 use crate::hook;
 use crate::settings::Settings;
 use crate::template::Template;
@@ -606,8 +606,30 @@ pub fn write(checkout: &Checkout, settings: &Settings) -> Result<Vec<String>> {
     }
     prune_empty_dirs(&rules_dir)?;
     write_planned(&plan, &mut changed)?;
+    let written: Vec<String> = changed
+        .iter()
+        .filter_map(|l| l.strip_prefix("wrote ").map(str::to_owned))
+        .collect();
+    changed.extend(ignored_warnings(root, &written));
     changed.extend(by_hand);
     Ok(changed)
+}
+
+/// One warning line per file (relative to `root`) that git ignores: another checkout of the
+/// project would not get it.
+pub fn ignored_warnings(root: &Path, files: &[String]) -> Vec<String> {
+    files
+        .iter()
+        .filter(|f| {
+            git::output(root, ["check-ignore", "-q", "--no-index", "--", f.as_str()])
+                .is_ok_and(|o| o.status.success())
+        })
+        .map(|f| {
+            format!(
+                "warning: {f} is ignored by git; agents in other checkouts won't get it — un-ignore it"
+            )
+        })
+        .collect()
 }
 
 /// Removes folders left empty under `dir` (not `dir` itself).

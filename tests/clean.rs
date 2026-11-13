@@ -888,6 +888,69 @@ fn clean_runs_mbx_clean_under_the_removed_worktree_and_a_failure_is_resumable() 
     );
 }
 
+fn fake_mbx(p: &Proj, fail_gc: bool) -> (PathBuf, String) {
+    let bin = p.base.join("bin");
+    fs::create_dir_all(&bin).unwrap();
+    let log = p.base.join("mbx.log");
+    let script = format!(
+        "#!/bin/sh\necho \"$@\" >> {}\nif [ \"$1\" = gc ] && [ {} = 1 ]; then echo gc-says-no; exit 3; fi\nexit 0\n",
+        log.display(),
+        u8::from(fail_gc)
+    );
+    fs::write(bin.join("mbx"), script).unwrap();
+    use std::os::unix::fs::PermissionsExt;
+    fs::set_permissions(bin.join("mbx"), fs::Permissions::from_mode(0o755)).unwrap();
+    let path = format!("{}:{}", bin.display(), std::env::var("PATH").unwrap());
+    (log, path)
+}
+
+const MBX_SETTINGS: &str =
+    "\n[prerequisites.mbx]\nversion = \"1.2.3\"\ncargo = [\"/usr/bin/cargo\"]\n";
+
+#[test]
+fn clean_runs_mbx_gc_once_after_all_branches_and_prints_it_in_the_plan() {
+    let p = Proj::with_settings(MBX_SETTINGS);
+    for b in ["a", "b"] {
+        let wt = p.start(b, None);
+        p.land(b, &wt);
+    }
+    let (log, path) = fake_mbx(&p, false);
+    let env = [
+        ("PATH", path.as_str()),
+        ("TMPDIR", p.tmpdir.to_str().unwrap()),
+    ];
+
+    let out = p.repo.atelier_env(p.main(), &["clean"], &env);
+    assert_eq!(code(&out), 0, "{}{}", stdout(&out), stderr(&out));
+    assert!(stdout(&out).contains("run mbx gc"), "{}", stdout(&out));
+    assert!(!log.exists(), "the plan runs nothing");
+
+    let out = p.repo.atelier_env(p.main(), &["clean", "--yes"], &env);
+    assert_eq!(code(&out), 0, "{}{}", stdout(&out), stderr(&out));
+    let calls = fs::read_to_string(&log).unwrap();
+    let lines: Vec<&str> = calls.lines().collect();
+    assert_eq!(lines.iter().filter(|l| **l == "gc").count(), 1, "{calls}");
+    assert_eq!(lines.last(), Some(&"gc"), "gc runs last: {calls}");
+    assert!(p.record("a").is_none() && p.record("b").is_none());
+}
+
+#[test]
+fn a_failing_mbx_gc_is_reported_and_undoes_nothing() {
+    let p = Proj::with_settings(MBX_SETTINGS);
+    let wt = p.start("a", None);
+    p.land("a", &wt);
+    let (_log, path) = fake_mbx(&p, true);
+    let out = p.repo.atelier_env(
+        p.main(),
+        &["clean", "--yes"],
+        &[("PATH", &path), ("TMPDIR", p.tmpdir.to_str().unwrap())],
+    );
+    assert_eq!(code(&out), 1, "{}{}", stdout(&out), stderr(&out));
+    assert!(format!("{}{}", stdout(&out), stderr(&out)).contains("gc-says-no"));
+    assert!(!wt.exists() && !p.branch_exists("a"));
+    assert!(p.record("a").is_none(), "the branch stays cleaned");
+}
+
 #[test]
 fn mbx_is_not_run_on_a_path_that_something_else_occupies() {
     let p = Proj::with_settings(
@@ -915,9 +978,10 @@ fn mbx_is_not_run_on_a_path_that_something_else_occupies() {
         .atelier_env(p.main(), &["clean", "a", "--yes"], &[("PATH", &path)]);
     assert_eq!(code(&out), 0, "{}{}", stdout(&out), stderr(&out));
     assert!(wt.is_dir());
+    let calls = fs::read_to_string(&log).unwrap_or_default();
     assert!(
-        !log.exists(),
-        "mbx never ran on a path that is not the recorded worktree"
+        !calls.contains("clean --under"),
+        "mbx never cleaned a path that is not the recorded worktree: {calls}"
     );
 }
 

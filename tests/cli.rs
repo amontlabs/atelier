@@ -58,6 +58,44 @@ fn init_outside_a_project_needs_the_version_named() {
 }
 
 #[test]
+fn help_prints_outside_a_project_for_every_command() {
+    let repo = Repo::new();
+    for args in [&["init", "--help"][..], &["clean", "-h"], &["--help"]] {
+        let out = repo.atelier(args);
+        assert_eq!(code(&out), 0, "{args:?}: {}", stderr(&out));
+        assert!(stdout(&out).contains("Usage:"), "{args:?}");
+    }
+    let out = repo.atelier(&["init", "--help"]);
+    assert!(stdout(&out).contains("--version"));
+}
+
+#[test]
+fn init_and_rules_warn_about_written_files_git_ignores() {
+    let repo = Repo::new();
+    repo.install_self(VERSION);
+    repo.write(".gitignore", ".claude/\n");
+    let out = repo.atelier(&["init", "--version", VERSION]);
+    assert_eq!(code(&out), 0, "{}", stderr(&out));
+    let text = stdout(&out);
+    assert!(
+        text.contains(
+            "warning: .claude/settings.json is ignored by git; agents in other checkouts won't get it — un-ignore it"
+        ),
+        "{text}"
+    );
+    assert!(!text.contains("warning: AGENTS.md"), "{text}");
+    assert!(!text.contains("warning: .atelier/atelier.toml"), "{text}");
+
+    // `rules` names it again only when it writes it.
+    fs::remove_file(repo.root.join(".claude/settings.json")).unwrap();
+    let out = repo.atelier(&["rules"]);
+    assert_eq!(code(&out), 0, "{}", stderr(&out));
+    assert!(stdout(&out).contains("warning: .claude/settings.json is ignored"));
+    let out = repo.atelier(&["rules"]);
+    assert!(!stdout(&out).contains("warning"), "{}", stdout(&out));
+}
+
+#[test]
 fn a_missing_version_prints_the_install_command_and_exits_4() {
     let repo = Repo::new();
     let out = repo.atelier(&["init", "--version", "9.9.9"]);

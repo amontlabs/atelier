@@ -64,7 +64,15 @@ pub fn init(checkout: &Checkout, version: &str) -> Result<Vec<String>> {
             fs::write(&p, "").ctx(p.display())?;
         }
         let settings = Settings::load(root)?;
-        rules::write(checkout, &settings)
+        let mut changed = rules::write(checkout, &settings)?;
+        let mut mine = vec![SETTINGS_PATH.to_owned()];
+        mine.extend(
+            rules::PROJECT_FILES
+                .iter()
+                .map(|f| format!("{}/{f}", rules::PROJECT_DIR)),
+        );
+        changed.extend(rules::ignored_warnings(root, &mine));
+        Ok(changed)
     })();
     if result.is_err() {
         let _ = fs::remove_dir_all(&dir);
