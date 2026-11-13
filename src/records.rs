@@ -133,6 +133,91 @@ impl BranchRecord {
     }
 }
 
+/// What `clean` may trust about a merged branch: the commit `merge` merged and the worktree
+/// `approve` recorded (path and file-system identity). It is the `merged` table of the branch's
+/// record (`docs/FROZEN-LAYER.md`), written by `merge` in the same write that sets the state to
+/// `merged` ([`MergeFacts::record`]) and removed by `clean` in the write that sets `cleaned`
+/// ([`MergeFacts::retire`]). A merged record without it grants `clean` nothing.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct MergeFacts {
+    /// The full commit id the branch was merged at: its tip when approved.
+    pub commit: String,
+    /// The one worktree `clean` may delete for this branch: absolute, canonical, UTF-8.
+    pub worktree: PathBuf,
+    pub dev: u64,
+    pub ino: u64,
+    /// Fields written by a later version, kept as they are.
+    #[serde(flatten)]
+    pub later: toml::Table,
+}
+
+impl MergeFacts {
+    /// The record's key for these facts.
+    const KEY: &'static str = "merged";
+
+    /// Records the identity of `worktree` (an existing folder) as `approve` does.
+    pub fn of_worktree(commit: &str, worktree: &Path) -> Result<MergeFacts> {
+        let entry = TmpEntry::of(worktree)?;
+        Ok(MergeFacts {
+            commit: commit.to_owned(),
+            worktree: entry.path,
+            dev: entry.dev,
+            ino: entry.ino,
+            later: toml::Table::new(),
+        })
+    }
+
+    /// The facts a record holds. `None` when it has none; refuses (4) a table this version
+    /// cannot read.
+    pub fn read(rec: &BranchRecord) -> Result<Option<MergeFacts>> {
+        let Some(v) = rec.later.get(Self::KEY) else {
+            return Ok(None);
+        };
+        let facts: MergeFacts = v.clone().try_into().map_err(|e: toml::de::Error| {
+            Failure::refused(format!("{}: merged: {}", rec.name, e.to_string().trim()))
+        })?;
+        check_oid(&facts.commit)
+            .map_err(|f| Failure::refused(f.message).context("merged.commit"))?;
+        if !facts.worktree.is_absolute() || facts.worktree.to_str().is_none() {
+            return Err(Failure::refused(format!(
+                "{}: merged.worktree must be an absolute UTF-8 path",
+                rec.name
+            )));
+        }
+        Ok(Some(facts))
+    }
+
+    /// The one write `merge` makes for a branch: state `merged` with these facts, only for the
+    /// given lifetime. The caller holds the branch's lock.
+    pub fn record(&self, state: &State, branch: &str, lifetime: &str) -> Result<()> {
+        let mut rec = of_lifetime(state, branch, lifetime)?;
+        let table = toml::Table::try_from(self).map_err(|e| Failure::refused(e.to_string()))?;
+        rec.later
+            .insert(Self::KEY.to_owned(), toml::Value::Table(table));
+        rec.state = BranchState::Merged;
+        rec.write(state)
+    }
+
+    /// The one write `clean` makes when everything is gone: state `cleaned`, facts removed (they
+    /// grant nothing more). The caller holds the branch's lock.
+    pub fn retire(state: &State, branch: &str, lifetime: &str) -> Result<()> {
+        let mut rec = of_lifetime(state, branch, lifetime)?;
+        rec.later.remove(Self::KEY);
+        rec.state = BranchState::Cleaned;
+        rec.write(state)
+    }
+}
+
+fn of_lifetime(state: &State, branch: &str, lifetime: &str) -> Result<BranchRecord> {
+    BranchRecord::read(state, branch)?
+        .filter(|r| r.lifetime == lifetime)
+        .ok_or_else(|| {
+            Failure::refused(format!(
+                "{branch}: no record of lifetime {lifetime}; it was started again"
+            ))
+        })
+}
+
 /// One registered temp folder: its exact path and file-system identity.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct TmpEntry {

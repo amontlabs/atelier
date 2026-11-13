@@ -3,10 +3,12 @@
 //! Module 3.1, the skeleton: exit codes, the dispatcher and pin, settings and the owner's files,
 //! the shared state and its locks, runs with process groups and the survivor scan, the tree id,
 //! and plain refs. Module 3.3: `start`, `follow` and the branch record rules (`stack`). Module
-//! 3.6: machines, `test` and remote runs. Other commands come in later modules.
+//! 3.5: `tmp` and `clean`. Module 3.6: machines, `test` and remote runs. Other commands come in
+//! later modules.
 
 pub mod agents;
 pub mod check;
+pub mod clean;
 pub mod cli;
 pub mod dirfd;
 pub mod dispatch;
@@ -39,4 +41,5 @@ pub mod state;
 pub mod task;
 pub mod template;
 pub mod testcmd;
+pub mod tmp;
 pub mod tree;

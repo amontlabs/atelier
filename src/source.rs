@@ -67,6 +67,7 @@ pub const FILES: &[(&str, &[u8])] = &[
     ),
     src_file!("src/agents.rs", "agents.rs"),
     src_file!("src/check.rs", "check.rs"),
+    src_file!("src/clean.rs", "clean.rs"),
     src_file!("src/cli.rs", "cli.rs"),
     src_file!("src/dirfd.rs", "dirfd.rs"),
     src_file!("src/dispatch.rs", "dispatch.rs"),
@@ -101,6 +102,7 @@ pub const FILES: &[(&str, &[u8])] = &[
     src_file!("src/task.rs", "task.rs"),
     src_file!("src/template.rs", "template.rs"),
     src_file!("src/testcmd.rs", "testcmd.rs"),
+    src_file!("src/tmp.rs", "tmp.rs"),
     src_file!("src/tree.rs", "tree.rs"),
 ];
 

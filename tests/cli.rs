@@ -188,8 +188,6 @@ fn stub_commands_preflight_then_exit_2() {
         (&["approve", "a", "abc"][..], "3.4"),
         (&["merge", "a", "b"], "3.4"),
         (&["promote"], "3.4"),
-        (&["tmp", "--", "true"], "3.5"),
-        (&["clean"], "3.5"),
         (&["status"], "3.8"),
     ] {
         let out = repo.atelier(args);
@@ -296,7 +294,7 @@ fn versioned_commands_need_the_version_pinned_on_main() {
     assert!(stderr(&out).contains("runs only with the atelier version pinned on main (9.9.9)"));
     assert!(!repo.root.join(".git/atelier/versioned").exists());
     // Commands of the frozen layer still run.
-    assert_eq!(code(&repo.atelier(&["tmp", "--", "true"])), 2);
+    assert_eq!(code(&repo.atelier(&["status"])), 2);
 
     // The version pinned on main creates the layer with its format.
     repo.commit_all("pin back");

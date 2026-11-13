@@ -57,7 +57,7 @@ const REDIRECTING_VARS: &[&str] = &[
 
 pub fn run(ctx: &Context) -> Result<Exit> {
     let root = &ctx.checkout.root;
-    let branch = current_branch(&ctx.checkout)?;
+    let branch = current_branch(&ctx.checkout, "follow")?;
     let integration = &ctx.settings.integration_branch;
     let lock = HeldLock::acquire(&ctx.state, LockKey::branch(&branch))?;
     let stack = Stack::new(&ctx.checkout, &ctx.state, integration);
@@ -254,7 +254,7 @@ fn rebase(
 /// The branch `HEAD` names, read without following a symbolic branch ref: a branch that is an
 /// alias of another is refused (4), not resolved (3.3 review 2). Refuses (4) a detached
 /// `HEAD`, and an open rebase.
-fn current_branch(checkout: &Checkout) -> Result<String> {
+pub fn current_branch(checkout: &Checkout, command: &str) -> Result<String> {
     let out = git::output(
         &checkout.root,
         ["symbolic-ref", "--no-recurse", "-q", "HEAD"],
@@ -266,7 +266,7 @@ fn current_branch(checkout: &Checkout) -> Result<String> {
             return Ok(b.to_owned());
         }
         return Err(Failure::refused(format!(
-            "HEAD names {r}, not a branch: follow runs on a branch atelier started"
+            "HEAD names {r}, not a branch: {command} runs on a branch atelier started"
         )));
     }
     for sub in ["rebase-merge", "rebase-apply"] {
@@ -276,9 +276,9 @@ fn current_branch(checkout: &Checkout) -> Result<String> {
             return Err(Failure::refused(format!("{b}: {FINISH_REBASE}")));
         }
     }
-    Err(Failure::refused(
-        "HEAD is detached: follow runs on a branch atelier started",
-    ))
+    Err(Failure::refused(format!(
+        "HEAD is detached: {command} runs on a branch atelier started"
+    )))
 }
 
 /// The exit-5 failure after a rebase stopped, with the files; runs the resolver first.

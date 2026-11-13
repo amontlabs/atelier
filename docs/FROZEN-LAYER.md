@@ -130,6 +130,7 @@ When nothing lives, the record is removed.
 | `base` | string | full commit id (40 or 64 lowercase hex digits) of what it is built on |
 | `state` | string | `active`, `merged` or `cleaned` |
 | `pending` | table, optional | a `follow` not settled yet: `target` and `old_base`, full commit ids |
+| `merged` | table, optional | what `merge` recorded when it set `state` to `merged`, and `clean` trusts (below); removed when the state becomes `cleaned` |
 | `starting` | table, optional | a `start` not finished yet: `worktree` (absolute path, UTF-8, where the branch is checked out) and `new_worktree` (boolean: `start` creates that worktree, or switches the detached worktree it ran in) |
 
 Commit ids are checked when a record is read and when it is written.
@@ -187,12 +188,35 @@ Lifecycle, the same for every version:
 - A writer holds the branch's lock (`locks/branch/<key>.lock`) while it reads and writes the
   record.
 
+## Merge facts
+
+The `merged` table of a branch record is written by `merge` in the same write that sets `state` to
+`merged` (`records::MergeFacts::record`), and removed by `clean` in the write that sets `cleaned`
+(`MergeFacts::retire`). A record in state `merged` without it grants `clean` nothing.
+
+| Field | Type | Meaning |
+|---|---|---|
+| `commit` | string | full commit id the branch was merged at: its tip when `approve` recorded it |
+| `worktree` | string | the one worktree `clean` may delete for this branch: absolute, canonical, UTF-8, recorded by `approve` |
+| `dev`, `ino` | integers | that worktree folder's file-system identity when `approve` recorded it |
+
+`clean` deletes only a worktree that is still that folder (identity and canonical path), with the
+branch checked out at `commit`; it deletes the branch only while the ref still holds `commit`.
+
 ## Temp-folder registry entries
 
 | Field | Type | Meaning |
 |---|---|---|
 | `path` | string | the folder's canonical path (no symbolic link in it); UTF-8 only |
 | `dev`, `ino` | integers | its file-system identity when registered |
+
+The entry's file name is `<entry id>.toml` (lowercase hex). `tmp` makes the folder at
+`<temp dir>/atelier/<repo id>/<branch key>/<entry id>/` (`<repo id>`: the 64-bit FNV-1a hash of the
+canonical common git folder, 16 hex digits; `<branch key>`: `names::key` of the branch), or with
+`--short` at `/tmp/atl-<entry id>/`, always mode 0700. `clean` removes a folder only when its
+registered path has exactly that shape, is canonical and still names a real folder with the
+registered identity owned by this user, and its `leftovers` file (one line per thing created
+outside the folder) is empty or absent.
 
 ## The versioned layer's format number
 

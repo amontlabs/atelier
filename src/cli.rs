@@ -340,6 +340,14 @@ pub fn run(cmd: Cmd, cwd: &Path) -> Result<Exit> {
             let ctx = preflight::run(cwd, cmd.name(), cmd.needs())?;
             return crate::follow::run(&ctx);
         }
+        Cmd::Tmp { short, command } => {
+            let ctx = preflight::run(cwd, cmd.name(), cmd.needs())?;
+            return crate::tmp::run(&ctx, cwd, *short, command);
+        }
+        Cmd::Clean { branches, yes } => {
+            let ctx = preflight::run(cwd, cmd.name(), cmd.needs())?;
+            return crate::clean::run(&ctx, branches, *yes);
+        }
         _ => {
             let _context = preflight::run(cwd, cmd.name(), cmd.needs())?;
         }

@@ -10,7 +10,7 @@ parts the project uses.
 The design is kept outside this repository (`DESIGN.md`, revision 5, with mechanics in
 `DESIGN-r4.md`). The formats every version shares are in [docs/FROZEN-LAYER.md](docs/FROZEN-LAYER.md).
 
-## Status: modules 3.1, 3.2, 3.3, 3.6 and 3.7
+## Status: modules 3.1, 3.2, 3.3, 3.5, 3.6 and 3.7
 
 Built so far, with tests on throwaway git repositories:
 
@@ -44,7 +44,15 @@ Module 3.6, machines: the owner's machines file, `atelier machines`, `atelier ma
 <name>`, `atelier test <platform>|--all [-- <command>…]`, and remote runs over ssh (`ssh -tt`,
 the hang-up watcher, the result read with a second ssh). See [docs/MACHINES.md](docs/MACHINES.md).
 
-The other commands (`merge`, `tmp`/`clean`, `status`) come in later modules.
+`atelier tmp [--short] -- <command>` (module 3.5) runs a command with a registered temp folder in
+`ATELIER_TMP` for the branch checked out in the current worktree, holding the branch lock until
+the command ends. `atelier clean [<branch>…] [--yes]` prints a plan, or with `--yes` deletes what
+`merge` recorded as merged: the worktree `approve` recorded, the branch, its registered temp
+folders and its mbx build, each condition re-checked at the moment of deletion (`src/clean.rs`).
+It reads the merged commit and the recorded worktree from the branch record's `merged` table
+(`docs/FROZEN-LAYER.md`); module 3.4 writes it.
+
+The other commands (`approve`, `merge`, `promote`, `status`) come in later modules.
 
 ## Layout
 
@@ -64,6 +72,7 @@ The other commands (`merge`, `tmp`/`clean`, `status`) come in later modules.
 | `refs`, `names`, `git` | plain refs and `--no-deref` updates; branch names and file keys; running git |
 | `stack` | branch record rules: settling `follow`, the base check, targets, "current", dependents |
 | `start`, `follow` | the two commands |
+| `tmp`, `clean` | the two commands (module 3.5); `clean` also holds the plan and every re-check |
 | `rules` | rules currency check (stub until module 3.7) |
 | `check`, `prereq`, `nextest` | the `check` command; tool and mbx prerequisites; nextest flags, file refusals and result parsing |
 | `testcmd` | `test`, `machines`, `machines init` |
