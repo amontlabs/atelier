@@ -11,6 +11,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 
 use atelier::locks::{HeldLock, LockKey};
+use atelier::runs::{RunInfo, RunKind, RunResult, TestCounts};
 use atelier::state::State;
 use common::*;
 
@@ -116,6 +117,7 @@ impl Fx {
                 self.nextest
             ),
         );
+        self.repo.write_rules();
     }
 
     /// Settings pinned to the real nextest, after the fixture has been built.
@@ -156,9 +158,13 @@ impl Fx {
             .env("GIT_CONFIG_NOSYSTEM", "1")
             .env_remove("ATELIER_DISPATCHED")
             .env_remove("ATELIER_RUN")
+            .env_remove("ATELIER_RUNS")
             .env_remove("MBX_DISABLE")
             .env_remove("CARGO_TARGET_DIR")
+            .env_remove("CARGO_BUILD_TARGET_DIR")
             .env_remove("RUSTC_WRAPPER")
+            .env_remove("CARGO_BUILD_RUSTC_WRAPPER")
+            .env_remove("RUSTC_WORKSPACE_WRAPPER")
             .env_remove("NEXTEST_RETRIES")
             .env_remove("NEXTEST_FLAKY_RESULT");
         for (k, v) in env {
@@ -251,6 +257,19 @@ fn a_green_check_prints_the_design_line_and_records_every_test() {
     );
 
     assert!(result_text(&run).contains("outcome = \"passed\""));
+    let result = RunResult::read(&run).unwrap().unwrap();
+    assert_eq!(result.kind, RunKind::Check);
+    assert_eq!(
+        result.tests,
+        Some(TestCounts {
+            passed: 2,
+            ..TestCounts::default()
+        })
+    );
+    assert_eq!(result.test_results.as_deref(), Some("tests.tsv"));
+    let info = RunInfo::read(&run).unwrap().unwrap();
+    assert_eq!(info.kind, RunKind::Check);
+    assert_eq!(info.runs, vec![id.to_owned()]);
     let tsv = fs::read_to_string(run.join("tests.tsv")).unwrap();
     assert_eq!(tsv.lines().count(), 2, "{tsv}");
     assert!(tsv.contains("\tpass\t"), "{tsv}");
@@ -311,6 +330,15 @@ fn a_failing_test_is_red_and_named() {
     );
     let tsv = fs::read_to_string(fx.last_run().join("tests.tsv")).unwrap();
     assert!(tsv.contains("\tfail\t"), "{tsv}");
+    let tests = RunResult::read(&fx.last_run()).unwrap().unwrap().tests;
+    assert_eq!(
+        tests,
+        Some(TestCounts {
+            passed: 1,
+            failed: 1,
+            ..TestCounts::default()
+        })
+    );
 }
 
 #[test]
@@ -482,6 +510,15 @@ fn an_exclusion_is_printed_with_its_reason_and_counted() {
         "{}",
         last_line(&out)
     );
+    let tests = RunResult::read(&fx.last_run()).unwrap().unwrap().tests;
+    assert_eq!(
+        tests,
+        Some(TestCounts {
+            passed: 2,
+            excluded: 1,
+            ..TestCounts::default()
+        })
+    );
 }
 
 #[test]
@@ -495,6 +532,25 @@ fn every_job_runs_without_retries_whatever_the_callers_shell_exports() {
         &[("NEXTEST_RETRIES", "5"), ("NEXTEST_FLAKY_RESULT", "pass")],
     );
     assert_eq!(code(&out), 0, "{}", stdout(&out));
+}
+
+#[test]
+fn a_check_inside_another_run_carries_both_run_ids() {
+    let outer = "20261113T1012Z-4f2a09c1d3e5b7a8";
+    let fx = Fx::new(&shell_step(
+        "markers",
+        "echo \"$ATELIER_RUN $ATELIER_RUNS\"",
+    ));
+    let out = fx.check_env(&[], &[("ATELIER_RUN", outer), ("ATELIER_RUNS", outer)]);
+    assert_eq!(code(&out), 0, "{}\n{}", stdout(&out), stderr(&out));
+    let run = fx.last_run();
+    let id = run.file_name().unwrap().to_str().unwrap();
+    assert_eq!(
+        RunInfo::read(&run).unwrap().unwrap().runs,
+        vec![outer.to_owned(), id.to_owned()]
+    );
+    let log = fs::read_to_string(run.join("markers.log")).unwrap();
+    assert_eq!(log.trim(), format!("{id} {outer}:{id}"));
 }
 
 #[test]
@@ -517,6 +573,10 @@ fn compile_only_runs_the_compile_steps_and_never_says_green() {
     assert!(line.starts_with("compile: OK — run "), "{line}");
     assert!(!stdout(&out).contains("GREEN"));
     let run = fx.last_run();
+    let result = RunResult::read(&run).unwrap().unwrap();
+    assert_eq!(result.kind, RunKind::CheckCompile);
+    assert_eq!(result.tests, None);
+    assert_eq!(result.test_results, None);
     assert!(run.join("typecheck.log").is_file());
     assert!(!run.join("frontend.log").exists());
     assert!(!run.join("tests.log").exists());
@@ -629,7 +689,13 @@ fn with_mbx_the_listed_setup_is_green_and_every_deviation_is_refused() {
     fs::remove_file(fx.repo.root.join(".mbx.toml")).unwrap();
 
     // Bypass variables.
-    for var in ["MBX_DISABLE", "CARGO_TARGET_DIR", "RUSTC_WRAPPER"] {
+    for var in [
+        "MBX_DISABLE",
+        "CARGO_TARGET_DIR",
+        "RUSTC_WRAPPER",
+        "CARGO_BUILD_RUSTC_WRAPPER",
+        "RUSTC_WORKSPACE_WRAPPER",
+    ] {
         let out = fx.check_env(&[], &[(var, "1")]);
         assert_eq!(code(&out), 4, "{var}");
         assert!(

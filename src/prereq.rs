@@ -26,7 +26,7 @@ use crate::exit::{Failure, Result};
 use crate::git::{self, Checkout};
 use crate::nextest;
 use crate::platform::Platform;
-use crate::procs::{self, RUN_MARKER};
+use crate::procs::{self, RUN_MARKER, RUNS_MARKER};
 use crate::settings::{Mbx, Settings, Tool};
 
 /// Environment variables that make mbx step aside (mbx §3, §4).
@@ -35,12 +35,18 @@ const MBX_BYPASS_VARS: &[&str] = &[
     "CARGO_TARGET_DIR",
     "CARGO_BUILD_TARGET_DIR",
     "RUSTC_WRAPPER",
+    "CARGO_BUILD_RUSTC_WRAPPER",
+    "RUSTC_WORKSPACE_WRAPPER",
 ];
 
-/// A command whose environment carries the run marker.
+/// A command whose environment carries the run markers as a step's does: `ATELIER_RUN=<marker>`
+/// and `ATELIER_RUNS` with the outer runs' ids, then the marker.
 fn command(program: impl AsRef<std::ffi::OsStr>, marker: &str) -> Command {
+    let mut runs = procs::inherited_runs();
+    runs.retain(|id| id != marker);
+    runs.push(marker.to_owned());
     let mut cmd = Command::new(program);
-    cmd.env(RUN_MARKER, marker);
+    cmd.env(RUN_MARKER, marker).env(RUNS_MARKER, runs.join(":"));
     cmd
 }
 
@@ -739,6 +745,24 @@ pub fn display(checkout: &Checkout, p: &Path) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn commands_carry_the_run_markers_like_steps() {
+        let marker = "20261113T1012Z-4f2a09c1d3e5b7a8";
+        let cmd = command("true", marker);
+        let envs: BTreeMap<_, _> = cmd
+            .get_envs()
+            .map(|(k, v)| (k.to_owned(), v.map(|v| v.to_owned())))
+            .collect();
+        assert_eq!(
+            envs[std::ffi::OsStr::new(RUN_MARKER)].as_deref(),
+            Some(std::ffi::OsStr::new(marker))
+        );
+        let runs = envs[std::ffi::OsStr::new(RUNS_MARKER)].clone().unwrap();
+        let runs = runs.to_str().unwrap();
+        assert!(runs.split(':').next_back() == Some(marker), "{runs}");
+        assert_eq!(runs.split(':').filter(|id| *id == marker).count(), 1);
+    }
 
     fn listed() -> BTreeMap<String, toml::Value> {
         let mut m = BTreeMap::new();

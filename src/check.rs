@@ -17,9 +17,12 @@ use crate::nextest::{self, Verdict};
 use crate::platform::Platform;
 use crate::preflight::Context;
 use crate::prereq::{self, Workspace};
-use crate::runs::{self, Outcome, Run, RunResult, StepStatus};
+use crate::runs::{self, Outcome, Run, RunKind, RunResult, StepStatus, TestCounts};
 use crate::settings::Exclude;
 use crate::tree;
+
+/// The per-test results in the run folder: workspace, test, verdict, seconds, tab-separated.
+const TEST_RESULTS: &str = "tests.tsv";
 
 /// Runs the check; the exit code is 0 for GREEN (or `compile: OK`) and 1 for RED.
 pub fn run(ctx: &Context, compile_only: bool) -> Result<Exit> {
@@ -35,6 +38,11 @@ pub fn run(ctx: &Context, compile_only: bool) -> Result<Exit> {
     let mut run = Run::start_with_id(
         &ctx.state,
         LockKey::worktree(checkout),
+        if compile_only {
+            RunKind::CheckCompile
+        } else {
+            RunKind::Check
+        },
         "check",
         &checkout.root,
         Some(&marker),
@@ -65,6 +73,7 @@ pub fn run(ctx: &Context, compile_only: bool) -> Result<Exit> {
         stop: false,
         tests: 0,
         excluded: 0,
+        counts: None,
         compile_only,
     };
     c.hooks()?;
@@ -77,12 +86,20 @@ pub fn run(ctx: &Context, compile_only: bool) -> Result<Exit> {
     c.end(&snapshot);
 
     let Checker {
-        run,
+        mut run,
         extras,
         tests,
         excluded,
+        counts,
         ..
     } = c;
+    if let Some(mut counts) = counts {
+        counts.excluded = excluded as u64;
+        run.set_tests(counts);
+        if run_dir.join(TEST_RESULTS).is_file() {
+            run.set_test_results(TEST_RESULTS);
+        }
+    }
     let result = run.finish(extras.is_empty())?;
     let elapsed = started.elapsed();
     Ok(report(
@@ -108,6 +125,8 @@ struct Checker<'a> {
     stop: bool,
     tests: usize,
     excluded: usize,
+    /// The result's test counts, once a test step has run.
+    counts: Option<TestCounts>,
     compile_only: bool,
 }
 
@@ -335,6 +354,14 @@ impl Checker<'_> {
             let ok = self.step(&name, &argv, &ws.dir, Some(&file))?;
             let stream = fs::read_to_string(self.run.dir().join(&file)).unwrap_or_default();
             let results = nextest::parse_results(&stream);
+            let counts = self.counts.get_or_insert_with(TestCounts::default);
+            for r in &results {
+                match r.verdict {
+                    Verdict::Passed => counts.passed += 1,
+                    Verdict::Failed => counts.failed += 1,
+                    Verdict::Ignored => counts.skipped += 1,
+                }
+            }
             self.tests += results
                 .iter()
                 .filter(|r| r.verdict != Verdict::Ignored)
@@ -352,7 +379,7 @@ impl Checker<'_> {
                     println!("    failed test: {}", r.name);
                 }
             }
-            append(&self.run.dir().join("tests.tsv"), &tsv);
+            append(&self.run.dir().join(TEST_RESULTS), &tsv);
             if ok && results.is_empty() {
                 self.fail(
                     &name,
