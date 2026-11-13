@@ -982,7 +982,7 @@ fn machines_init_prints_its_plan_and_replaces_another_install_only_with_yes() {
     assert!(text.starts_with("box: plan\n"), "{text}");
     assert!(text.contains("create it (git init)"), "{text}");
     assert!(
-        text.contains("replace 0.1.0 0000000000000000 at ~/.local/share/atelier/"),
+        text.contains("replace atelier 0.1.0 0000000000000000 at ~/.local/share/atelier/"),
         "{text}"
     );
     assert!(
@@ -1020,7 +1020,7 @@ fn remote_commands_survive_a_tcsh_login_shell() {
     assert_eq!(stdout(&out).trim(), format!("{}: PASS on box", here()));
     let out = run(&["machines"]);
     assert!(
-        stdout(&out).contains("reachable, ready, free"),
+        stdout(&out).contains("reachable, ready (prerequisites checked at run time), free"),
         "{}",
         both(&out)
     );
@@ -1323,4 +1323,138 @@ fn a_machine_without_a_prerequisite_is_passed_over_once_the_run_starts() {
         )) && line.contains("box2 not ready: "),
         "{line}"
     );
+}
+
+/// A machine `inst` whose `path` starts with stand-ins for `cargo` (it "builds" by linking the
+/// binary under test into `--root`) and `rustc` (its exchange probe fails when the machine's
+/// HOME has `no-exchange`); each logs its calls in that HOME.
+fn install_world() -> (World, PathBuf) {
+    let w = World::new("");
+    let home = w.add_machine("inst");
+    let tools = w.machines.join("inst-tools");
+    fs::create_dir_all(&tools).unwrap();
+    let cargo = format!(
+        "#!/bin/sh\necho \"$@\" >> \"$HOME/cargo.log\"\nwhile [ $# -gt 0 ]; do [ \"$1\" = --root ] && root=$2; shift; done\nmkdir -p \"$root/bin\" && ln -s '{}' \"$root/bin/atelier\"\n",
+        atelier_bin().display()
+    );
+    let rustc = "#!/bin/sh\necho \"$@\" >> \"$HOME/rustc.log\"\nwhile [ $# -gt 0 ]; do [ \"$1\" = -o ] && out=$2; shift; done\nif [ -e \"$HOME/no-exchange\" ]; then printf '#!/bin/sh\\necho \"exchanging two folders in $1: Operation not supported (os error 45)\" >&2; exit 1\\n' > \"$out\"; else printf '#!/bin/sh\\nexit 0\\n' > \"$out\"; fi\nchmod +x \"$out\"\n";
+    use std::os::unix::fs::PermissionsExt;
+    for (name, text) in [("cargo", cargo.as_str()), ("rustc", rustc)] {
+        fs::write(tools.join(name), text).unwrap();
+        fs::set_permissions(tools.join(name), fs::Permissions::from_mode(0o755)).unwrap();
+    }
+    w.machines_file(Some(&format!(
+        "\n[machines.inst]\nssh = \"inst\"\nplatform = \"{}\"\npriority = 50\npath = [\"{}\", \"/usr/bin\", \"/bin\"]\ncheckouts = \"~/checkouts\"\n",
+        here(),
+        tools.display()
+    )));
+    (w, home)
+}
+
+fn replaced_folders(home: &Path) -> Vec<PathBuf> {
+    let root = home.join(".local/share/atelier");
+    let mut all: Vec<PathBuf> = fs::read_dir(&root)
+        .unwrap()
+        .map(|e| e.unwrap().path())
+        .filter(|p| {
+            p.file_name()
+                .unwrap()
+                .to_string_lossy()
+                .starts_with(&format!(".{VERSION}.replaced-"))
+        })
+        .collect();
+    all.sort();
+    all
+}
+
+#[test]
+fn machines_init_replaces_a_broken_install_with_yes() {
+    let (w, home) = install_world();
+    let v = home.join(format!(".local/share/atelier/{VERSION}"));
+    fs::remove_file(v.join("bin/atelier")).unwrap();
+    fs::write(v.join("note"), "left by an interrupted install\n").unwrap();
+
+    let out = w.run(&["machines", "init", "inst"]);
+    assert_eq!(code(&out), 4, "{}", both(&out));
+    assert!(
+        stdout(&out).contains(
+            "replace a broken install (no bin/atelier that answers) at ~/.local/share/atelier/"
+        ),
+        "{}",
+        both(&out)
+    );
+    assert!(
+        stderr(&out).contains("inst has a broken install (no bin/atelier that answers)")
+            && stderr(&out).contains("--yes"),
+        "{}",
+        both(&out)
+    );
+    assert!(!home.join("cargo.log").exists(), "nothing built");
+
+    let out = w.run(&["machines", "init", "inst", "--yes"]);
+    assert_eq!(code(&out), 0, "{}", both(&out));
+    assert!(home.join("cargo.log").exists(), "built");
+    assert!(
+        stdout(&out).contains(&format!("inst: atelier {VERSION} ")),
+        "{}",
+        both(&out)
+    );
+    let kept = replaced_folders(&home);
+    assert_eq!(kept.len(), 1, "{kept:?}");
+    assert_eq!(
+        fs::read_to_string(kept[0].join("note")).unwrap(),
+        "left by an interrupted install\n"
+    );
+    // Installed: init has nothing more to do.
+    let out = w.run(&["machines", "init", "inst"]);
+    assert_eq!(code(&out), 0, "{}", both(&out));
+    assert!(stdout(&out).contains("installed already"), "{}", both(&out));
+}
+
+#[test]
+fn a_filesystem_that_cannot_exchange_folders_is_refused_before_the_build() {
+    let (w, home) = install_world();
+    let script = "#!/bin/sh\necho '0.1.0 0000000000000000'\n";
+    let bin = w.replace_bin("inst", script);
+    fs::write(home.join("no-exchange"), "").unwrap();
+    let out = w.run(&["machines", "init", "inst", "--yes"]);
+    assert_eq!(code(&out), 4, "{}", both(&out));
+    assert!(
+        stderr(&out)
+            .contains("cannot exchange two folders in one step (exchanging two folders in ")
+            && stderr(&out).contains("Operation not supported")
+            && stderr(&out).contains("nothing was built or changed"),
+        "{}",
+        both(&out)
+    );
+    assert!(home.join("rustc.log").exists(), "the probe was compiled");
+    assert!(!home.join("cargo.log").exists(), "nothing built");
+    assert_eq!(fs::read_to_string(&bin).unwrap(), script, "not replaced");
+    assert!(replaced_folders(&home).is_empty());
+}
+
+#[test]
+fn only_the_newest_replaced_install_is_kept() {
+    let (w, home) = install_world();
+    for n in 0..3 {
+        let script = format!("#!/bin/sh\necho '0.1.0 000000000000000{n}'\n");
+        w.replace_bin("inst", &script);
+        let out = w.run(&["machines", "init", "inst", "--yes"]);
+        assert_eq!(code(&out), 0, "{}", both(&out));
+        let kept = replaced_folders(&home);
+        assert_eq!(kept.len(), 1, "{kept:?}");
+        assert_eq!(
+            fs::read_to_string(kept[0].join("bin/atelier")).unwrap(),
+            script
+        );
+        assert!(
+            stdout(&out).contains(&format!(
+                "the replaced install is kept at {}",
+                kept[0].display()
+            )),
+            "{}",
+            both(&out)
+        );
+        std::thread::sleep(Duration::from_millis(1100));
+    }
 }

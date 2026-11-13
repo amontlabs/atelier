@@ -572,11 +572,14 @@ impl Remote {
         Ok(String::from_utf8_lossy(&out.stdout).trim().to_owned())
     }
 
-    /// The installed pinned atelier's identity there (`<version> <hash>`), `None` if missing.
+    /// What the pinned version's install folder there holds, by the rule of
+    /// [`crate::remote_run::install_state`]: `None` when there is nothing, else its identity
+    /// (`<version> <hash>`) or [`crate::remote_run::BROKEN`].
     pub fn installed_identity(&self) -> std::result::Result<Option<String>, String> {
         let script = format!(
-            "b={bin}; if [ -x \"$b\" ]; then ATELIER_DISPATCHED=1 \"$b\" remote-run identity; fi",
-            bin = self.bin()
+            "d={dir}; b=\"$d/bin/atelier\"; if [ -e \"$d\" ] || [ -L \"$d\" ]; then id=; if [ -x \"$b\" ]; then id=$(ATELIER_DISPATCHED=1 \"$b\" remote-run identity 2>/dev/null </dev/null) || id=; fi; if [ -n \"$id\" ]; then printf '%s\\n' \"$id\"; else echo {broken}; fi; else echo none; fi",
+            dir = shell_path(&format!("~/.local/share/atelier/{VERSION}")),
+            broken = crate::remote_run::BROKEN,
         );
         let out = self
             .ssh(false, &script)
@@ -586,15 +589,20 @@ impl Remote {
         if !out.status.success() {
             return Err(last_line(&out.stderr));
         }
-        let text = String::from_utf8_lossy(&out.stdout).trim().to_owned();
-        Ok((!text.is_empty()).then_some(text))
+        match String::from_utf8_lossy(&out.stdout).trim() {
+            "none" => Ok(None),
+            "" => Err("the machine did not say what is installed".to_owned()),
+            text => Ok(Some(text.to_owned())),
+        }
     }
 
     /// Builds this binary's own source there with cargo into a new folder, then has the new
     /// program swap it in at `~/.local/share/atelier/<version>/` under the machine lock
-    /// (`remote-run install`), provided the install there is still `expect` (`None`: none). A
-    /// replaced folder is kept beside it, never deleted. cargo's output goes to this program's
-    /// stderr.
+    /// (`remote-run install`), provided the install there is still `expect` (`None`: none). The
+    /// replaced folder is kept beside it, and older replaced folders of this version are
+    /// removed. To replace an install, the filesystem must exchange two folders in one step:
+    /// before the build, `src/exchange.rs` compiled on its own with `rustc` checks that it does.
+    /// cargo's output goes to this program's stderr.
     pub fn install(&self, expect: Option<&str>) -> std::result::Result<Installed, String> {
         let nonce = new_nonce();
         let script = format!(
@@ -608,6 +616,10 @@ impl Remote {
              tar -xf - -C \"$src\"\n\
              cd \"$src\"\n\
              {path}export PATH\n\
+             if [ {expect} != none ]; then\n\
+             rustc --edition 2024 -o \"$src/exchange-probe\" src/exchange.rs >&2\n\
+             if ! why=$(\"$src/exchange-probe\" \"$root\" 2>&1); then printf '%s%s\\n' {cannot} \"$(printf '%s' \"$why\" | tr '\\n' ' ')\"; exit 0; fi\n\
+             fi\n\
              MBX_DISABLE=1 CARGO_TARGET_DIR=\"$src/target\" cargo install --locked --quiet --path . --root \"$new\" >&2\n\
              rm -f \"$new/.crates.toml\" \"$new/.crates2.json\"\n\
              trap 'rm -rf \"$src\"' EXIT\n\
@@ -619,6 +631,7 @@ impl Remote {
             },
             expect = sq(expect.unwrap_or("none")),
             nonce = sq(&nonce),
+            cannot = sq(&format!("{}cannot-exchange ", tag(&nonce))),
         );
         let mut cmd = self.ssh(false, &script);
         cmd.stdin(Stdio::piped())
@@ -649,6 +662,11 @@ impl Remote {
                 return Ok(Installed::Changed(id.to_owned()));
             } else if let Some(e) = l.strip_prefix("error ") {
                 return Err(format!("the install there failed: {e}"));
+            } else if let Some(why) = l.strip_prefix("cannot-exchange ") {
+                return Err(format!(
+                    "~/.local/share/atelier there cannot exchange two folders in one step ({why}); machines init replaces an install only that way, so nothing was built or changed: move ~/.local/share/atelier/{VERSION} away, or put ~/.local/share/atelier on a local filesystem, and run atelier machines init {} again",
+                    self.name
+                ));
             }
         }
         Err(format!(

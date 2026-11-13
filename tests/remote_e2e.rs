@@ -124,7 +124,7 @@ checkouts = "~/atelier-exp/checkouts"
 
     let out = atelier(&["machines"]).output().unwrap();
     eprintln!("machines:\n{}", both(&out));
-    assert!(stdout(&out).contains("reachable, ready, free"));
+    assert!(stdout(&out).contains("reachable, ready (prerequisites checked at run time), free"));
 
     let t = Instant::now();
     let out = atelier(&["test", "linux-x86_64"]).output().unwrap();

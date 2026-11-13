@@ -10,6 +10,7 @@ pub mod check;
 pub mod cli;
 pub mod dirfd;
 pub mod dispatch;
+pub mod exchange;
 pub mod exit;
 pub mod follow;
 pub mod fsutil;

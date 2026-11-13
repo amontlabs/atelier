@@ -620,10 +620,18 @@ pub fn init(ctx: &Context, name: &str, yes: bool) -> Result<Exit> {
             "create it (git init)"
         }
     );
+    let what = |h: &str| {
+        if h == crate::remote_run::BROKEN {
+            "a broken install (no bin/atelier that answers)".to_owned()
+        } else {
+            format!("atelier {h}")
+        }
+    };
     match have.as_deref() {
         Some(h) if h == want => println!("  atelier {want}: installed already at {place}"),
         Some(h) => println!(
-            "  atelier: replace {h} at {place} with {want}, built there from this program's source (cargo install --locked), swapped in under the machine lock; the replaced folder is kept beside it"
+            "  atelier: replace {} at {place} with {want}, built there from this program's source (cargo install --locked), swapped in under the machine lock; the replaced folder is kept beside it, and an older replaced folder of this version is removed",
+            what(h)
         ),
         None => println!(
             "  atelier {want}: build it there from this program's source (cargo install --locked) and install it at {place}"
@@ -634,7 +642,8 @@ pub fn init(ctx: &Context, name: &str, yes: bool) -> Result<Exit> {
         && !yes
     {
         return Err(Failure::refused(format!(
-            "{name} has atelier {h} at {place}, which the machine's own projects may use: nothing was changed; run atelier machines init {name} --yes to replace it"
+            "{name} has {} at {place}, which the machine's own projects may use: nothing was changed; run atelier machines init {name} --yes to replace it",
+            what(h)
         )));
     }
 
@@ -657,7 +666,9 @@ pub fn init(ctx: &Context, name: &str, yes: bool) -> Result<Exit> {
     {
         Installed::Done(kept) => {
             if let Some(k) = kept {
-                println!("{name}: the replaced install is kept at {k}");
+                println!(
+                    "{name}: the replaced install is kept at {k}; remove it when nothing runs from it"
+                );
             }
         }
         Installed::Busy(h) => {

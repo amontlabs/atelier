@@ -69,6 +69,7 @@ pub const FILES: &[(&str, &[u8])] = &[
     src_file!("src/check.rs", "check.rs"),
     src_file!("src/cli.rs", "cli.rs"),
     src_file!("src/dispatch.rs", "dispatch.rs"),
+    src_file!("src/exchange.rs", "exchange.rs"),
     src_file!("src/exit.rs", "exit.rs"),
     src_file!("src/fsutil.rs", "fsutil.rs"),
     src_file!("src/git.rs", "git.rs"),

@@ -426,12 +426,40 @@ enum Installed {
     Changed(String),
 }
 
+/// What an install folder holds, by one rule that `machines init` applies too (in shell, before
+/// the build): `none` when there is nothing at the path, the identity that its `bin/atelier
+/// remote-run identity` prints, or [`BROKEN`] when that program is missing, not executable, fails
+/// or prints nothing.
+pub fn install_state(to: &Path) -> String {
+    if fs::symlink_metadata(to).is_err() {
+        return "none".to_owned();
+    }
+    let out = std::process::Command::new(to.join("bin/atelier"))
+        .args(["remote-run", "identity"])
+        .env(crate::dispatch::DISPATCHED_VAR, "1")
+        .stdin(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .output();
+    match out {
+        Ok(o) if o.status.success() => match String::from_utf8_lossy(&o.stdout).trim() {
+            "" => BROKEN.to_owned(),
+            id => id.to_owned(),
+        },
+        _ => BROKEN.to_owned(),
+    }
+}
+
+/// An install folder without a working `bin/atelier`.
+pub const BROKEN: &str = "broken";
+
 /// Swaps `from` in as this version's install folder under the machine lock, if the install
-/// there is still `expect`. A failure before the swap removes `from` (this program's own new
-/// folder, nothing else uses it).
+/// there is still `expect`, then removes this version's older replaced folders: only the newest
+/// is kept. Before the exchange, a failure removes `from` (this program's own new folder, nothing
+/// else uses it); after it, `from` may hold the old install and is never removed.
 fn install(home: &Path, from: &Path, expect: &str) -> std::result::Result<Installed, String> {
-    let result = install_locked(home, from, expect);
-    if !matches!(result, Ok(Installed::Done(_))) {
+    let mut exchanged = false;
+    let result = install_locked(home, from, expect, &mut exchanged);
+    if !exchanged && !matches!(result, Ok(Installed::Done(_))) {
         let _ = fs::remove_dir_all(from);
     }
     result
@@ -441,6 +469,7 @@ fn install_locked(
     home: &Path,
     from: &Path,
     expect: &str,
+    exchanged: &mut bool,
 ) -> std::result::Result<Installed, String> {
     let _lock = match MachineLock::try_take(home, "atelier machines init") {
         Ok(Some(l)) => l,
@@ -448,78 +477,84 @@ fn install_locked(
         Err(f) => return Err(f.message),
     };
     let to = crate::dispatch::install_root(home).join(crate::dispatch::VERSION);
-    let bin = to.join("bin/atelier");
-    let found = if bin.exists() {
-        let out = std::process::Command::new(&bin)
-            .args(["remote-run", "identity"])
-            .env(crate::dispatch::DISPATCHED_VAR, "1")
-            .stdin(std::process::Stdio::null())
-            .output()
-            .map_err(|e| format!("{}: {e}", bin.display()))?;
-        String::from_utf8_lossy(&out.stdout).trim().to_owned()
-    } else if fs::symlink_metadata(&to).is_ok() {
-        "an install without bin/atelier".to_owned()
-    } else {
-        "none".to_owned()
-    };
+    let found = install_state(&to);
     if found != expect {
         return Ok(Installed::Changed(found));
     }
-    swap_in(from, &to).map(Installed::Done)
+    let kept = swap_in(from, &to, exchanged)?;
+    remove_older_replaced(&to, kept.as_deref());
+    Ok(Installed::Done(kept))
+}
+
+/// The name of a replaced folder of `to`: `.<name>.replaced-<time>-<pid>`, which sorts by time.
+fn replaced_prefix(to: &Path) -> String {
+    format!(
+        ".{}.replaced-",
+        to.file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_default()
+    )
+}
+
+/// Removes the replaced folders of `to` except the newest: `kept`, the install just replaced,
+/// wherever it is; without one, the newest by name.
+fn remove_older_replaced(to: &Path, kept: Option<&Path>) {
+    let Some(dir) = to.parent() else { return };
+    let prefix = replaced_prefix(to);
+    let mut all: Vec<PathBuf> = fs::read_dir(dir)
+        .into_iter()
+        .flatten()
+        .flatten()
+        .filter(|e| e.file_name().to_string_lossy().starts_with(&prefix))
+        .map(|e| e.path())
+        .collect();
+    all.sort();
+    let newest = match kept {
+        Some(k) => Some(k.to_path_buf()),
+        None => all.last().cloned(),
+    };
+    for p in all {
+        if Some(&p) != newest.as_ref() {
+            let _ = fs::remove_dir_all(&p);
+        }
+    }
 }
 
 /// Puts `from` at `to` in one step: a rename when `to` is absent, else an atomic exchange of the
 /// two (no moment without an install), after which the old folder is renamed to
 /// `.<name>.replaced-<time>-<pid>` beside it and kept: a program may still run from it.
-pub fn swap_in(from: &Path, to: &Path) -> std::result::Result<Option<PathBuf>, String> {
+pub fn swap_in(
+    from: &Path,
+    to: &Path,
+    exchanged: &mut bool,
+) -> std::result::Result<Option<PathBuf>, String> {
+    let (y, mo, d, h, mi, sec) = crate::fsutil::utc_parts(crate::fsutil::now_secs());
+    let kept = to.with_file_name(format!(
+        "{}{y:04}{mo:02}{d:02}T{h:02}{mi:02}{sec:02}Z-{}",
+        replaced_prefix(to),
+        std::process::id()
+    ));
+    swap_in_keeping(from, to, &kept, exchanged)
+}
+
+/// [`swap_in`] with the name the old folder is kept under. When that rename fails, the old
+/// install stays where the exchange put it, at `from`, which is returned instead.
+fn swap_in_keeping(
+    from: &Path,
+    to: &Path,
+    kept: &Path,
+    exchanged: &mut bool,
+) -> std::result::Result<Option<PathBuf>, String> {
     let shown = |e: std::io::Error| format!("{} → {}: {e}", from.display(), to.display());
     if fs::symlink_metadata(to).is_err() {
         fs::rename(from, to).map_err(shown)?;
         return Ok(None);
     }
-    exchange(from, to).map_err(shown)?;
-    let name = to
-        .file_name()
-        .map(|n| n.to_string_lossy().into_owned())
-        .unwrap_or_default();
-    let (y, mo, d, h, mi, sec) = crate::fsutil::utc_parts(crate::fsutil::now_secs());
-    let kept = to.with_file_name(format!(
-        ".{name}.replaced-{y:04}{mo:02}{d:02}T{h:02}{mi:02}{sec:02}Z-{}",
-        std::process::id()
-    ));
-    fs::rename(from, &kept).map_err(|e| {
-        format!(
-            "the new install is in place; the old one is at {} ({e})",
-            from.display()
-        )
-    })?;
-    Ok(Some(kept))
-}
-
-/// Exchanges two paths atomically.
-fn exchange(a: &Path, b: &Path) -> std::io::Result<()> {
-    use std::ffi::CString;
-    use std::os::unix::ffi::OsStrExt;
-    let ca = CString::new(a.as_os_str().as_bytes())?;
-    let cb = CString::new(b.as_os_str().as_bytes())?;
-    #[cfg(target_os = "macos")]
-    // SAFETY: two NUL-terminated paths.
-    let r = unsafe { libc::renamex_np(ca.as_ptr(), cb.as_ptr(), libc::RENAME_SWAP) };
-    #[cfg(target_os = "linux")]
-    // SAFETY: two NUL-terminated paths relative to the current folder.
-    let r = unsafe {
-        libc::renameat2(
-            libc::AT_FDCWD,
-            ca.as_ptr(),
-            libc::AT_FDCWD,
-            cb.as_ptr(),
-            libc::RENAME_EXCHANGE,
-        )
-    };
-    if r == 0 {
-        Ok(())
-    } else {
-        Err(std::io::Error::last_os_error())
+    crate::exchange::exchange(from, to).map_err(shown)?;
+    *exchanged = true;
+    match fs::rename(from, kept) {
+        Ok(()) => Ok(Some(kept.to_path_buf())),
+        Err(_) => Ok(Some(from.to_path_buf())),
     }
 }
 
@@ -1171,6 +1206,115 @@ mod tests {
                 .starts_with(&format!(".{}.replaced-", crate::dispatch::VERSION))
         );
         assert!(!from.exists());
+
+        // Replaced again, twice: only the newest replaced folder is kept.
+        let (_, r) = install_after_release("e", "new d");
+        assert!(matches!(r, Ok(Installed::Done(Some(_)))), "{r:?}");
+        sleep(Duration::from_millis(1100));
+        let (_, r) = install_after_release("f", "new e");
+        let newest = match r {
+            Ok(Installed::Done(Some(k))) => k,
+            other => panic!("{other:?}"),
+        };
+        let replaced: Vec<PathBuf> = fs::read_dir(&root)
+            .unwrap()
+            .map(|e| e.unwrap().path())
+            .filter(|p| {
+                p.file_name()
+                    .unwrap()
+                    .to_string_lossy()
+                    .starts_with(&replaced_prefix(&to))
+            })
+            .collect();
+        assert_eq!(replaced, std::slice::from_ref(&newest));
+        assert!(
+            fs::read_to_string(newest.join("bin/atelier"))
+                .unwrap()
+                .contains("new e")
+        );
+    }
+
+    #[test]
+    fn an_install_is_none_its_identity_or_broken_by_one_rule() {
+        let tmp = tempfile::tempdir().unwrap();
+        let to = tmp.path().join("v");
+        assert_eq!(install_state(&to), "none");
+        fs::create_dir_all(&to).unwrap();
+        assert_eq!(install_state(&to), BROKEN, "no bin/atelier");
+        write(&to, "bin/atelier", "#!/bin/sh\necho 'v h'\n");
+        assert_eq!(install_state(&to), BROKEN, "not executable");
+        fake_install(&to, "v h");
+        assert_eq!(install_state(&to), "v h");
+        write(&to, "bin/atelier", "#!/bin/sh\necho 'v h'; exit 1\n");
+        assert_eq!(install_state(&to), BROKEN, "fails");
+        write(&to, "bin/atelier", "#!/bin/sh\n");
+        assert_eq!(install_state(&to), BROKEN, "prints nothing");
+        fs::remove_dir_all(&to).unwrap();
+        std::os::unix::fs::symlink(tmp.path().join("gone"), &to).unwrap();
+        assert_eq!(install_state(&to), BROKEN, "a link to nothing");
+
+        // A broken install is replaced when that is what the caller saw.
+        let home = tmp.path().join("home");
+        let root = crate::dispatch::install_root(&home);
+        let to = root.join(crate::dispatch::VERSION);
+        fs::create_dir_all(&to).unwrap();
+        let from = root.join(".new");
+        fake_install(&from, "new");
+        let deadline = std::time::Instant::now() + Duration::from_secs(3);
+        let r = loop {
+            match install(&home, &from, BROKEN) {
+                Ok(Installed::Busy(h)) if h.is_empty() && std::time::Instant::now() < deadline => {
+                    sleep(Duration::from_millis(10))
+                }
+                other => break other,
+            }
+        };
+        assert!(matches!(r, Ok(Installed::Done(Some(_)))), "{r:?}");
+        assert_eq!(install_state(&to), "new");
+    }
+
+    #[test]
+    fn when_the_replaced_folder_cannot_be_renamed_it_stays_where_the_exchange_put_it() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (from, to) = (tmp.path().join(".new"), tmp.path().join("v"));
+        fake_install(&from, "new");
+        fake_install(&to, "old");
+        let mut exchanged = false;
+        let kept = swap_in_keeping(&from, &to, &tmp.path().join("missing/kept"), &mut exchanged);
+        assert!(exchanged);
+        assert_eq!(kept, Ok(Some(from.clone())));
+        assert_eq!(install_state(&to), "new");
+        assert_eq!(install_state(&from), "old", "the old install is kept");
+    }
+
+    #[test]
+    fn the_exchange_probe_compiles_on_its_own_and_checks_a_folder() {
+        let tmp = tempfile::tempdir().unwrap();
+        assert_eq!(crate::exchange::probe(tmp.path()), Ok(()));
+        assert_eq!(fs::read_dir(tmp.path()).unwrap().count(), 0, "nothing left");
+        let e = crate::exchange::probe(&tmp.path().join("missing")).unwrap_err();
+        assert!(e.contains("missing"), "{e}");
+
+        // As machines init compiles and runs it on the machine.
+        let probe = tmp.path().join("exchange-probe");
+        let out = Command::new("rustc")
+            .args(["--edition", "2024", "-o"])
+            .arg(&probe)
+            .arg("src/exchange.rs")
+            .current_dir(env!("CARGO_MANIFEST_DIR"))
+            .output()
+            .unwrap();
+        assert!(out.status.success(), "{out:?}");
+        let dir = tmp.path().join("root");
+        fs::create_dir_all(&dir).unwrap();
+        let out = Command::new(&probe).arg(&dir).output().unwrap();
+        assert!(out.status.success(), "{out:?}");
+        assert_eq!(fs::read_dir(&dir).unwrap().count(), 0, "nothing left");
+        let out = Command::new(&probe)
+            .arg(tmp.path().join("missing"))
+            .output()
+            .unwrap();
+        assert_eq!(out.status.code(), Some(1), "{out:?}");
     }
 
     #[test]
