@@ -153,7 +153,14 @@ priority = 100
                 out.push(r);
             }
         }
-        out.sort_by(|a, b| a.started.cmp(&b.started).then(a.id.cmp(&b.id)));
+        // A platform run starts the check it names, often within the same second: on a tie it
+        // comes first, whatever the ids' random parts say.
+        out.sort_by(|a, b| {
+            a.started
+                .cmp(&b.started)
+                .then((a.kind.as_str() != "test-full").cmp(&(b.kind.as_str() != "test-full")))
+                .then(a.id.cmp(&b.id))
+        });
         out
     }
 }

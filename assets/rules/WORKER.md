@@ -11,8 +11,12 @@ You build one item, in one worktree, on one branch, named in your task.
 - Use plain `cargo`. Never `+toolchain`, never `CARGO_TARGET_DIR`.
 {{/rust}}
 
+## Decisions
+- When your task does not decide a behaviour, pick the safest one that keeps every existing rule (no wider access, no skipped approval, no lost data, older saved data still loads) and go on. List each under "Decisions I made" in your report.
+
 ## Proof
 - Choose the tests that prove your change: one test, one crate, the frontend files you touched. Run them yourself.
+- A rule that must hold on every path has one model-based test (random sequences of operations against a reference model, checked after every step). A change that adds a path the rule covers adds it to that test.
 {{#rust}}
 - After a fix, rerun the failing tests by name (`cargo nextest run -E 'test(=<name>)'`). Fixing a flaky test: prove it with `cargo nextest run --stress-count 50` on the crates you touched (`vitest --repeats 50` for frontend tests).
 {{/rust}}
@@ -31,4 +35,5 @@ When you end your turn, atelier's stop hook sends you back while a rebase is ope
 2. What you built, in plain words.
 3. Tests you ran and their results; the `compile:` line.
 4. What is not done or not verified.
-5. Broken things outside your scope; what the orchestrator should decide.
+5. Decisions I made, or "none".
+6. Broken things outside your scope; what the orchestrator should decide.

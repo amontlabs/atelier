@@ -1,6 +1,6 @@
 +++
 fields = ["goal", "files", "done", "risks"]
-optional = ["notes"]
+optional = ["notes", "decisions"]
 +++
 # Task: {{branch}}
 
@@ -13,6 +13,9 @@ Worktree: {{worktree}}. Branch: {{branch}}, built on {{lower}}. Read {{rules}}/W
 **Done when.** {{done}}
 
 **Risks.** {{risks}}
+{{#decisions}}
+**Decisions.** {{decisions}}
+{{/decisions}}
 {{#notes}}
 **Notes.** {{notes}}
 {{/notes}}
