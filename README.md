@@ -55,10 +55,8 @@ nextest = "0.9.151"           # exact cargo-nextest version
 [[check.steps]]               # any command; the only check for non-Rust projects
 name = "docs"
 run = ["cargo", "doc", "--no-deps", "--locked"]
-# parallel = false                # by default steps run one after another while the tests run;
-                                  # false runs this one alone, after the tests and earlier steps.
-                                  # Use it for a step that builds with cargo or is heavy enough to
-                                  # slow timing-sensitive tests.
+# parallel = false            # steps run beside the tests; false runs this one alone, after
+                              # them (for a cargo build or a step heavy enough to slow tests)
 
 [platforms.macos-aarch64]     # must pass before main moves
 run = "check"
