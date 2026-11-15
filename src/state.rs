@@ -538,7 +538,23 @@ mod tests {
         assert_eq!(s.format().unwrap(), Some(1));
         assert!(!s.root().join("versioned/converted").exists());
         drop(other);
-        s.versioned(2, &[bump]).unwrap();
+        // Tests in this process spawn children in parallel; between fork and exec such a child
+        // still holds a copy of `other`'s descriptor, and with it the lock, for a moment. Only
+        // that release is awaited: the conversion itself must then succeed.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        loop {
+            match s.versioned(2, &[bump]) {
+                Ok(_) => break,
+                Err(e) => {
+                    assert_eq!(
+                        e.message,
+                        "state upgrade waits for running atelier commands"
+                    );
+                    assert!(std::time::Instant::now() < deadline, "lock never released");
+                    std::thread::sleep(std::time::Duration::from_millis(5));
+                }
+            }
+        }
         assert_eq!(s.format().unwrap(), Some(2));
     }
 }
