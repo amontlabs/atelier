@@ -2,36 +2,28 @@
 
 **Several coding agents build one project in parallel: no waiting on CI, no waiting on each other's merges.**
 
-atelier is a command-line tool the agents run themselves: an *orchestrator* that plans, reviews
-and merges, and *workers* that each build one branch in its own git worktree. It answers four
-problems, measured on the multi-agent builds that came before it:
+atelier is a command-line tool the agents run themselves: an *orchestrator* plans, reviews and merges; *workers* each build one branch in their own git worktree. It answers four problems measured on earlier multi-agent builds:
 
 | The problem | What atelier does |
 |---|---|
-| **Agents waited on CI.** A third to a half of all build time was agents polling CI until green (31% in one analysis, 49% in another). One Linux CI job failed 52 of 166 runs, at 16 minutes each. | **No CI in the loop.** `merge` checks the merged tree on your own machines, on every platform the project lists: this computer, and others over ssh, with the next machine tried when one is offline. `main` moves only when it is green. Nothing waits on GitHub. |
-| **Work ran one item at a time.** Builds averaged 1.4 workers at once, because each item waited for the previous one to merge. | **Parallel by default.** One worktree per item. An item that builds on another starts before that one is merged (`start --on`, `follow`). Approved branches merge as one batch; a red batch is split, and the branches before the one that breaks it land. `status` forecasts conflicts between open branches. |
-| **Test loops were slow and not trusted.** Full suites run by reflex, retries that hid failures, flaky tests nobody fixed. | **Fast feedback you can trust.** A worker runs only the tests that prove its change, then `check --compile-only`. The full check runs once per merge. Nothing is retried: a test that fails, then passes on the same tree, is listed as flaky, to be fixed. |
-| **Every agent followed its own idea of the rules.** Notes in several places, models picked ad hoc. | **One set of rules.** `init` and `rules` generate what agents read. `task` renders the same task templates every time. Agents are chosen by role, never by model name. |
+| **Agents waited on CI.** A third to a half of build time went to polling CI (31% in one analysis, 49% in another). One Linux CI job failed 52 of 166 runs, at 16 minutes each. | **No CI in the loop.** `merge` checks the merged tree on your own machines, on every platform the project lists: this computer, and others over ssh, trying the next machine when one is offline. `main` moves only when green. |
+| **Work ran one item at a time.** Builds averaged 1.4 workers at once, because each item waited for the previous merge. | **Parallel by default.** One worktree per item. An item that builds on another starts before that one merges (`start --on`, `follow`). Approved branches merge as one batch; a red batch is split and the branches before the breaking one land. `status` forecasts conflicts between open branches. |
+| **Test loops were slow and untrusted.** Full suites by reflex, retries that hid failures, flaky tests nobody fixed. | **Fast, trustworthy feedback.** A worker runs only the tests that prove its change, then `check --compile-only`. The full check runs once per merge. Nothing is retried: a test that fails, then passes on the same tree, is listed as flaky, to be fixed. |
+| **Every agent followed its own idea of the rules.** Notes in several places, models picked ad hoc. | **One set of rules.** `init` and `rules` generate what agents read. `task` renders the same templates every time. Agents are chosen by role, never by model name. |
 
-A green `main` is the guard rail that lets agents merge with nobody watching: `merge` moves it
-only to a tree that passed, and only for the exact commits that were reviewed (`approve`).
-Nothing is best-effort: a platform with no machine is not passed, never silently skipped, and no
-verdict comes from a cache; the full check runs on the exact tree that lands.
+Evidence-backed rules ship with it: decisions are written before the worker starts (5 problems left after review, against 13 without), risky items get two high-effort reviews (2-3x more findings than one default-effort review), and each rule that must hold on every path gets one model-based test (a state-machine test of one rule caught 4 of 7 high-severity past bugs that ordinary tests missed).
 
-> **Status: early (0.1.0).** Used on one real project, Silo. The speed-up is not measured yet: a
-> measured trial build is next. Expect rough edges and changes. macOS and Linux only.
+A green `main` is what lets agents merge with nobody watching. `merge` moves it only to a tree that passed, and only for the exact commits that were reviewed (`approve`). Nothing is best-effort: a platform with no machine is not passed, never silently skipped; no verdict comes from a cache; the full check runs on the exact tree that lands.
+
+> **Status: early (0.1.0).** Used on one real project. The speed-up is not measured yet; a measured trial build is next. Expect rough edges and changes. macOS and Linux only.
 
 ## Who it's for
 
-You run several coding agents (Claude Code, Codex) on one repository at the same time and want
-their work to land on `main` quickly, without CI in the way and without breaking it. The
-orchestrator can be an agent or you. Rust projects get format, compile and
-[nextest](https://nexte.st/) built in; anything else runs as steps you declare.
+You run several coding agents (Claude Code, Codex) on one repository at once and want their work on `main` fast, without CI in the way and without breaking it. The orchestrator can be an agent or you. Rust projects get format, compile and [nextest](https://nexte.st/) built in; anything else runs as steps you declare.
 
 ## A build, end to end
 
-`start` → the worker commits → `check --compile-only` → `approve` → `merge` → `clean`.
-The output below is real (paths shortened), from a small Rust project in `/Users/you/shop`.
+`start` → the worker commits → `check --compile-only` → `approve` → `merge` → `clean`. The output is real (paths shortened), from a small Rust project in `/Users/you/shop`.
 
 ```console
 # Orchestrator: one branch and one worktree per item, then a task file for the worker
@@ -73,8 +65,7 @@ cart
   cart is cleaned
 ```
 
-A branch is merged only if `merged <branch> <commit>` was printed. When something is in the way,
-atelier stops, leaves `main` where it was and says what to do:
+A branch is merged only if `merged <branch> <commit>` was printed. When something is in the way, atelier stops, leaves `main` where it was and says what to do:
 
 ```console
 # A worker on another branch, after main moved
@@ -158,15 +149,9 @@ cargo +1.100.0 install --git https://github.com/amontlabs/atelier --tag v0.1.0 -
 mkdir -p ~/.local/bin && cp ~/.local/share/atelier/0.1.0/bin/atelier ~/.local/bin/atelier
 ```
 
-`~/.local/bin` must be on `PATH`, for you and for your agents. `cargo install` does not read the
-repository's `rust-toolchain.toml`, so the command names the pinned Rust (`+1.100.0`) itself.
+`~/.local/bin` must be on `PATH`, for you and your agents. `cargo install` ignores the repository's `rust-toolchain.toml`, so the command names the pinned Rust (`+1.100.0`).
 
-**The pin.** `atelier` on `PATH` reads `atelier = "<version>"` from `.atelier/atelier.toml` of the
-checkout it runs in and runs `~/.local/share/atelier/<version>/bin/atelier`. Each worktree runs
-the version its own tree pins. If that version is missing, it prints the install command and
-exits 4; nothing installs itself.
-
-The command atelier prints for a missing version is this one with that version.
+**The pin.** `atelier` on `PATH` reads `atelier = "<version>"` from the `.atelier/atelier.toml` of the checkout it runs in and runs `~/.local/share/atelier/<version>/bin/atelier`. Each worktree runs the version its own tree pins. If that version is missing, it prints the install command above (with that version) and exits 4; nothing installs itself.
 
 ## Set up a project
 
@@ -210,17 +195,9 @@ run = ["cargo", "doc", "--no-deps", "--locked"]
 run = "check"
 ```
 
-A workspace needs a `rust-toolchain.toml` with an exact `channel`. After any edit, run
-`atelier rules` and commit `.atelier/`, `AGENTS.md`, `CLAUDE.md`, `.claude/settings.json` and
-`.codex/hooks.json`. Unknown keys are refused. The other keys (tool prerequisites,
-`check.prepare`, `merge.after`, more platforms) are in a full annotated example:
-[tests/fixtures/silo-atelier.toml](tests/fixtures/silo-atelier.toml).
+A workspace needs a `rust-toolchain.toml` with an exact `channel`. After any edit, run `atelier rules` and commit `.atelier/`, `AGENTS.md`, `CLAUDE.md`, `.claude/settings.json` and `.codex/hooks.json`. Unknown keys are refused. The other keys (tool prerequisites, `check.prepare`, `merge.after`, more platforms) are in a full annotated example: [tests/fixtures/silo-atelier.toml](tests/fixtures/silo-atelier.toml).
 
-What agents then read is generated, never hand-edited: the block in `AGENTS.md`, and
-`.atelier/rules/WORKER.md` and `ORCHESTRATOR.md` (sources in [assets/rules/](assets/rules/)).
-Your own rules go in `.atelier/project/{binding,worker,orchestrator}.md` and are appended. The
-stop hook sends a worker back while a rebase is open, something is uncommitted, a background
-task runs, or its report has no `compile:` line.
+What agents read is generated, never hand-edited: the block in `AGENTS.md`, and `.atelier/rules/WORKER.md` and `ORCHESTRATOR.md` (sources in [assets/rules/](assets/rules/)). Your own rules go in `.atelier/project/{binding,worker,orchestrator}.md` and are appended. The stop hook sends a worker back while a rebase is open, something is uncommitted, a background task runs, or its report has no `compile:` line.
 
 **Two files of your own**, never committed, shared by all your projects:
 
@@ -246,27 +223,18 @@ platform = "linux-x86_64"
 priority = 10
 ```
 
-Without a machines file, `merge` still runs this computer's own platform. With a second
-platform in the settings (`[platforms.linux-x86_64]`), `atelier machines init linux-box` sets the
-machine up, `atelier test linux-x86_64 -- <command>` runs one command there, and `merge` runs
-every platform at the same time. No machine means not passed (exit 3), never a silent skip.
+Without a machines file, `merge` still runs this computer's own platform. With a second platform in the settings (`[platforms.linux-x86_64]`), `atelier machines init linux-box` sets the machine up, `atelier test linux-x86_64 -- <command>` runs one command there, and `merge` runs every platform at once. No machine means not passed (exit 3), never a silent skip.
 
 ## What it deliberately doesn't do
 
 - **No task board.** The item is the branch; `approve` and `merge` write the only records.
-- **It doesn't run agents or pick models.** `agents` prints your roles, `task` writes a prompt
-  file; your harness starts the agent.
-- **No GitHub, no pull requests, no CI.** Everything happens on your machines. `main` moves by a
-  local push, and another machine gets the commit over ssh.
+- **It doesn't run agents or pick models.** `agents` prints your roles, `task` writes a prompt file; your harness starts the agent.
+- **No GitHub, pull requests or CI.** `main` moves by a local push; other machines get the commit over ssh.
 - **No retries.** A failing test is red.
-- **No conflict resolution in the gate.** A conflict stops the merge (exit 5) with the files
-  listed. The one exception is files you declare as regenerated by a `merge.after` hook.
-- **It never deletes or overwrites what it did not make.** Unknown files, unmerged work and open
-  edits are listed and the command refuses (exit 4).
-- **It installs nothing by itself**, neither its own versions nor your tools. Prerequisites are
-  checked, never set.
-- **It is not a sandbox.** Agents' code runs as your user, here and on your machines. The stop
-  hook is a strong nudge, not a guarantee, and has not yet been run against a live Codex model.
+- **No conflict resolution in the gate.** A conflict stops the merge (exit 5) with the files listed. The one exception is files you declare as regenerated by a `merge.after` hook.
+- **It never deletes or overwrites what it did not make.** Unknown files, unmerged work and open edits are listed and the command refuses (exit 4).
+- **It installs nothing by itself**, neither its own versions nor your tools. Prerequisites are checked, never set.
+- **It is not a sandbox.** Agents' code runs as your user, here and on your machines. The stop hook is a strong nudge, not a guarantee, and has not yet been run against a live Codex model.
 - **No Windows.**
 
 ## Docs

@@ -1,20 +1,13 @@
 # The frozen layer
 
-`.git/atelier/` holds the state every worktree of a clone shares. Its frozen layer is read and
-written by every atelier version, old and new, at the same time: a worker on an upgrade branch
-runs its pinned version beside the orchestrator's. These rules keep that safe.
+`.git/atelier/` holds the state every worktree of a clone shares. Every atelier version, old and new, reads and writes its frozen layer at the same time: a worker on an upgrade branch runs its pinned version beside the orchestrator's. These rules keep that safe.
 
 ## Compatibility rule
 
-- **Readers ignore fields they do not know.** A later version may add fields. It never removes a
-  field, renames one, or changes what a value means.
-- **Readers refuse what they cannot parse at all**: a file that is not TOML, a missing required
-  field, a value of the wrong type, or a lock-record line of a shape this document does not
-  describe. The command refuses (4) and names the file.
-- **Writers never drop what they did not parse.** A version that rewrites a file keeps every
-  unknown field and every unknown trailing field of a line, as it found them.
-- Enumerated values are closed, except the run `kind`: a kind this version does not know is read
-  as "other" and kept.
+- **Readers ignore fields they do not know.** A later version may add fields; it never removes or renames one, or changes what a value means.
+- **Readers refuse what they cannot parse**: a file that is not TOML, a missing required field, a value of the wrong type, or a lock-record line of a shape this document does not describe. The command refuses (4) and names the file.
+- **Writers never drop what they did not parse.** A rewrite keeps every unknown field, and every unknown trailing field of a line, as found.
+- Enumerated values are closed, except the run `kind`: an unknown kind is read as "other" and kept.
 
 ## Paths
 
@@ -35,16 +28,11 @@ runs its pinned version beside the orchestrator's. These rules keep that safe.
 | `versioned/` | the versioned layer, with its format number in `versioned/format`; only the version pinned on the integration branch uses it |
 | `empty-hooks/` | an empty folder, created when missing: the hooks folder of the receiving side of the promotion's push; anything in it makes the push refuse |
 
-`<key>` is a branch name encoded by `names::key`. A worktree key is `@main` for the main checkout,
-otherwise the encoded name of the worktree's git folder relative to the common git folder
-(`worktrees%2F<name>`). A worktree key longer than 200 bytes is cut to 183 bytes and ends in `~`
-and the 16 hex digits of the FNV-1a (64-bit) hash of the uncut name.
+`<key>` is a branch name encoded by `names::key`. A worktree key is `@main` for the main checkout, otherwise the encoded name of the worktree's git folder relative to the common git folder (`worktrees%2F<name>`). One longer than 200 bytes is cut to 183 bytes and ends in `~` and the 16 hex digits of the FNV-1a (64-bit) hash of the uncut name.
 
 ## Run ids and markers
 
-A run id is the UTC minute and 8 random bytes: `YYYYMMDDTHHMMZ-` and 16 lowercase hex digits
-(31 bytes). Ids are unique across every clone on a machine, because the marker scan covers the
-whole machine.
+A run id is the UTC minute and 8 random bytes: `YYYYMMDDTHHMMZ-` and 16 lowercase hex digits (31 bytes). Ids are unique across every clone on a machine, because the marker scan covers the whole machine.
 
 Every process of a step carries, set last so that no step environment can replace them:
 
@@ -52,9 +40,7 @@ Every process of a step carries, set last so that no step environment can replac
 - `ATELIER_RUNS=<id>:<id>:…`: the ids of the runs it is nested in, outermost first, then its own
   run's id. An atelier started inside a step appends its own id to the list it inherits.
 
-A step may also be given `ATELIER_RUN_ID=<run id>`: the id the `atelier check` it starts takes
-for its run when that id is free (the gate names its inner check's run this way). No other step
-sees it.
+A step may also be given `ATELIER_RUN_ID=<run id>`: the id the `atelier check` it starts takes for its run when free (the gate names its inner check's run this way). No other step sees it.
 
 A process belongs to run `X` when `ATELIER_RUN=X`, or when `X` is an element of `ATELIER_RUNS`.
 So an outer run, the gate for one, finds what an inner atelier left behind.
@@ -65,14 +51,7 @@ state each run is in. A step cannot set any of the three variables (refused, 2).
 
 ## Coalitions (macOS)
 
-On macOS each step is a launchd job with its own resource coalition, which every
-process the step starts keeps (after `setsid`, a double fork or `env -i` too). There a process
-belongs to run `X` when its coalition is listed in `runs/X/coalitions`, and also, as everywhere,
-when it carries `X`'s marker: the end-of-run scan and the lock's next taker look for both, so
-either catches a survivor. Members of the coalitions are stopped; marked processes outside them
-are named and not signalled. A coalition is written
-`<coalition id>@<boot session uuid>` (`kern.bootsessionuuid`): coalition ids only grow within a
-boot, and a coalition of another boot has no members.
+On macOS each step is a launchd job with its own resource coalition, which every process the step starts keeps (after `setsid`, a double fork or `env -i` too). A process belongs to run `X` when its coalition is listed in `runs/X/coalitions`, and also, as everywhere, when it carries `X`'s marker. The end-of-run scan and the lock's next taker look for both, so either catches a survivor. Members of the coalitions are stopped; marked processes outside them are named and not signalled. A coalition is written `<coalition id>@<boot session uuid>` (`kern.bootsessionuuid`): ids only grow within a boot, and a coalition of another boot has no members.
 
 `runs/<run id>/coalitions` is text, one line per job, fields separated by one space:
 
@@ -80,37 +59,17 @@ boot, and a coalition of another boot has no members.
 <coalition> <launchd label> [<later fields>...]
 ```
 
-A step's line is appended before its program runs, to its run's file and to every outer run's
-file: those its `ATELIER_COALITIONS` names (any state; only an existing file named `coalitions`
-in a run folder with `run.toml`), and those of the runs named in its `ATELIER_RUNS` whose folder
-is in the same state. So an outer run also finds what a nested atelier left when that atelier
-died. Lines this version cannot read are skipped. A run without the file (Linux, or an older
-version) is looked for by its markers only.
+A step's line is appended before its program runs, to its run's file and every outer run's file: those its `ATELIER_COALITIONS` names (any state; only an existing file named `coalitions` in a run folder with `run.toml`), and those of the runs in its `ATELIER_RUNS` whose folder is in the same state. So an outer run also finds what a nested atelier left when it died. Lines this version cannot read are skipped. A run without the file (Linux, or an older version) is looked for by its markers only.
 
-The job's label is `atelier.<run id>.<n>` (a step) or `atelier.probe.<pid>.<hex>` (the probe), in
-`gui/<uid>` or `user/<uid>`. Its files (spec, FIFOs, plist, launchd's log) are in
-`<user temp>/atelier-jobs/<label>/`, where `<user temp>` is `getconf DARWIN_USER_TEMP_DIR`, never in
-the state. That folder is created before `launchctl bootstrap` with a file `owner`, `<pid> <start
-time>\n` of the atelier process that starts the job (start time as in lock records, or `-`), and
-is removed after `launchctl bootout`. Loaded jobs that atelier processes which died left behind
-are removed (`launchctl bootout`) when a run starts, when it ends, and when the lock's next taker
-finds nothing alive: every loaded `atelier.*` job whose process does not run and whose folder's
-owner is gone; without a folder, a probe job whose pid is gone, or a step job whose run (in the
-state doing the cleanup) has a `run.toml` whose process is gone. A job whose process still runs is
-left until it ends (its processes are survivors, found as above). Folders of dead owners whose job
-is not loaded are removed too.
+The job's label is `atelier.<run id>.<n>` (a step) or `atelier.probe.<pid>.<hex>` (the probe), in `gui/<uid>` or `user/<uid>`. Its files (spec, FIFOs, plist, launchd's log) are in `<user temp>/atelier-jobs/<label>/` (`<user temp>` is `getconf DARWIN_USER_TEMP_DIR`), never in the state. The folder is created before `launchctl bootstrap` with a file `owner` holding `<pid> <start time>\n` of the atelier process that starts the job (start time as in lock records, or `-`), and removed after `launchctl bootout`.
 
-`probes/coalition-<uid>.toml`: `macos` (`<product version> (<build>)`), `passed` (RFC 3339 UTC),
-`atelier_version`. Written when the probe (a job that starts a sleeper with `setsid` and a double
-fork, then exits 3) found the sleeper by coalition, stopped it, and read exit status 3 from
-`launchctl print`. A record of another macOS version, or none, makes the next run probe again; a
-failed probe refuses (4) and writes nothing.
+Jobs that dead atelier processes left loaded are booted out when a run starts, when it ends, and when the lock's next taker finds nothing alive. That covers every loaded `atelier.*` job whose process does not run and whose folder's owner is gone; without a folder, a probe job whose pid is gone, or a step job whose run (in the state doing the cleanup) has a `run.toml` whose process is gone. A job whose process still runs is left until it ends (its processes are survivors, found as above). Folders of dead owners whose job is not loaded are removed too.
+
+`probes/coalition-<uid>.toml`: `macos` (`<product version> (<build>)`), `passed` (RFC 3339 UTC), `atelier_version`. Written when the probe (a job that starts a sleeper with `setsid` and a double fork, then exits 3) found the sleeper by coalition, stopped it, and read exit status 3 from `launchctl print`. A record of another macOS version, or none, makes the next run probe again; a failed probe refuses (4) and writes nothing.
 
 ## Stop hook sessions
 
-`hooks/<session id>` is TOML, written by `atelier hook stop` for an input whose `session_id` is
-made of ASCII letters, digits, `-`, `_` and `.` (128 bytes at most, not starting with `.`);
-removed when it holds nothing.
+`hooks/<session id>` is TOML, written by `atelier hook stop` for an input whose `session_id` is ASCII letters, digits, `-`, `_` and `.` (128 bytes at most, not starting with `.`); removed when it holds nothing.
 
 - `blocks`: a table, condition → the number of blocks in a row for it in the current turn.
 - `warning`: an array of tables, newest first, 20 at most: the stops the hook let through while a
@@ -141,16 +100,9 @@ group <pgid> <run id> <leader start time> [<coalition> [<later fields>...]]
 - Empty lines are ignored. Any other line makes the record unreadable: the lock refuses (4), and
   the file is left as it is.
 
-Whoever takes the lock exclusive next reads the record and refuses (4) while any of these
-live, naming them. It never signals them. Shared holders of a branch lock run beside each other:
-one never refuses for what the record lists, and changes only its own lines, re-reading the file
-and writing it back under `locks/update/…/<same name>.lock`.
+Whoever next takes the lock exclusive reads the record and refuses (4) while any of these live, naming them. It never signals them. Shared holders of a branch lock run side by side: one never refuses for what the record lists and changes only its own lines, re-reading the file and writing it back under `locks/update/…/<same name>.lock`.
 
-- A recorded group is alive and is still the one atelier started. If a process with pid == pgid
-  exists and its start time differs from the recorded one, the pgid was reused: the line is not
-  ours and is dropped. If no such process exists but the group has members, the group is ours (a
-  pgid is not reallocated while its group has members). On Linux, a recorded boot id other than
-  the current one means the group is gone.
+- A recorded group is alive and still the one atelier started. If a process with pid == pgid exists and its start time differs from the recorded one, the pgid was reused: the line is dropped. If none exists but the group has members, the group is ours (a pgid is not reallocated while its group has members). On Linux, a recorded boot id other than the current one means the group is gone.
 - A process is marked with a recorded run id (`run` lines and the run ids of `group` lines).
 - macOS: a `group` line with a coalition lives while that coalition has a live member; a recorded
   run with a coalitions file lives while any coalition listed there has one.
@@ -211,64 +163,24 @@ Commit ids are checked when a record is read and when it is written.
 
 Lifecycle, the same for every version:
 
-- `start` writes a new record, with a new lifetime, only when the branch does not exist and no
-  `active` record names the old lifetime as its lower; it then replaces the old record whole. Its
-  steps, in this order: write the record with `starting` set; create the branch ref at the base
-  (`update-ref --no-deref`, expected absent); check the branch out (`git worktree add`, or
-  `git switch` in the detached worktree); write the record again without `starting`. A record
-  with `starting` is not started: every command that reads records refuses it (`run atelier
-  start <branch> again`), and it counts as a dependent of its lower branch.
-- A `start` of a name whose record has `starting` (atelier died between the steps, or a step
-  failed) first reconciles it, under the branch's lock. The branch is *in use* when a
-  registered worktree has it checked out (`git worktree list`, prunable ones included) or when
-  the git folder of any worktree names it in `rebase-merge/head-name`, `rebase-apply/head-name`
-  or `BISECT_START` (git's own sense: `git branch -D` refuses such a branch):
-  - a registered worktree has the branch checked out and nothing else uses it: if it is the
-    recorded worktree, the ref exists, and this start asks for the same lower branch and place,
-    `starting` is cleared and the start is finished;
-  - otherwise, while the branch is in use: refused (4), changing nothing; the message gives the
-    command that finishes the start (`atelier start <branch> --path <path>`, or `cd <path> &&
-    atelier start <branch>` for a start in place) and the ones that free the branch (`git
-    worktree remove <path>` for the worktree the start created, `git -C <path> switch
-    --detach` for any other, finishing or aborting the rebase or bisect);
-  - not in use, and the ref is absent: the record is removed;
-  - not in use, and the ref holds the recorded base: the ref is deleted (expected value the
-    base), then the record is removed;
-  - not in use, and the ref holds another commit: refused (4), ref and record kept; the message
-    says how to keep that work (check the branch out again where the start put it and finish
-    the start, or `git branch <new-name> <branch>` first) and how to undo the start (`git
-    branch -D <branch>`, then `atelier start <branch> --abandon`).
+- **`start`** writes a new record, with a new lifetime, only when the branch does not exist and no `active` record names the old lifetime as its lower; it replaces the old record whole. Steps, in order: write the record with `starting` set; create the branch ref at the base (`update-ref --no-deref`, expected absent); check the branch out (`git worktree add`, or `git switch` in the detached worktree); write the record again without `starting`. Every command that reads records refuses a record with `starting` (`run atelier start <branch> again`); it counts as a dependent of its lower branch.
+- **A `start` of a name whose record has `starting`** (atelier died between steps, or one failed) first reconciles it, under the branch's lock. The branch is *in use* when a registered worktree has it checked out (`git worktree list`, prunable ones included) or the git folder of any worktree names it in `rebase-merge/head-name`, `rebase-apply/head-name` or `BISECT_START` (git's own sense: `git branch -D` refuses such a branch).
+  - Checked out in the recorded worktree, nothing else using it, the ref exists, and this start asks for the same lower branch and place: `starting` is cleared and the start finishes.
+  - Otherwise, in use: refused (4), nothing changed. The message gives the command that finishes the start (`atelier start <branch> --path <path>`, or `cd <path> && atelier start <branch>` for a start in place) and the ones that free the branch (`git worktree remove <path>` for the worktree the start created, `git -C <path> switch --detach` for any other, finishing or aborting the rebase or bisect).
+  - Not in use, ref absent: the record is removed.
+  - Not in use, ref holds the recorded base: the ref is deleted (expected value the base), then the record is removed.
+  - Not in use, ref holds another commit: refused (4), ref and record kept. The message says how to keep that work (check the branch out again where the start put it and finish the start, or `git branch <new-name> <branch>` first) and how to undo the start (`git branch -D <branch>`, then `atelier start <branch> --abandon`).
 
-  After an undo the new start proceeds as if the name were free. The record a rolled-back start
-  replaced is not restored: `start` replaces only a record that no active record names as its
-  lower, so nothing depended on it. A step that fails while `start` is still running is undone
-  the same way at once (the replaced record is then restored), except that a ref this `start`
-  did not create is never deleted. A branch ref that is in use is never deleted.
-- `atelier start <branch> --abandon` only undoes an unfinished start: under the branch's lock,
-  when the record has `starting`, the branch is not in use and its ref is absent or holds the
-  recorded base, it deletes the ref (expected value the base) and removes the record. It
-  refuses (4), changing nothing, otherwise, saying why.
-- `follow` writes `pending` before its rebase and settles it from ancestry alone. The rebase
-  is the one step of a `follow` run held under the branch's lock, so its process group is
-  recorded (`locks/branch/<key>.procs`) before git starts, and the next command that takes the
-  lock refuses while that group lives, even when atelier died meanwhile. A rebase of the branch
-  open in any worktree, whether `follow` started it or not, makes every reader refuse.
-- No command repairs a base the branch no longer contains: it refuses (4) until the worker
-  restores the branch. Once the lower
-  branch is merged (or gone, with its base in the integration branch), `follow` sets `lower` to
-  the integration branch (`lower_is_integration = true`, no `lower_lifetime`).
-- A record is removed only in state `cleaned`, and only when no `active` record names it, by
-  name and lifetime, as its lower.
-- A writer holds the branch's lock (`locks/branch/<key>.lock`) while it reads and writes the
-  record.
+  After an undo the new start proceeds as if the name were free. The record a rolled-back start replaced is not restored: `start` replaces only a record no active record names as its lower, so nothing depended on it. A step that fails while `start` is still running is undone the same way at once (the replaced record is then restored), except that a ref this `start` did not create is never deleted. A branch ref in use is never deleted.
+- **`atelier start <branch> --abandon`** only undoes an unfinished start: under the branch's lock, when the record has `starting`, the branch is not in use and its ref is absent or holds the recorded base, it deletes the ref (expected value the base) and removes the record. Otherwise it refuses (4), changing nothing, and says why.
+- **`follow`** writes `pending` before its rebase and settles it from ancestry alone. The rebase is the one step of a `follow` run held under the branch's lock, so its process group is recorded (`locks/branch/<key>.procs`) before git starts. The next command that takes the lock refuses while that group lives, even when atelier died meanwhile. A rebase of the branch open in any worktree, whether `follow` started it or not, makes every reader refuse.
+- **A base the branch no longer contains:** no command repairs it; it refuses (4) until the worker restores the branch. Once the lower branch is merged (or gone, with its base in the integration branch), `follow` sets `lower` to the integration branch (`lower_is_integration = true`, no `lower_lifetime`).
+- A record is removed only in state `cleaned`, and only when no `active` record names it, by name and lifetime, as its lower.
+- A writer holds the branch's lock (`locks/branch/<key>.lock`) while it reads and writes the record.
 
 ## Merge facts
 
-The `merged` table of a branch record is written by `merge` in the same write that sets `state` to
-`merged` (`records::MergeFacts::record`), and removed by `clean` in the write that sets `cleaned`
-(`MergeFacts::retire`). A record in state `merged` without it grants `clean` nothing. `merge`
-makes that write only while the branch is at the commit it merged and approved no other: a
-branch that moved or was approved again meanwhile keeps its record `active`, as it is.
+`merge` writes a branch record's `merged` table in the same write that sets `state` to `merged` (`records::MergeFacts::record`); `clean` removes it in the write that sets `cleaned` (`MergeFacts::retire`). A `merged` record without the table grants `clean` nothing. `merge` makes the write only while the branch is at the commit it merged and approved no other: a branch that moved or was approved again keeps its record `active`.
 
 | Field | Type | Meaning |
 |---|---|---|
@@ -286,21 +198,8 @@ branch checked out at `commit`; it deletes the branch only while the ref still h
 | `path` | string | the folder's canonical path (no symbolic link in it); UTF-8 only |
 | `dev`, `ino` | integers | its file-system identity when registered |
 
-The entry's file name is `<entry id>.toml` (lowercase hex). `tmp` makes the folder at
-`<temp dir>/atelier-<uid>/<repo id>/<branch key>/<entry id>/` (`<temp dir>`: `$TMPDIR`, or the
-system's temp dir when it is unset, `/tmp` on Linux; `atelier-<uid>`: this user's root, mode 0700,
-used only when it is a folder this user owns that others cannot enter; `<repo id>`: the 64-bit FNV-1a hash of the
-canonical common git folder, 16 hex digits; `<branch key>`: `names::key` of the branch), or with
-`--short` at `/tmp/atl-<entry id>/`, always mode 0700. `clean` removes a folder only when its
-registered path has exactly that shape, is canonical and still names a real folder with the
-registered identity owned by this user, nothing in it is on another device (a mount), and its
-`leftovers` file (one line per thing created outside the folder) is empty or absent; it deletes
-through folder descriptors and never enters another device.
+The entry's file name is `<entry id>.toml` (lowercase hex). `tmp` makes the folder at `<temp dir>/atelier-<uid>/<repo id>/<branch key>/<entry id>/`, or with `--short` at `/tmp/atl-<entry id>/`, always mode 0700. Here `<temp dir>` is `$TMPDIR`, else the system's temp dir (`/tmp` on Linux); `atelier-<uid>` is this user's root, mode 0700, used only when this user owns it and others cannot enter; `<repo id>` is the 64-bit FNV-1a hash of the canonical common git folder, 16 hex digits; `<branch key>` is `names::key` of the branch. `clean` removes a folder only when its registered path has exactly that shape, is canonical and still names a real folder with the registered identity owned by this user, nothing in it is on another device (a mount), and its `leftovers` file (one line per thing created outside the folder) is empty or absent. It deletes through folder descriptors and never enters another device.
 
 ## The versioned layer's format number
 
-`versioned/format` holds one decimal number and a newline. It is created whole (written, flushed,
-hard-linked into place, folder flushed). A conversion from format `n` writes format `n + 1` into
-`versioned.next/`, flushes it, and swaps the two folders in one rename (`renamex_np` with
-`RENAME_SWAP` on macOS, `renameat2` with `RENAME_EXCHANGE` on Linux). A crash leaves the old layer
-or the new one whole, and a leftover `versioned.next/` is removed by the next conversion.
+`versioned/format` holds one decimal number and a newline, created whole (written, flushed, hard-linked into place, folder flushed). A conversion from format `n` writes format `n + 1` into `versioned.next/`, flushes it, and swaps the two folders in one rename (`renamex_np` with `RENAME_SWAP` on macOS, `renameat2` with `RENAME_EXCHANGE` on Linux). A crash leaves the old layer or the new one whole; the next conversion removes a leftover `versioned.next/`.
