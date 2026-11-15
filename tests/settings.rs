@@ -187,7 +187,8 @@ fn a_project_step_cannot_take_the_name_of_an_atelier_step() {
         repo.write(".atelier/atelier.toml", &text);
         let e = Settings::load(&repo.root).unwrap_err();
         assert!(
-            e.message.contains("fmt, compile and tests name atelier's own steps"),
+            e.message
+                .contains("fmt, compile and tests name atelier's own steps"),
             "{taken}: {}",
             e.message
         );

@@ -406,7 +406,9 @@ impl Settings {
             let at = format!("check.steps {:?}", s.name);
             name_problems(&at, &s.name, &mut seen, &mut problems);
             if ["fmt", "compile", "tests"].contains(&s.name.as_str()) {
-                problems.push(format!("{at}: fmt, compile and tests name atelier's own steps"));
+                problems.push(format!(
+                    "{at}: fmt, compile and tests name atelier's own steps"
+                ));
             }
             command_problems(root, &at, &s.run, &mut problems);
         }
