@@ -367,6 +367,9 @@ impl Run {
     ) -> Result<Run> {
         let guard = signals::install()
             .map_err(|e| Failure::refused(format!("cannot install signal handlers: {e}")))?;
+        // Read while this is the only thread; steps may later start from two.
+        #[cfg(target_os = "macos")]
+        crate::launchd::process_umask();
         let lock = HeldLock::acquire(state, key)?;
         Self::begin(state, lock, guard, kind, command, worktree, preferred)
     }

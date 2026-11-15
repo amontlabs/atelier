@@ -128,6 +128,21 @@ pub struct Job {
 
 static PROGRAM: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
 
+/// The process umask, read once. Reading it means setting it, so a read while another thread
+/// starts a step could leave the wrong mask behind; atelier never changes it after this.
+static UMASK: std::sync::OnceLock<libc::mode_t> = std::sync::OnceLock::new();
+
+pub fn process_umask() -> libc::mode_t {
+    *UMASK.get_or_init(|| {
+        // SAFETY: umask only sets the mask; it is put back at once.
+        unsafe {
+            let m = libc::umask(0o022);
+            libc::umask(m);
+            m
+        }
+    })
+}
+
 /// Makes `path` the program step jobs run as their shim, for a process that is not atelier
 /// itself (a test binary using the library). The first call wins.
 #[doc(hidden)]
@@ -219,13 +234,7 @@ fn spec_bytes(spec: &Spec, ready: &Path, go: &Path, probe: bool) -> Vec<u8> {
     if unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut rl) } == 0 {
         push("nofile", rl.rlim_cur.to_string().as_bytes());
     }
-    // SAFETY: umask only sets the mask; it is put back at once.
-    let mask = unsafe {
-        let m = libc::umask(0o022);
-        libc::umask(m);
-        m
-    };
-    push("umask", mask.to_string().as_bytes());
+    push("umask", process_umask().to_string().as_bytes());
     for (k, v) in &spec.env {
         let mut e = k.as_bytes().to_vec();
         e.push(b'=');

@@ -434,7 +434,8 @@ impl Checker<'_> {
     }
 
     /// The tests in one thread and the project steps in this one; see the module documentation.
-    /// An error in either thread starts no further step in the other; the first is returned.
+    /// An error in either thread starts no further step in the other; the tests thread's error
+    /// is returned when both fail.
     fn test_and_project_steps(&self, built: &Built) -> Result<()> {
         let steps = self.project_step_list();
         let alone = steps
@@ -476,6 +477,9 @@ impl Checker<'_> {
         let mut applied_anywhere = vec![false; exclude.len()];
         let mut tried = false;
         for (i, ws) in workspaces.iter().enumerate() {
+            if self.stopped() {
+                return Ok(());
+            }
             let name = self.suffixed("tests", ws);
             let only_filter = match &self.only {
                 None => None,
@@ -550,6 +554,9 @@ impl Checker<'_> {
                     argv.push("-E".to_owned());
                     argv.push(f.clone());
                 }
+            }
+            if self.stopped() {
+                return Ok(());
             }
             let file = format!("tests-{}.jsonl", file_tag(ws));
             let ok = self.step(&name, &argv, &ws.dir, Some(&file))?;
