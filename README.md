@@ -1,6 +1,6 @@
 # atelier
 
-**Several coding agents build one project in parallel, with no CI wait and no merge queue.**
+**A CLI for coding agents to orchestrate parallel work: one worktree per task, an async merge gate, and CI on your own machines.**
 
 atelier is a command-line tool the agents run themselves. An *orchestrator* plans, reviews and merges. *Workers* each build one branch in their own git worktree. It fixes four problems measured on earlier multi-agent builds:
 
