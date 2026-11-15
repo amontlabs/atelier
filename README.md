@@ -13,7 +13,7 @@ atelier is a command-line tool the agents run themselves. An *orchestrator* plan
 
 `main` moves only to a tree that passed, and only with the exact commits that were reviewed. A platform with no machine fails; nothing is skipped or cached.
 
-> **Status: early (0.2.0).** Used on one real project. macOS and Linux only.
+> **Status: early (0.2.1).** Used on one real project. macOS and Linux only.
 
 ## Rules that ship with it
 
@@ -27,9 +27,9 @@ You need git and Rust 1.100.0 (via rustup).
 
 ```sh
 # The version your project pins. Versions sit side by side.
-cargo +1.100.0 install --git https://github.com/amontlabs/atelier --tag v0.2.0 --locked --root ~/.local/share/atelier/0.2.0
+cargo +1.100.0 install --git https://github.com/amontlabs/atelier --tag v0.2.1 --locked --root ~/.local/share/atelier/0.2.1
 # The dispatcher, once.
-mkdir -p ~/.local/bin && cp ~/.local/share/atelier/0.2.0/bin/atelier ~/.local/bin/atelier
+mkdir -p ~/.local/bin && cp ~/.local/share/atelier/0.2.1/bin/atelier ~/.local/bin/atelier
 ```
 
 `~/.local/bin` must be on `PATH` for you and your agents. The `atelier` on `PATH` reads the `atelier = "<version>"` pin from `.atelier/atelier.toml` and runs `~/.local/share/atelier/<version>/bin/atelier`. A missing version exits 4 with the install command; nothing installs itself.
@@ -37,7 +37,7 @@ mkdir -p ~/.local/bin && cp ~/.local/share/atelier/0.2.0/bin/atelier ~/.local/bi
 ## Quickstart
 
 ```sh
-cd shop && atelier init --version 0.2.0
+cd shop && atelier init --version 0.2.1
 ```
 
 This writes `.atelier/`, the generated rules (`AGENTS.md`, `CLAUDE.md`, `.atelier/rules/`) and the stop hook (`.claude/settings.json`, `.codex/hooks.json`). In Codex, run `/hooks` once to trust the hook.
@@ -45,7 +45,7 @@ This writes `.atelier/`, the generated rules (`AGENTS.md`, `CLAUDE.md`, `.atelie
 Say what your check is in `.atelier/atelier.toml`:
 
 ```toml
-atelier = "0.2.0"
+atelier = "0.2.1"
 integration_branch = "main"
 workspaces = ["."]            # Cargo workspaces: fmt, compile, nextest
 min_free_gb = 20              # start, check, test and merge refuse below this much free disk; 0 disables
