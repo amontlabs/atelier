@@ -295,6 +295,14 @@ fn a_green_merge_moves_main_records_each_branch_and_updates_the_main_checkout() 
         "{so}"
     );
     assert!(so.find("merge: GREEN").unwrap() < so.find("merged disk-api").unwrap());
+    assert!(
+        so.trim_end()
+            .lines()
+            .last()
+            .unwrap()
+            .starts_with("next: atelier clean --yes"),
+        "{so}"
+    );
     // Both merges are --no-ff merges of the approved commits, on top of OLD.
     let parents = git(p.main(), &["log", "--format=%P", "-2", &m]);
     assert!(
@@ -345,7 +353,7 @@ fn a_rules_item_merges_alone_and_says_rules_changed() {
     let out = p.merge(&["rules-x"]);
     assert_eq!(code(&out), 0, "{}", both(&out));
     assert!(
-        stdout(&out).trim_end().ends_with("rules changed"),
+        stdout(&out).trim_end().lines().nth_back(1) == Some("rules changed"),
         "{}",
         stdout(&out)
     );
@@ -697,6 +705,58 @@ fn regenerates_must_name_files_inside_the_project() {
     );
 }
 
+#[test]
+fn merge_start_and_check_refuse_below_the_free_disk_floor() {
+    let p = Proj::new();
+    p.ready("disk-floor", "f.txt", "f\n");
+    let toml = p.main().join(".atelier/atelier.toml");
+    let original = std::fs::read_to_string(&toml).unwrap();
+    std::fs::write(
+        &toml,
+        original.replacen(
+            "promotion_wait_seconds",
+            "min_free_gb = 999999999\npromotion_wait_seconds",
+            1,
+        ),
+    )
+    .unwrap();
+    for args in [
+        vec!["merge", "disk-floor"],
+        vec![
+            "start",
+            "disk-other",
+            "--path",
+            p.wt("disk-other").to_str().unwrap(),
+        ],
+        vec!["check"],
+    ] {
+        let out = p.run(&args);
+        assert_eq!(code(&out), 4, "{args:?}: {}", both(&out));
+        let se = stderr(&out);
+        assert!(
+            se.contains("GB free") && se.contains("min_free_gb is 999999999"),
+            "{se}"
+        );
+        assert!(se.contains("atelier clean --yes"), "{se}");
+    }
+    std::fs::write(
+        &toml,
+        original.replacen(
+            "promotion_wait_seconds",
+            "min_free_gb = 0\npromotion_wait_seconds",
+            1,
+        ),
+    )
+    .unwrap();
+    let out = p.run(&[
+        "start",
+        "disk-other",
+        "--path",
+        p.wt("disk-other").to_str().unwrap(),
+    ]);
+    assert_eq!(code(&out), 0, "{}", both(&out));
+}
+
 // ---------------------------------------------------------------------------------------------
 // merge: RED (step 6) and hooks (step 4)
 
@@ -712,6 +772,7 @@ fn a_red_check_leaves_main_unmoved_and_the_gate_for_inspection() {
     assert!(so.contains("verify"), "{so}");
     assert!(so.contains("main has not moved"), "{so}");
     assert!(!so.lines().any(|l| l.starts_with("merged ")), "{so}");
+    assert!(!so.contains("next: atelier clean"), "{so}");
     assert_eq!(p.main_tip(), old);
     assert!(
         p.gate().join("BROKEN").exists(),

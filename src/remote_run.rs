@@ -269,6 +269,7 @@ fn run(
         Needs {
             rules: true,
             versioned: false,
+            disk: true,
         },
     )
     .map_err(|f| Stop::NotReady(f.message))?;

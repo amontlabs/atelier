@@ -26,6 +26,8 @@ pub struct Needs {
     pub rules: bool,
     /// Use the versioned layer (`approve`, `merge`, `promote`, `clean`).
     pub versioned: bool,
+    /// Refuse when the project's filesystem has less free space than `min_free_gb`.
+    pub disk: bool,
 }
 
 /// What a passed preflight hands to the command. `state` holds `state.lock` shared until dropped.
@@ -70,6 +72,9 @@ pub fn run(cwd: &Path, command: &str, needs: Needs) -> Result<Context> {
     let state = State::open(&checkout)?;
     check_version(&settings::read_pin(&text)?)?;
     let settings = Settings::load(&checkout.root)?;
+    if needs.disk {
+        require_free_disk(&checkout.root, settings.min_free_gb)?;
+    }
     if needs.versioned {
         require_main_version(&checkout, command)?;
     }
@@ -84,6 +89,38 @@ pub fn run(cwd: &Path, command: &str, needs: Needs) -> Result<Context> {
         state,
         settings,
     })
+}
+
+const GIB: u64 = 1 << 30;
+
+/// Free bytes on the filesystem holding `path` (what an ordinary user can use).
+pub fn free_bytes(path: &Path) -> std::io::Result<u64> {
+    use std::os::unix::ffi::OsStrExt;
+    let c = std::ffi::CString::new(path.as_os_str().as_bytes())
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))?;
+    let mut st: libc::statvfs = unsafe { std::mem::zeroed() };
+    // SAFETY: `c` is a valid NUL-terminated path and `st` a writable statvfs.
+    if unsafe { libc::statvfs(c.as_ptr(), &mut st) } != 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok((st.f_bavail as u64).saturating_mul(st.f_frsize as u64))
+}
+
+/// Refuses (4) when less than `min_free_gb` GB is free where `root` lives; 0 disables.
+pub fn require_free_disk(root: &Path, min_free_gb: u64) -> Result<()> {
+    if min_free_gb == 0 {
+        return Ok(());
+    }
+    let free = free_bytes(root)
+        .map_err(|e| Failure::refused(format!("free disk space of {}: {e}", root.display())))?;
+    if free >= min_free_gb.saturating_mul(GIB) {
+        return Ok(());
+    }
+    Err(Failure::refused(format!(
+        "only {:.1} GB free where {} lives; min_free_gb is {min_free_gb}. Free space first: `atelier clean --yes`, `mbx gc`, or remove old worktrees",
+        free as f64 / GIB as f64,
+        root.display()
+    )))
 }
 
 /// The integration branch and the version pinned on it, read from the main checkout: the
@@ -222,6 +259,19 @@ pub fn report(cwd: &Path) -> Report {
                 Ok(()) => push(&mut r, true, "state format", CURRENT_FORMAT.to_string()),
                 Err(m) => push(&mut r, false, "state format", m),
             }
+        }
+        match free_bytes(&checkout.root) {
+            Ok(free) => {
+                let gb = free as f64 / GIB as f64;
+                let floor = settings.min_free_gb;
+                push(
+                    &mut r,
+                    floor == 0 || free >= floor.saturating_mul(GIB),
+                    "disk",
+                    format!("{gb:.1} GB free (min_free_gb {floor})"),
+                );
+            }
+            Err(e) => push(&mut r, false, "disk", e.to_string()),
         }
         r.settings = Some(settings);
     }

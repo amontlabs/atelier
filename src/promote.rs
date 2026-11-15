@@ -1006,6 +1006,9 @@ pub fn finish(ctx: &Context, v: &Versioned, rec: &Promotion) -> Result<Exit> {
     if rec.rules_changed {
         println!("rules changed");
     }
+    println!(
+        "next: atelier clean --yes (removes the merged branches' worktrees and builds; run atelier clean first to see the plan)"
+    );
     Promotion::remove(v)?;
     Ok(Exit::Ok)
 }

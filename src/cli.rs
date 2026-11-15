@@ -215,11 +215,16 @@ impl Cmd {
                 Needs {
                     rules: true,
                     versioned: true,
+                    disk: matches!(self, Cmd::Merge { .. }),
                 }
             }
             _ => Needs {
                 rules: true,
                 versioned: false,
+                disk: matches!(
+                    self,
+                    Cmd::Start { .. } | Cmd::Check { .. } | Cmd::Test { .. }
+                ),
             },
         }
     }

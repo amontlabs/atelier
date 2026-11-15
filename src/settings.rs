@@ -23,6 +23,9 @@ pub struct Settings {
     pub workspaces: Vec<String>,
     #[serde(default = "default_promotion_wait")]
     pub promotion_wait_seconds: u64,
+    /// Commands that build refuse below this much free disk, in GB; 0 disables.
+    #[serde(default = "default_min_free_gb")]
+    pub min_free_gb: u64,
     pub rust: Option<Rust>,
     #[serde(default)]
     pub prerequisites: Prerequisites,
@@ -59,6 +62,10 @@ fn default_import_into() -> Vec<String> {
 
 fn default_integration_branch() -> String {
     "main".to_owned()
+}
+
+fn default_min_free_gb() -> u64 {
+    20
 }
 
 fn default_promotion_wait() -> u64 {

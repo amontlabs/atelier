@@ -36,6 +36,8 @@ Machines are chosen as `atelier test` chooses them ([MACHINES.md](MACHINES.md)).
 - If this computer's platform fails, the gate is RED at once; the others print `cancelled on <machine>, run <id>: the run on this computer failed`.
 - Every machine runs the merged commit's pinned atelier. A machine without it is `not ready: atelier <pin> is not installed there: run atelier machines init <name> with atelier <pin>`.
 
+A GREEN merge ends with `next: atelier clean --yes …`; clean right away, before starting new items. `start`, `check`, `test` and `merge` refuse (4) when the project's filesystem has less free space than `min_free_gb` (default 20; 0 disables); `atelier status` shows the free space.
+
 ## promote
 
 After a green gate, `main` moves by one local push into the main checkout:

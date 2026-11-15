@@ -265,6 +265,7 @@ fn a_fresh_project_reports_every_section_and_exits_0() {
     }
     assert!(text.contains("ok     version"), "{text}");
     assert!(text.contains("ok     rules: current"), "{text}");
+    assert!(text.contains("GB free (min_free_gb 20)"), "{text}");
     assert!(text.contains("ok     integration: main pins"), "{text}");
     let main = section(&text, "main");
     assert!(main[0].starts_with("main at "), "{main:?}");

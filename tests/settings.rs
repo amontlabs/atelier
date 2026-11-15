@@ -40,6 +40,7 @@ fn the_silo_example_parses_and_validates() {
     assert_eq!(s.integration_branch, "main");
     assert_eq!(s.workspaces, vec!["app/SiloUI"]);
     assert_eq!(s.promotion_wait_seconds, 300);
+    assert_eq!(s.min_free_gb, 20);
     assert_eq!(s.rust.as_ref().unwrap().nextest, "0.9.151");
     let mbx = s.prerequisites.mbx.as_ref().unwrap();
     assert_eq!(mbx.version, "1.30.0");
@@ -193,4 +194,19 @@ fn a_project_step_cannot_take_the_name_of_an_atelier_step() {
             e.message
         );
     }
+}
+
+#[test]
+fn min_free_gb_defaults_to_20_and_zero_disables() {
+    let repo = silo_repo();
+    let text = std::fs::read_to_string(repo.root.join(".atelier/atelier.toml")).unwrap();
+    repo.write(
+        ".atelier/atelier.toml",
+        &text.replacen(
+            "promotion_wait_seconds",
+            "min_free_gb = 0\npromotion_wait_seconds",
+            1,
+        ),
+    );
+    assert_eq!(Settings::load(&repo.root).unwrap().min_free_gb, 0);
 }

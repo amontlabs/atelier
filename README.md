@@ -48,6 +48,7 @@ Say what your check is in `.atelier/atelier.toml`:
 atelier = "0.2.0"
 integration_branch = "main"
 workspaces = ["."]            # Cargo workspaces: fmt, compile, nextest
+min_free_gb = 20              # start, check, test and merge refuse below this much free disk; 0 disables
 
 [rust]
 nextest = "0.9.151"           # exact cargo-nextest version
