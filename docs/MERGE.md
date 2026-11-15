@@ -1,98 +1,95 @@
 # approve, merge, promote
 
-## The versioned layer, format 1
-
-Only the version pinned on the integration branch reads or writes these, in the main checkout (`preflight::require_main_version`). A later format needs a converter (`state::Converter`).
-
-| Path under `.git/atelier/versioned/` | Content |
-|---|---|
-| `approvals/<branch key>.toml` | one per branch; replaced by every `approve`, removed when the branch is recorded merged |
-| `merges.tsv` | one line per merged branch, appended once, flushed |
-| `promotion.toml` | a green gate's promotion; written before the push, removed once every branch is recorded |
-
-**Approval** (TOML): `branch`, `lifetime` (the branch record's), `commit` (the approved tip), `worktree` (canonical path), `dev`, `ino` (that folder's identity), `approved` (RFC 3339 UTC).
-
-**`merges.tsv`**, tab-separated, one line per branch: `time branch lifetime commit OLD M run platforms`. `platforms` is `;`-separated, each `<platform>=pass@<machine>` (`local` for this computer) or `<platform>=waived:<owner's words>`. `%`, tab, newline, carriage return and `;` inside a field are percent-encoded.
-
-**Promotion** (TOML): `integration`, `old`, `m`, `run` (the gate's run id), `created`, `push_started`, `push_pgid`, `push_ended`, `summary` (the GREEN line), `rules_changed`, `branches` (each `name`, `lifetime`, `commit`, `worktree`, `dev`, `ino`) and `platforms` (each `platform`, `result`, `machine`, `reason`, `run`).
-
-When a promotion is recorded, each branch's frozen record gets, in one write, `state = "merged"` and the `merged` table `clean` trusts (`records::MergeFacts::record`, docs/FROZEN-LAYER.md): the merged commit and the worktree path and identity `approve` recorded.
-
-**Exception:** a branch that moved past its approved commit during the gate, or was approved again at another commit. Its approved commit is merged (`merged <branch> <commit>`), but its record stays `active` with no `merged` table, and `merge` prints `<branch> moved to <tip> after its approval at <commit>: its later commits are not merged; it stays active (atelier follow in its worktree, then approve it again)`. It keeps its lifetime. `follow` rebases the later commits onto the integration branch (the merged ones are upstream and dropped), `clean` deletes nothing of it, and its newer approval stays.
-
 ## approve
 
-Under the branch's lock: the record as every reading command sees it (pending follow settled, base still in the branch); `<commit>` is the branch's tip; no merge commit of its own; current (transitively); checked out in exactly one worktree that is neither the main checkout nor the gate.
+`atelier approve <branch> <commit>`, under the branch's lock. Refused (4) unless `<commit>` is the branch's tip, the branch has no merge commit of its own, it is current (not behind a rewrite of what it builds on, transitively), and it is checked out in exactly one worktree that is neither the main checkout nor the gate.
 
 ## merge
 
-Under the gate lock, in this order:
+`atelier merge <branch>… [--waive <platform> --reason "<words>"]…`, under the gate lock. Each `--waive` takes its own `--reason`, in the same order.
 
-1. **Checks.**
-   - A pending promotion is settled by the three questions (M in the integration branch: recorded; at OLD: refused as pending or interrupted; elsewhere: discarded). Mode A checks a and b.
-   - Per branch: approved, same lifetime, still at the approved commit, not behind a rewrite, no own merge commit, no rebase open. A stacked branch's lower branch is in the batch, earlier, approved at a commit containing the upper's base.
-   - A branch whose own commits (`base..commit`) touch `.atelier/`, `AGENTS.md` or an import file merges alone (a *rules item*).
-   - OLD's settings are read from OLD itself (`git show OLD:.atelier/atelier.toml`), never from the main checkout. The batch's settings are known before anything merges: a rules item's committed settings are the merged ones (`gate::batch_settings`); any other batch keeps OLD's.
-   - Every platform of those settings has a machine or is waived (exit 3 otherwise, before the gate), and the pin is theirs. This computer takes a `run = "check"` platform only with that atelier installed here (refused, 4, naming the install command, when no other machine is listed). Another machine does only when its probe says that atelier is installed there.
-   - `--waive <platform> --reason "<words>"` repeats, each `--waive` with its own `--reason` in the same order. A waiver names a platform of OLD's settings or of the merged ones, so a rules item that drops a platform whose machine is gone merges with or without a waiver for it.
-   - Then `merge` forecasts each batch branch against `main` and every other open branch. It prints `warning: forecast: <branch> x <branch>: <files>` (or `would be refused: ...`) for each conflict, and the number of pairs not forecast (`src/forecast.rs`, [STATUS.md](STATUS.md)). It refuses nothing.
-2. **The gate** `<main checkout>.gate` (`gate::gate_worktree`, the one function `approve`, `tmp` and `clean` use). Created detached at OLD on first use. Otherwise it must be registered at that exact path, detached, with no git operation in progress and no tracked change or untracked file git does not ignore; atelier lists what is there and refuses, and deletes nothing. Then `git checkout --detach --no-overwrite-ignore OLD`, and its tree id must be OLD's tree.
-3. **Merges.** `git merge --no-ff --no-verify --no-gpg-sign --no-autostash --no-overwrite-ignore` of each approved commit, with `-c core.attributesFile=/dev/null -c rerere.enabled=false -c merge.renormalize=false -c merge.renames=true` and `GIT_ATTR_NOSYSTEM=1` (on every git command of the gate's merges, `merge-tree` and `check-attr` included).
-   - Before each merge, the paths both sides changed are looked up with `git check-attr merge` (the checkout's `.gitattributes`, the incoming commit's with `--source`, and `info/attributes`). A merge driver other than git's `text` and `binary` (named by the attribute or `merge.default`), or one of those names redefined by `merge.<name>.driver`, refuses (4), naming each path and driver, before anything merges. Such a driver (mergiraf's documented install is one) would settle a conflict silently. So does git's `union`, wherever set: it keeps both sides' lines (`<path>: merge=union, which keeps both sides' lines and never conflicts`).
-   - When every conflicted path is a *regenerated path*, atelier takes **the incoming branch's side** for those paths (`git checkout --theirs`, or removes the path when that side deleted it), commits the merge, and the hook rewrites them in step 4. A regenerated path is one that a `[[merge.after]]` hook with `commit` names in `regenerates`, both in OLD's committed settings and in the merged settings (the index's, after the merge). A rules item never has a conflict settled.
-   - Any other conflicted path aborts the merge, returns the gate to OLD and exits 5: `conflict: <branch> with main` when the approved commit alone conflicts with OLD (`git merge-tree`), otherwise `with <earlier branches> (earlier in this batch)`; then the files (regenerated paths left out).
-4. **After hooks** (`[[merge.after]]`, from the merged settings), each a step of the gate run.
-   - A hook with `commit` has everything it changed committed (`git add -A`). Any other change is RED naming the hook. The tree id must be M's tree.
-   - Each settled path must hold what a hook with `commit` that names it produced: that hook's commit changed it, or, with the path removed, running the hooks that name it again gives back exactly M's tree (steps `regenerate:<hook>`). Otherwise RED (`merge.after <hook> did not regenerate <path> as merged`). Paths atelier removed and no hook wrote again are checked out from M.
-   - A hand edit on either side of a regenerated file is lost when the hook rewrites it. A `regenerates` hook must always rewrite its files: one that skips work by timestamp is RED here.
-5. **Platforms**, from the merged settings.
-   - A waiver must name one of OLD's or the merged ones (refused, 4, otherwise). One the merged settings no longer have prints `WAIVED (<words>); the merged settings no longer have it`.
-   - A platform that differs from step 1's settings (or every platform, when the pin differs) is checked for a machine first, as in step 1.
-   - Then every platform runs at the same time (`gate_machines::Machines`, below). `run = "check"` runs `<~/.local/share/atelier/<M's pin>/bin/atelier> check` as a step of the gate run, passing `ATELIER_RUN_ID=<a new id>`, the id its run takes, so the gate reads exactly that run's result (a nested atelier run under it is never taken for it). A pinned atelier that does not take the id is read through the one run directly under the gate's. A command runs after the `check.prepare` hooks that apply and the platform's `prepare`.
-6. **RED:** exit 1, the integration branch unmoved, the gate left at M. With more than one branch, bisection follows (below).
-7. **Green:** tree id still M's, OLD an ancestor of M, the promotion record written. Then mode A (`promote`) prints the GREEN line, `merged <branch> <commit>` per branch, and `rules changed` when a rules item landed.
+1. **Checks** (refused before anything merges):
+   - A pending promotion is settled first (see promote).
+   - Each branch: approved, still at the approved commit, same lifetime, current, no merge commit of its own, no rebase open. A stacked branch's lower branch must be earlier in the batch, approved at a commit containing the upper's base.
+   - A *rules item* (own commits touch `.atelier/`, `AGENTS.md` or an import file) merges alone. Its committed settings are the batch's; otherwise the integration branch's.
+   - Every platform has a machine or a waiver (else exit 3). A waiver names a platform of the old or the merged settings. This computer runs a `run = "check"` platform only with the pinned atelier installed (else 4, naming the install command).
+   - A forecast of each batch branch against `main` and every open branch prints `warning: forecast: <branch> x <branch>: <files>` (or `would be refused: …`). It refuses nothing.
+2. **The gate** is the worktree `<main checkout>.gate`, detached at `main` (OLD). If it holds a git operation, tracked changes or unignored untracked files, atelier lists them and refuses; it deletes nothing.
+3. **Merges.** `git merge --no-ff` of each approved commit, with no hooks, signing, autostash, rerere, renormalization or user attribute files.
+   - A path both sides changed that uses a custom merge driver, or git's `union`, refuses (4) before anything merges, naming the path and driver: such drivers settle conflicts silently.
+   - A conflict only in *regenerated paths* (named in `regenerates` by a `[[merge.after]]` hook with `commit`, in both the old and merged settings) takes the incoming branch's side; the hook rewrites them in step 4. A rules item never has a conflict settled.
+   - Any other conflict aborts, resets the gate and exits 5: `conflict: <branch> with main`, or `with <earlier branches> (earlier in this batch)`, then the files.
+4. **After hooks** (`[[merge.after]]`, from the merged settings). A hook with `commit` has its changes committed; any other change is RED. Each settled path must hold what its hook produced, else RED (`merge.after <hook> did not regenerate <path> as merged`). Hand edits to regenerated files are lost. A `regenerates` hook must always rewrite its files; one that skips work by timestamp fails here.
+5. **Platforms**, from the merged settings, all at once (below). `run = "check"` runs the merged commit's pinned `atelier check` in the gate. Another command runs after the `check.prepare` hooks and the platform's `prepare`. A waived platform prints `WAIVED (<words>)`.
+6. **RED:** exit 1, `main` unmoved, the gate kept at the merge for inspection. With more than one branch, bisection follows.
+7. **GREEN:** the promotion record is written and promotion runs. It prints the GREEN line, `merged <branch> <commit>` per branch, and `rules changed` when a rules item landed.
 
-## promote (mode A)
+A branch that moved past its approved commit, or was approved again, still has the approved commit merged, but stays `active`: `<branch> moved to <tip> after its approval at <commit>: its later commits are not merged; it stays active (atelier follow in its worktree, then approve it again)`. `clean` deletes nothing of it.
 
-`promote::promote` repeats, for `promotion_wait_seconds`: the three questions; the interrupted check; checks a and b (refusal, 4); checks c, d, e (busy: wait). With all five passing, one push:
+### Platforms on machines
+
+Machines are chosen as `atelier test` chooses them ([MACHINES.md](MACHINES.md)). Without a machines file, only this computer's platform has one.
+
+- Step 1 only probes. Step 5 runs every platform at once.
+- This computer runs its platform in the gate, under the machine lock (`~/.local/state/atelier/machine.lock`). While another atelier holds it, the gate prints `<platform>: waiting for this computer's machine lock: <holder>` once and waits.
+- Another machine gets the merged commit pushed and runs the platform's `run`. It passes only if every run there records that commit, its tree and no uncommitted change. A lost connection is no machine: exit 3.
+- If this computer's platform fails, the gate is RED at once; the others print `cancelled on <machine>, run <id>: the run on this computer failed`.
+- Every machine runs the merged commit's pinned atelier. A machine without it is `not ready: atelier <pin> is not installed there: run atelier machines init <name> with atelier <pin>`.
+
+## promote
+
+After a green gate, `main` moves by one local push into the main checkout:
 
 ```sh
 git -c push.gpgSign=false push --porcelain --no-verify --receive-pack='git -c receive.denyCurrentBranch=updateInstead -c receive.denyNonFastForwards=true -c core.hooksPath=<state>/empty-hooks receive-pack' --force-with-lease=refs/heads/main:<OLD> . <M>:refs/heads/main
 ```
 
-No repository hook runs on either side: not `pre-push` (`--no-verify`), and not `pre-receive`, `update`, `reference-transaction` or `push-to-checkout` (the receiving side's hooks folder is `.git/atelier/empty-hooks`, which must stay empty: anything in it refuses, 4, naming it). git's own clean-checkout test decides. Check b still refuses a `push-to-checkout` hook before the gate.
+No repository hook runs. `.git/atelier/empty-hooks` must stay empty (anything in it: refused, 4). The push is never signalled or time-limited.
 
-The push starts through the step trampoline as its own process group, recorded under the gate lock (and its `push_pgid` in the record) before git runs. It is never signalled and never time-limited: atelier waits for the group to be empty. The record holds `push_started` before, and `push_ended` after, a push that ended cleanly. Clean means one of:
-- git accepted the ref;
-- the ref stayed at OLD and the main checkout shows the push wrote nothing, judged by content and never by git's words (every path that differs between OLD and M, and every other tracked path `git status` reports, holds OLD's content, so none of M's added paths is there, and the index is OLD's tree);
-- failing that, the push left the checkout as checks d and e want it.
+Before each push atelier checks:
 
-git's words cannot tell: with `updateInstead`, receive-pack runs `read-tree -u -m` before it moves the ref, and a failure part way through (a folder without write permission) is reported as `[remote rejected] (Could not update working tree to new HEAD)` and `Done`, with files already written. That case is an interrupted promotion (below). A stop signal ends only the wait. Exit 7 prints `merge: GREEN, NOT PROMOTED — run <id>; <reasons>; run `atelier promote` when it is clean`.
+| Check | Failure |
+|---|---|
+| a. `main` is a plain ref, checked out in the main checkout or nowhere | refused (4) |
+| b. the repository has no `push-to-checkout` hook | refused (4) |
+| c. no merge, rebase, cherry-pick, revert, bisect or `index.lock` in the main checkout; no rebase or bisect of `main` in any worktree | busy |
+| d. no tracked change in the main checkout | busy |
+| e. nothing stands where `M` adds a path, except paths `M` deletes (case-insensitively on such volumes) | busy |
 
-**Interrupted promotion:** `push_started` with a recorded `push_pgid` and without `push_ended`, the ref still at OLD, check d or e failing. `merge` and `promote` refuse (4) with `git status`, the counts of paths holding OLD's and M's content, every path holding something else with its size, the file `runs/<gate run>/promotion-paths.tsv` (`path`, `old|m|other`, what is there), and the two resets it does not run. Without a recorded `push_pgid`, atelier ended before releasing the push and git never ran: no interruption. `promote --discard` drops the record; approvals stay.
+While a check is busy, `merge` retries for `promotion_wait_seconds`, then exits 7:
 
-Check e does not count as an obstruction what git removes before it writes: a path OLD tracks and M deletes (compared without case on a volume that ignores case, so a case-only rename passes), or a folder holding only such paths (a folder that becomes a file). An ignored or untracked file inside such a folder still obstructs, named.
+```text
+merge: GREEN, NOT PROMOTED — run <id>; <reasons>; run `atelier promote` when it is clean
+```
 
-**Step 9** (`promote::finish`) appends the `merges.tsv` lines. Then per branch, under its branch lock taken shared (`tmp` and `check` hold it shared too; only `start`, `follow` and `clean` make it wait, 10 s, after which the record is kept and the next command finishes): the record is marked merged (or kept active, above) and the approval removed. It prints the GREEN line, `merged <branch> <commit>` per branch and `rules changed`, and only then removes the promotion record, so a crash in between prints them again on the next `promote` or `merge`.
+`atelier promote` retries. `atelier promote --discard` drops the green result; approvals stay. A pending promotion is settled by `merge` and `promote` first: recorded if `main` already holds it, discarded if `main` moved elsewhere.
+
+**Interrupted promotion.** A push that started, did not finish, and left the main checkout partly written. `merge` and `promote` refuse (4) and print `git status`, path counts, every path holding something unexpected, and `runs/<gate run>/promotion-paths.tsv` (`path`, `old|m|other`, what is there), with the two resets to choose from. atelier runs neither. Give this list to the owner.
+
+Recording each branch as merged takes its branch lock shared, so `tmp` and `check` do not block it. `start`, `follow` and `clean` hold it exclusive; after 10 s the record is left for the next `promote` or `merge`. The output lines are printed again until the record is complete.
 
 ## Bisection
 
-After a RED gate of more than one branch, under the same gate lock, in a run of kind `gate-bisect`.
+After a RED gate of several branches, in a run of kind `gate-bisect`.
 
-A RED that is no platform's failure (the merged settings, the hooks, the tree changing) is not searched: `merge: no search: the RED is not a platform's failure (<cause>) …; no branch is blamed`.
+- A RED that is not a platform failure (settings, hooks, a changed tree) is not searched: `merge: no search: the RED is not a platform's failure (<cause>) …; no branch is blamed`.
+- Otherwise prefixes of the batch are tried, longest first. Only what failed is re-run: failed tests by name and failed steps whole (`atelier check --only`, run kind `check-only`); a failure that cannot be narrowed runs the platform whole. A remote failure is re-run on that machine first.
+- A prefix whose hooks leave the gate unclean stops the search; the RED stands.
+- The branch after the longest green prefix is blamed: `<branch> breaks: on prefix <…>: <what failed>`, or `fails only with the whole batch (<last>), or is flaky: <failures>`.
+- The green prefix goes through one full gate and lands if green. The rest stay approved and are listed. `merge` still exits 1.
 
-Otherwise prefixes are tried longest first, each merged in the gate with the after hooks (and the regenerated-path check); a prefix whose hooks fail is a failing prefix. When a prefix leaves the gate unclean, the search stops, because the leftovers would come into every shorter prefix and atelier deletes nothing there (`the search stopped (prefix …: the gate is not clean after its merge.after hooks: <paths>; …); the RED verdict stands`).
+## Versioned layer, format 1
 
-A tree already judged (the failed batch's included) takes its verdict. Otherwise only what failed runs: `atelier check --only <file>` (run kind `check-only`) with the failed tests by name (`test(=<name>)`, the part after `$`) and the failed steps whole. A failure that cannot be narrowed (a `check.prepare` hook, a failure that is no step's, a command platform) runs the platform whole. Only the listed full names are judged; a listed test the prefix does not have counts as not appearing (`--no-tests=pass`).
+Under `.git/atelier/versioned/`. Only the version pinned on `main` reads or writes it, in the main checkout. A new format needs a converter.
 
-The branch after the longest green prefix is the culprit (`<branch> breaks: on prefix <…>: <what failed on that prefix>`, or `fails only with the whole batch (<last>), or is flaky: <the batch's failures>`). A failure on another machine is re-run whole, on that machine first, then the platform's other machines in order. The green prefix then goes through one full gate and lands if green; the rest stay approved and are listed. `merge` still exits 1.
+| Path | Content |
+|---|---|
+| `approvals/<branch key>.toml` | one per branch; replaced by `approve`, removed when the branch is recorded merged |
+| `merges.tsv` | one line per merged branch, appended once |
+| `promotion.toml` | a green gate's promotion; written before the push, removed once every branch is recorded |
 
-## Platforms on machines (`gate_machines`)
+- **Approval** (TOML): `branch`, `lifetime`, `commit`, `worktree` (canonical path), `dev`, `ino` (its identity), `approved` (RFC 3339 UTC).
+- **`merges.tsv`**, tab-separated: `time branch lifetime commit OLD M run platforms`. `platforms` is `;`-separated `<platform>=pass@<machine>` (`local` for this computer) or `<platform>=waived:<owner's words>`. `%`, tab, newline, carriage return and `;` in a field are percent-encoded.
+- **Promotion** (TOML): `integration`, `old`, `m`, `run`, `created`, `push_started`, `push_pgid`, `push_ended`, `summary` (the GREEN line), `rules_changed`, `branches` (each `name`, `lifetime`, `commit`, `worktree`, `dev`, `ino`) and `platforms` (each `platform`, `result`, `machine`, `reason`, `run`).
 
-Without a machines file (`~/.config/atelier/machines.toml`), the platform this computer runs runs here and every other platform has no machine. With one, each platform's machine is chosen as `atelier test` chooses it (`machines::candidates`, `machines::select`: the project's order or the priorities, offline, not ready, busy, the wait for a busy one).
-
-- **Step 1 is a probe only,** with the batch's settings. This computer is available for its platform when it can run their pin; another machine is when its probe answers ready or busy.
-- **Step 5 runs every platform at the same time:** one thread per platform chooses its machine. This computer runs its platform in the gate worktree, as a step of the gate run (its machine preflight first, as `test`). Another machine gets M pushed and runs the platform's whole `run` (`remote-run`), and passes only when every run there records M, M's tree and no uncommitted change (`remote::Session::finish`). A lost connection gives no verdict: no machine, exit 3. The record names the machine (`<platform>=pass@<machine>`).
-- **Machine lock.** Every run on this computer holds `~/.local/state/atelier/machine.lock`: the gate's, with or without a machines file, and bisection's re-runs. While another atelier holds it (`test`, a `remote-run` from another computer) the gate waits, printing `<platform>: waiting for this computer's machine lock: <holder>` once. A stop signal ends the wait.
-- **This computer fails first.** When the platform on this computer fails (or cannot run), the gate is RED whatever the other machines say. Their sessions stop at once (closing the connection stops the remote run) and the gate does not wait for them. Each is printed and recorded as `cancelled on <machine>, run <id>: the run on this computer failed` (`cancelled, no machine started` when none had taken it yet). Bisection searches only this computer's failures.
-- **The pin.** Every machine runs M's own pinned atelier, `~/.local/share/atelier/<pin>/bin/atelier` there. The probe asks whether that version is installed (for this program's own version, also built from this program's source); otherwise the machine is not ready: `atelier <pin> is not installed there: run atelier machines init <name> with atelier <pin>`. A merged commit that changes the pin therefore needs `atelier machines init <name>`, run with the new version, on each machine that is to run it, before the merge. Step 1 finds out in seconds, before anything merges. This computer needs the pin installed only for a platform it runs itself.
+When a branch is recorded merged, its branch record gets `state = "merged"` and the `merged` table `clean` trusts ([FROZEN-LAYER.md](FROZEN-LAYER.md#merge-facts)).

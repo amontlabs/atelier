@@ -2173,7 +2173,7 @@ fn r10_a_tmp_in_the_branchs_worktree_does_not_hold_up_the_merge() {
                 "--",
                 "sh",
                 "-c",
-                &format!("touch {}; sleep 20", started.display()),
+                &format!("touch {}; sleep 600", started.display()),
             ],
             &[],
         )
@@ -2182,19 +2182,18 @@ fn r10_a_tmp_in_the_branchs_worktree_does_not_hold_up_the_merge() {
         .spawn()
         .unwrap();
     wait_for("tmp to start", || started.exists());
-    let t = Instant::now();
     let out = p.merge(&["feat"]);
-    let took = t.elapsed();
+    // tmp still holds the branch lock: the merge did not wait for it to end.
+    let tmp_running = child.try_wait().unwrap().is_none();
     // Stopped as an owner would: atelier stops its step and removes the step's job.
     // SAFETY: the test's own child.
     unsafe { libc::kill(child.id() as i32, libc::SIGTERM) };
     let _ = child.wait();
+    assert!(tmp_running, "tmp ended before the merge did");
     assert_eq!(code(&out), 0, "{}", both(&out));
+    // A merge that waited for the branch lock gives up and leaves the branch unrecorded.
+    assert!(!both(&out).contains("waits for its lock"), "{}", both(&out));
     p.assert_merged("feat", &c);
-    assert!(
-        took < Duration::from_secs(10),
-        "no wait for the lock: {took:?}"
-    );
 }
 
 #[test]
