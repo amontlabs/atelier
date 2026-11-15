@@ -25,6 +25,10 @@
 //! the marker scan, so either catches a survivor; the run fails. A run refuses (4) to start on a
 //! macOS where the preflight probe ([`crate::coalition::ensure_probed`]) fails: there is no
 //! fallback to the marker scan alone.
+//!
+//! Steps may run at the same time from several threads (`atelier check` runs the tests and the
+//! project steps together): each has its own group or job, and the lock's record, the step
+//! records and the failures are changed under one mutex. A stop signal ends every running step.
 
 use std::fs::{self, File};
 use std::io::{ErrorKind, Write};
@@ -33,6 +37,7 @@ use std::os::unix::process::{CommandExt, ExitStatusExt};
 use std::path::{Path, PathBuf};
 #[cfg(not(target_os = "macos"))]
 use std::process::{Command, Stdio};
+use std::sync::{Mutex, MutexGuard};
 #[cfg(not(target_os = "macos"))]
 use std::thread::sleep;
 use std::time::Duration;
@@ -298,7 +303,6 @@ pub struct Run {
     kind: RunKind,
     dir: PathBuf,
     command: String,
-    lock: HeldLock,
     started: String,
     worktree: PathBuf,
     branch: Option<String>,
@@ -307,19 +311,14 @@ pub struct Run {
     /// `ATELIER_RUNS` of every step.
     runs: String,
     grace: Duration,
-    steps: Vec<StepRecord>,
-    failures: Vec<String>,
+    live: Mutex<Live>,
     tree: Option<String>,
     commit: Option<String>,
     uncommitted: Option<bool>,
     tests: Option<TestCounts>,
     test_results: Option<String>,
-    interrupted: Option<i32>,
     /// A test's replacement for the end-of-run scan.
     scan: Option<SurvivorScan>,
-    /// Step jobs started so far (macOS), for their labels and folders.
-    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
-    jobs: u32,
     /// The coalitions files of the runs this one is nested in, in any state: a step's coalition
     /// is listed there too, so an outer run finds what a nested atelier left.
     #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
@@ -328,6 +327,18 @@ pub struct Run {
     #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
     coalitions: String,
     _signals: signals::RunSignals,
+}
+
+/// What steps running at the same time change, under [`Run`]'s mutex.
+#[derive(Debug)]
+struct Live {
+    lock: HeldLock,
+    steps: Vec<StepRecord>,
+    failures: Vec<String>,
+    interrupted: Option<i32>,
+    /// Step jobs started so far (macOS), for their labels and folders.
+    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+    jobs: u32,
 }
 
 impl Run {
@@ -422,7 +433,6 @@ impl Run {
             kind,
             dir,
             command: command.to_owned(),
-            lock,
             started,
             worktree: worktree.to_path_buf(),
             branch,
@@ -430,16 +440,19 @@ impl Run {
             machine: None,
             runs: chain.join(":"),
             grace: procs::DEFAULT_GRACE,
-            steps: Vec::new(),
-            failures: Vec::new(),
+            live: Mutex::new(Live {
+                lock,
+                steps: Vec::new(),
+                failures: Vec::new(),
+                interrupted: None,
+                jobs: 0,
+            }),
             tree: None,
             commit: None,
             uncommitted: None,
             tests: None,
             test_results: None,
-            interrupted: None,
             scan: None,
-            jobs: 0,
             outer_files,
             coalitions,
             _signals: guard,
@@ -459,6 +472,10 @@ impl Run {
         self
     }
 
+    fn live(&self) -> MutexGuard<'_, Live> {
+        self.live.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
     pub fn id(&self) -> &str {
         &self.id
     }
@@ -471,18 +488,19 @@ impl Run {
         &self.dir
     }
 
-    pub fn steps(&self) -> &[StepRecord] {
-        &self.steps
+    /// The step records so far, in the order the steps ended.
+    pub fn steps(&self) -> Vec<StepRecord> {
+        self.live().steps.clone()
     }
 
     /// The failure lines recorded so far.
-    pub fn failures(&self) -> &[String] {
-        &self.failures
+    pub fn failures(&self) -> Vec<String> {
+        self.live().failures.clone()
     }
 
     /// The stop signal received during this run, if any.
     pub fn interrupted(&self) -> Option<i32> {
-        self.interrupted.or_else(signals::received)
+        self.live().interrupted.or_else(signals::received)
     }
 
     /// Records the tree the run tests.
@@ -515,16 +533,17 @@ impl Run {
     }
 
     /// Adds a failure line to the result.
-    pub fn fail(&mut self, line: impl Into<String>) {
-        self.failures.push(line.into());
+    pub fn fail(&self, line: impl Into<String>) {
+        self.live().failures.push(line.into());
     }
 
     /// Runs one step to its end: its own process group, the run markers set, stdin closed,
     /// output in `<name>.log`. Returns its record (also kept for the result). After a stop
-    /// signal no step starts. Refuses (2) an `env` that names a run marker, and a program whose
+    /// signal no step starts; a stop signal ends every running step. Steps may run at the same
+    /// time from several threads. Refuses (2) an `env` that names a run marker, and a program whose
     /// name starts with `-` (the trampoline's `exec` would read it as an option).
     pub fn step(
-        &mut self,
+        &self,
         name: &str,
         argv: &[String],
         cwd: &Path,
@@ -536,7 +555,7 @@ impl Run {
     /// As [`Run::step`], with the step's standard output in `stdout_file` (a name in the run
     /// folder) instead of the log; standard error stays in the log.
     pub fn step_with_stdout(
-        &mut self,
+        &self,
         name: &str,
         argv: &[String],
         cwd: &Path,
@@ -570,9 +589,10 @@ impl Run {
             )));
         }
         if let Some(sig) = self.interrupted() {
-            self.interrupted = Some(sig);
+            let mut live = self.live();
+            live.interrupted = Some(sig);
             record.status = StepStatus::Interrupted;
-            self.steps.push(record.clone());
+            live.steps.push(record.clone());
             return Ok(record);
         }
         let log_path = self.dir.join(&log_name);
@@ -591,7 +611,7 @@ impl Run {
     /// A step as its own process group, released by the `/bin/sh` trampoline (Linux).
     #[cfg(not(target_os = "macos"))]
     fn group_step(
-        &mut self,
+        &self,
         mut record: StepRecord,
         argv: &[String],
         cwd: &Path,
@@ -643,7 +663,7 @@ impl Run {
             Ok(c) => c,
             Err(e) => {
                 let _ = fs::write(&log_path, format!("atelier: cannot start {program}: {e}\n"));
-                self.steps.push(record.clone());
+                self.live().steps.push(record.clone());
                 return Ok(record);
             }
         };
@@ -651,7 +671,8 @@ impl Run {
         let gate = child.stdin.take();
         // The shell is this process's unreaped child, so its pid is not reused meanwhile.
         let leader_start = procs::start_time(pgid);
-        if let Err(e) = self.lock.add_group(pgid, &self.id, leader_start) {
+        let added = self.live().lock.add_group(pgid, &self.id, leader_start);
+        if let Err(e) = added {
             drop(gate);
             procs::stop_group(pgid, Some(&mut child), self.grace);
             return Err(e);
@@ -673,7 +694,7 @@ impl Run {
                 }
             }
             if let Some(sig) = signals::received() {
-                self.interrupted = Some(sig);
+                self.live().interrupted = Some(sig);
                 break false;
             }
             sleep(Duration::from_millis(20));
@@ -712,17 +733,18 @@ impl Run {
         } else {
             StepStatus::Failed
         };
+        let mut live = self.live();
         if !procs::group_alive(pgid) {
-            self.lock.remove_group(pgid)?;
+            live.lock.remove_group(pgid)?;
         }
-        self.steps.push(record.clone());
+        live.steps.push(record.clone());
         Ok(record)
     }
 
     /// A step as a launchd job, released by atelier's shim (macOS).
     #[cfg(target_os = "macos")]
     fn job_step(
-        &mut self,
+        &self,
         mut record: StepRecord,
         argv: &[String],
         cwd: &Path,
@@ -746,8 +768,12 @@ impl Run {
             .append(true)
             .open(log_path)
             .ctx(log_path.display())?;
-        self.jobs += 1;
-        let label = format!("atelier.{}.{}", self.id, self.jobs);
+        let n = {
+            let mut live = self.live();
+            live.jobs += 1;
+            live.jobs
+        };
+        let label = format!("atelier.{}.{n}", self.id);
         let spec = launchd::Spec {
             argv: argv.iter().map(Into::into).collect(),
             cwd: cwd.to_path_buf(),
@@ -765,13 +791,14 @@ impl Run {
             }
             Err(LaunchError::NotStarted(m)) => {
                 note(&m);
-                self.steps.push(record.clone());
+                self.live().steps.push(record.clone());
                 return Ok(record);
             }
             Err(LaunchError::Interrupted) => {
-                self.interrupted = signals::received();
+                let mut live = self.live();
+                live.interrupted = signals::received();
                 record.status = StepStatus::Interrupted;
-                self.steps.push(record.clone());
+                live.steps.push(record.clone());
                 return Ok(record);
             }
         };
@@ -782,15 +809,18 @@ impl Run {
         };
         // Listed before the program runs: this run's file, then every outer run's, whatever
         // state it is in.
-        let listed = coalition::append_run_file(&self.dir, &line)
-            .ctx(self.dir.join(coalition::RUN_FILE).display());
-        for f in &self.outer_files {
-            let _ = coalition::append_existing_file(f, &line);
-        }
-        let recorded = listed.and_then(|()| {
-            self.lock
-                .add_job_group(job.pid, &self.id, job.start.clone(), &job.coalition)
-        });
+        let recorded = {
+            let mut live = self.live();
+            let listed = coalition::append_run_file(&self.dir, &line)
+                .ctx(self.dir.join(coalition::RUN_FILE).display());
+            for f in &self.outer_files {
+                let _ = coalition::append_existing_file(f, &line);
+            }
+            listed.and_then(|()| {
+                live.lock
+                    .add_job_group(job.pid, &self.id, job.start.clone(), &job.coalition)
+            })
+        };
         if let Err(e) = recorded {
             job.abandon();
             let _ = job.wait(&mut || false);
@@ -811,7 +841,7 @@ impl Run {
             }
         };
         if !ended {
-            self.interrupted = signals::received();
+            self.live().interrupted = signals::received();
         }
         // End-of-step coalition check: the job's process is gone; its coalition must be empty
         // once what ends on its own has ended.
@@ -843,25 +873,25 @@ impl Run {
             StepStatus::Failed
         };
         if stopped.remaining.is_empty() {
-            self.lock.remove_group(job.pid)?;
+            self.live().lock.remove_group(job.pid)?;
         }
         if let Some(n) = job.bootout() {
             note(&n);
         }
-        self.steps.push(record.clone());
+        self.live().steps.push(record.clone());
         Ok(record)
     }
 
-    /// Forgets the last step when it merely exited non-zero: a probe whose failure is an answer,
-    /// not a failure of the run. Its log stays. A step that left processes behind, or did not
-    /// start, is kept.
-    pub fn discard_failed_step(&mut self) {
-        if self
-            .steps
-            .last()
-            .is_some_and(|s| s.status == StepStatus::Failed && s.unstoppable.is_empty())
+    /// Forgets the last step named `name` when it merely exited non-zero: a probe whose failure
+    /// is an answer, not a failure of the run. Its log stays. A step that left processes behind,
+    /// or did not start, is kept.
+    pub fn discard_failed_step(&self, name: &str) {
+        let mut live = self.live();
+        if let Some(i) = live.steps.iter().rposition(|s| s.name == name)
+            && live.steps[i].status == StepStatus::Failed
+            && live.steps[i].unstoppable.is_empty()
         {
-            self.steps.pop();
+            live.steps.remove(i);
         }
     }
 
@@ -917,11 +947,13 @@ impl Run {
             crate::coalition::settle(&ids, crate::coalition::SETTLE);
             let stopped = crate::coalition::stop(&ids, self.grace);
             for line in stopped.unstoppable() {
-                self.failures.push(if line.starts_with("cannot stop ") {
-                    line
-                } else {
-                    format!("could not stop: {line}")
-                });
+                self.live()
+                    .failures
+                    .push(if line.starts_with("cannot stop ") {
+                        line
+                    } else {
+                        format!("could not stop: {line}")
+                    });
             }
             let mut found: Vec<String> = stopped
                 .members
@@ -960,17 +992,23 @@ impl Run {
         let (survivors, still_alive, scanned) = match self.end_scan() {
             Ok((found, alive)) => (found, alive, true),
             Err(e) => {
-                self.failures
-                    .push(format!("cannot scan for processes left behind: {e}"));
+                self.fail(format!("cannot scan for processes left behind: {e}"));
                 (Vec::new(), true, false)
             }
         };
-        for s in &self.steps {
+        let Live {
+            lock,
+            steps,
+            mut failures,
+            interrupted: stopped_by,
+            ..
+        } = self.live.into_inner().unwrap_or_else(|e| e.into_inner());
+        for s in &steps {
             match s.status {
                 StepStatus::Passed | StepStatus::Interrupted => {}
-                StepStatus::Failed => self.failures.push(format!("{} failed", s.name)),
-                StepStatus::NotStarted => self.failures.push(format!("{} could not start", s.name)),
-                StepStatus::LeftProcesses => self.failures.push(format!(
+                StepStatus::Failed => failures.push(format!("{} failed", s.name)),
+                StepStatus::NotStarted => failures.push(format!("{} could not start", s.name)),
+                StepStatus::LeftProcesses => failures.push(format!(
                     "{} left processes behind: {}",
                     s.name,
                     s.left.join("; ")
@@ -981,10 +1019,10 @@ impl Run {
                 .iter()
                 .partition(|l| l.starts_with("cannot stop "));
             for l in denied {
-                self.failures.push(format!("{}: {l}", s.name));
+                failures.push(format!("{}: {l}", s.name));
             }
             if !other.is_empty() {
-                self.failures.push(format!(
+                failures.push(format!(
                     "{}: could not stop {}",
                     s.name,
                     other
@@ -996,29 +1034,28 @@ impl Run {
             }
         }
         if !survivors.is_empty() {
-            self.failures
-                .push(format!("left processes behind: {}", survivors.join("; ")));
+            failures.push(format!("left processes behind: {}", survivors.join("; ")));
         }
-        let mut interrupted = self.interrupted();
+        let mut interrupted = stopped_by.or_else(signals::received);
         let mut outcome = if interrupted.is_some() {
             Outcome::Interrupted
-        } else if passed && self.failures.is_empty() {
+        } else if passed && failures.is_empty() {
             Outcome::Passed
         } else {
             Outcome::Failed
         };
-        let mut lock = Some(self.lock);
+        let mut lock = Some(lock);
         if follow && outcome == Outcome::Passed {
             // Passing means no survivor and a scan that worked: the run leaves the lock.
             if let Some(mut l) = lock.take() {
                 l.remove_run(&self.id)?;
             }
             let f = then();
-            self.failures.extend(f.failures);
-            interrupted = self.interrupted.or_else(signals::received);
+            failures.extend(f.failures);
+            interrupted = stopped_by.or_else(signals::received);
             outcome = if interrupted.is_some() {
                 Outcome::Interrupted
-            } else if f.passed && self.failures.is_empty() {
+            } else if f.passed && failures.is_empty() {
                 Outcome::Passed
             } else {
                 Outcome::Failed
@@ -1040,11 +1077,11 @@ impl Run {
             started: self.started.clone(),
             ended: fsutil::rfc3339(fsutil::now_secs()),
             signal: interrupted.map(|s| signals::name(s).to_owned()),
-            failures: self.failures.clone(),
+            failures,
             survivors: survivors.clone(),
             test_results: self.test_results.clone(),
             tests: self.tests,
-            steps: self.steps.clone(),
+            steps,
         };
         let text = toml::to_string(&result).map_err(|e| Failure::refused(e.to_string()))?;
         fsutil::write_atomic(&self.dir.join("result"), text.as_bytes()).ctx("result")?;

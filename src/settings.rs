@@ -132,6 +132,14 @@ pub struct Step {
     pub run: Vec<String>,
     #[serde(default)]
     pub compile: bool,
+    /// False: the step runs alone, after the tests and the steps before it, and the steps after
+    /// it follow it one by one. True (the default): it may run while the tests run.
+    #[serde(default = "default_true")]
+    pub parallel: bool,
+}
+
+fn default_true() -> bool {
+    true
 }
 
 #[derive(Debug, Clone, Default, Deserialize, PartialEq)]

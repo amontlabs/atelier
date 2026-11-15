@@ -10,7 +10,7 @@ How the commands work and where they live in `src/`. Every command runs its pref
   1. Prerequisites: Rust toolchain, nextest pin, declared tools; refusal of nextest settings that hide failures (default filters, retries, flaky passes, `on-timeout` other than `fail`, wrapper scripts); with `[prerequisites.mbx]`, mbx's version, settings and build folder. Files are read again at the end.
   2. The run lock and the tree id.
   3. `check.prepare` hooks, format, compile (`--compile-only` stops here).
-  4. nextest with no retries, then `check.steps`.
+  4. nextest with no retries and `check.steps` at the same time, each in its own thread; a step with `parallel = false` runs alone after both.
   5. The survivor scan.
 
   Per-test results stay in the run folder: `tests.tsv`, and nextest's JSON in `tests-<workspace>.jsonl`.

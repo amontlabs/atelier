@@ -2,12 +2,19 @@
 //!
 //! Order: prerequisites; this worktree's run lock; the tree id; the `check.prepare` hooks (the
 //! tree must not change after each, and a failing or tree-changing hook stops the run); format,
-//! compile, test (nextest with fixed flags); the project steps; the tree id again, the `.mbx.toml`
-//! and build-folder checks again, and the survivor scan. A failing step does not stop later
-//! independent ones; a compile failure skips that workspace's tests.
+//! compile; then the tests (nextest with fixed flags) and the project steps at the same time; the
+//! tree id again, the `.mbx.toml` and build-folder checks again, and the survivor scan. A failing
+//! step does not stop later independent ones; a compile failure skips that workspace's tests.
+//!
+//! The tests run in one thread, the project steps in another, in their configured order. A
+//! project step with `parallel = false` runs alone: it starts once the tests and the steps before
+//! it have ended, and the steps after it follow it one by one. A stop signal ends every running
+//! step and starts no other.
 
 use std::fs;
 use std::path::Path;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
 use crate::exit::{Exit, Result};
@@ -161,38 +168,34 @@ pub fn run_mode(
     let uncommitted = head_tree.as_deref() != Some(before.as_str());
     run.set_tree(before.clone(), head.clone(), uncommitted);
 
-    let mut c = Checker {
+    let c = Checker {
         ctx,
         run,
         workspaces: &workspaces,
         platform,
         before,
-        extras: Vec::new(),
-        stop: false,
-        tests: 0,
-        excluded: 0,
-        counts: None,
+        tally: Mutex::new(Tally::default()),
+        stop: AtomicBool::new(false),
         compile_only,
         only,
     };
     c.hooks()?;
-    if !c.stop {
-        c.cargo_steps()?;
-    }
-    if !c.stop {
-        c.project_steps()?;
+    if !c.stopped() {
+        let built = c.build_steps()?;
+        if !c.stopped() {
+            c.test_and_project_steps(&built)?;
+        }
     }
     c.end(&snapshot);
 
     let c_only = c.only.is_some();
-    let Checker {
-        mut run,
+    let Checker { mut run, tally, .. } = c;
+    let Tally {
         extras,
         tests,
         excluded,
         counts,
-        ..
-    } = c;
+    } = tally.into_inner().unwrap_or_else(|e| e.into_inner());
     if let Some(mut counts) = counts {
         counts.excluded = excluded as u64;
         run.set_tests(counts);
@@ -224,25 +227,51 @@ pub fn run_mode(
     ))
 }
 
+/// Shared by the tests' and the project steps' threads.
 struct Checker<'a> {
     ctx: &'a Context,
     run: Run,
     workspaces: &'a [Workspace],
     platform: Option<Platform>,
     before: String,
-    /// Failures that are not a step's own exit: a hook that changed the tree, a changed `.mbx.toml`.
-    extras: Vec<String>,
-    stop: bool,
-    tests: usize,
-    excluded: usize,
-    /// The result's test counts, once a test step has run.
-    counts: Option<TestCounts>,
+    tally: Mutex<Tally>,
+    /// No step starts any more: a stop signal, a failed hook, or an error in another thread.
+    stop: AtomicBool,
     compile_only: bool,
     /// A narrow re-run: only these tests and steps.
     only: Option<Only>,
 }
 
+#[derive(Default)]
+struct Tally {
+    /// Failures that are not a step's own exit: a hook that changed the tree, a changed `.mbx.toml`.
+    extras: Vec<String>,
+    tests: usize,
+    excluded: usize,
+    /// The result's test counts, once a test step has run.
+    counts: Option<TestCounts>,
+}
+
+/// What format and compile left for the tests: per workspace, whether its metadata was read and
+/// whether it compiled.
+struct Built {
+    healthy: Vec<bool>,
+    compiled: Vec<bool>,
+}
+
 impl Checker<'_> {
+    fn tally(&self) -> MutexGuard<'_, Tally> {
+        self.tally.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    fn stopped(&self) -> bool {
+        self.stop.load(Ordering::SeqCst)
+    }
+
+    fn set_stop(&self) {
+        self.stop.store(true, Ordering::SeqCst);
+    }
+
     fn checkout(&self) -> &Checkout {
         &self.ctx.checkout
     }
@@ -257,13 +286,7 @@ impl Checker<'_> {
     }
 
     /// Runs one step and prints its verdict; returns whether it passed. A stop signal ends the run.
-    fn step(
-        &mut self,
-        name: &str,
-        argv: &[String],
-        cwd: &Path,
-        stdout: Option<&str>,
-    ) -> Result<bool> {
+    fn step(&self, name: &str, argv: &[String], cwd: &Path, stdout: Option<&str>) -> Result<bool> {
         let env = if stdout.is_some() {
             Self::env(nextest::JSON_ENV)
         } else {
@@ -281,16 +304,17 @@ impl Checker<'_> {
             }
         );
         if self.run.interrupted().is_some() {
-            self.stop = true;
+            self.set_stop();
         }
         Ok(rec.passed())
     }
 
-    fn fail(&mut self, name: &str, why: String) {
+    fn fail(&self, name: &str, why: String) {
         println!("  {name}: {why}");
         self.run.fail(why);
-        if !self.extras.iter().any(|e| e == name) {
-            self.extras.push(name.to_owned());
+        let mut tally = self.tally();
+        if !tally.extras.iter().any(|e| e == name) {
+            tally.extras.push(name.to_owned());
         }
     }
 
@@ -309,7 +333,7 @@ impl Checker<'_> {
         Ok(Some(files.join(", ")))
     }
 
-    fn hooks(&mut self) -> Result<()> {
+    fn hooks(&self) -> Result<()> {
         let root = self.checkout().root.clone();
         let hooks: Vec<_> = self
             .ctx
@@ -324,10 +348,10 @@ impl Checker<'_> {
             let name = format!("prepare:{}", h.name);
             if !self.step(&name, &h.run, &root, None)? {
                 self.fail(&name, format!("hook {} failed; the run stops here", h.name));
-                self.stop = true;
+                self.set_stop();
                 return Ok(());
             }
-            if self.stop {
+            if self.stopped() {
                 return Ok(());
             }
             match self.tree_changed() {
@@ -340,12 +364,12 @@ impl Checker<'_> {
                             h.name
                         ),
                     );
-                    self.stop = true;
+                    self.set_stop();
                     return Ok(());
                 }
                 Err(e) => {
                     self.fail(&name, format!("hook {}: {}", h.name, e.message));
-                    self.stop = true;
+                    self.set_stop();
                     return Ok(());
                 }
             }
@@ -361,9 +385,11 @@ impl Checker<'_> {
         }
     }
 
-    fn cargo_steps(&mut self) -> Result<()> {
-        let workspaces = self.workspaces.to_vec();
+    /// Format, then compile, one workspace after another.
+    fn build_steps(&self) -> Result<Built> {
+        let workspaces = self.workspaces;
         let mut healthy = vec![true; workspaces.len()];
+        let mut compiled = vec![false; workspaces.len()];
 
         for (i, ws) in workspaces.iter().enumerate() {
             let name = self.suffixed("fmt", ws);
@@ -381,12 +407,11 @@ impl Checker<'_> {
                 argv.push(m.clone());
             }
             self.step(&name, &argv, &ws.dir, None)?;
-            if self.stop {
-                return Ok(());
+            if self.stopped() {
+                return Ok(Built { healthy, compiled });
             }
         }
 
-        let mut compiled = vec![false; workspaces.len()];
         for (i, ws) in workspaces.iter().enumerate() {
             if !healthy[i] {
                 continue;
@@ -401,14 +426,46 @@ impl Checker<'_> {
                 .map(str::to_owned)
                 .to_vec();
             compiled[i] = self.step(&name, &argv, &ws.dir, None)?;
-            if self.stop {
-                return Ok(());
+            if self.stopped() {
+                break;
             }
         }
-        if self.compile_only {
-            return Ok(());
-        }
+        Ok(Built { healthy, compiled })
+    }
 
+    /// The tests in one thread and the project steps in this one; see the module documentation.
+    /// An error in either thread starts no further step in the other; the first is returned.
+    fn test_and_project_steps(&self, built: &Built) -> Result<()> {
+        let steps = self.project_step_list();
+        let alone = steps
+            .iter()
+            .position(|s| !s.parallel)
+            .unwrap_or(steps.len());
+        let (together, after) = steps.split_at(alone);
+        let stop_on_error = |r: Result<()>| {
+            if r.is_err() {
+                self.set_stop();
+            }
+            r
+        };
+        let (tests, project) = std::thread::scope(|scope| {
+            let tests =
+                (!self.compile_only).then(|| scope.spawn(|| stop_on_error(self.test_steps(built))));
+            let project = stop_on_error(self.project_steps(together));
+            let tests = match tests {
+                Some(t) => t.join().unwrap_or_else(|p| std::panic::resume_unwind(p)),
+                None => Ok(()),
+            };
+            (tests, project)
+        });
+        tests?;
+        project?;
+        self.project_steps(after)
+    }
+
+    fn test_steps(&self, built: &Built) -> Result<()> {
+        let workspaces = self.workspaces;
+        let Built { healthy, compiled } = built;
         let exclude = self
             .ctx
             .settings
@@ -460,12 +517,12 @@ impl Checker<'_> {
                         e.filter, ws.rel
                     ),
                 }
-                if self.stop {
+                if self.stopped() {
                     return Ok(());
                 }
             }
             if applicable.len() == 1 {
-                self.excluded += counts[0];
+                self.tally().excluded += counts[0];
             } else if applicable.len() > 1 {
                 // Overlapping exclusions count each test once.
                 let any = applicable
@@ -477,7 +534,7 @@ impl Checker<'_> {
                 if let Some(n) =
                     self.list_matching(&format!("{name}:exclusions"), ws, &any, &file)?
                 {
-                    self.excluded += n;
+                    self.tally().excluded += n;
                 }
             }
             let exclude = applicable;
@@ -505,22 +562,25 @@ impl Checker<'_> {
                 });
                 if !ok && !appeared && !results.is_empty() {
                     // Only same-named tests of other binaries failed: not a listed failure.
-                    self.run.discard_failed_step();
+                    self.run.discard_failed_step(&name);
                     println!("    none of the listed tests failed");
                 }
             }
-            let counts = self.counts.get_or_insert_with(TestCounts::default);
-            for r in &results {
-                match r.verdict {
-                    Verdict::Passed => counts.passed += 1,
-                    Verdict::Failed => counts.failed += 1,
-                    Verdict::Ignored => counts.skipped += 1,
+            {
+                let mut tally = self.tally();
+                let counts = tally.counts.get_or_insert_with(TestCounts::default);
+                for r in &results {
+                    match r.verdict {
+                        Verdict::Passed => counts.passed += 1,
+                        Verdict::Failed => counts.failed += 1,
+                        Verdict::Ignored => counts.skipped += 1,
+                    }
                 }
+                tally.tests += results
+                    .iter()
+                    .filter(|r| r.verdict != Verdict::Ignored)
+                    .count();
             }
-            self.tests += results
-                .iter()
-                .filter(|r| r.verdict != Verdict::Ignored)
-                .count();
             let mut tsv = String::new();
             for r in &results {
                 tsv.push_str(&format!(
@@ -541,7 +601,7 @@ impl Checker<'_> {
                     "nextest passed but reported no test results".to_owned(),
                 );
             }
-            if self.stop {
+            if self.stopped() {
                 return Ok(());
             }
         }
@@ -564,7 +624,7 @@ impl Checker<'_> {
     /// `cargo nextest list` with `filter` in `ws`: how many tests it matches, or `None` when
     /// nextest rejects it there. A rejection is an answer, not a failure of the run.
     fn list_matching(
-        &mut self,
+        &self,
         name: &str,
         ws: &Workspace,
         filter: &str,
@@ -589,10 +649,10 @@ impl Checker<'_> {
             .run
             .step_with_stdout(name, &argv, &ws.dir, &env, Some(file))?;
         if self.run.interrupted().is_some() {
-            self.stop = true;
+            self.set_stop();
         }
         if rec.status == StepStatus::Failed {
-            self.run.discard_failed_step();
+            self.run.discard_failed_step(name);
             return Ok(None);
         }
         if !rec.passed() {
@@ -603,30 +663,38 @@ impl Checker<'_> {
         Ok(Some(nextest::count_matching(&text)))
     }
 
-    fn project_steps(&mut self) -> Result<()> {
-        let root = self.checkout().root.clone();
-        let steps: Vec<_> = self
-            .ctx
+    /// The project steps this run runs, in their configured order.
+    fn project_step_list(&self) -> Vec<&crate::settings::Step> {
+        self.ctx
             .settings
             .check
             .steps
             .iter()
             .filter(|s| !self.compile_only || s.compile)
             .filter(|s| self.only.as_ref().is_none_or(|o| o.steps.contains(&s.name)))
-            .cloned()
-            .collect();
+            .collect()
+    }
+
+    /// `steps` one after another; none starts after a stop.
+    fn project_steps(&self, steps: &[&crate::settings::Step]) -> Result<()> {
+        let root = &self.checkout().root;
         for s in steps {
-            self.step(&s.name, &s.run, &root, None)?;
-            if self.stop {
+            if self.stopped() {
                 break;
             }
+            self.step(&s.name, &s.run, root, None)?;
         }
         Ok(())
     }
 
     /// Step 8: the tree, the mbx files, then (in `finish`) the survivor scan.
-    fn end(&mut self, snapshot: &prereq::Snapshot) {
-        if !self.extras.iter().any(|e| e.starts_with("prepare:")) {
+    fn end(&self, snapshot: &prereq::Snapshot) {
+        let hook_failed = self
+            .tally()
+            .extras
+            .iter()
+            .any(|e| e.starts_with("prepare:"));
+        if !hook_failed {
             match self.tree_changed() {
                 Ok(None) => {}
                 Ok(Some(files)) => {

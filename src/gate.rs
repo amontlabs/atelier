@@ -488,7 +488,7 @@ pub fn regenerated_paths(settings: &Settings) -> BTreeSet<String> {
 }
 
 /// Ends the gate's run as failed and returns `e`.
-fn refuse_in(mut run: Run, e: Failure) -> Result<GateEnd> {
+fn refuse_in(run: Run, e: Failure) -> Result<GateEnd> {
     run.fail(e.message.clone());
     let _ = run.finish(false);
     Err(e)

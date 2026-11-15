@@ -85,7 +85,7 @@ mod mac {
         let state =
             State::open_at(PathBuf::from(std::env::var("ATELIER_TEST_STATE").unwrap())).unwrap();
         let pidfile = std::env::var("ATELIER_TEST_PIDFILE").unwrap();
-        let mut run = Run::start(
+        let run = Run::start(
             &state,
             LockKey::branch("inner"),
             RunKind::Check,
@@ -304,7 +304,7 @@ mod mac {
         let state = State::open(&repo.checkout()).unwrap();
         let out = repo.tmp.path().join("out");
         fs::create_dir(&out).unwrap();
-        let mut run = start(&state, LockKey::branch("x")).unwrap();
+        let run = start(&state, LockKey::branch("x")).unwrap();
         let extra = [
             (PROBE.to_owned(), "env".to_owned()),
             (
@@ -385,7 +385,7 @@ mod mac {
     fn exit_codes_signals_arguments_and_output_are_exact() {
         let repo = Repo::new();
         let state = State::open(&repo.checkout()).unwrap();
-        let mut run = start(&state, LockKey::branch("x")).unwrap();
+        let run = start(&state, LockKey::branch("x")).unwrap();
         let ok = run.step("ok", &sh("exit 0"), &repo.root, &[]).unwrap();
         assert_eq!(
             (ok.status, ok.exit, ok.signal),
@@ -453,7 +453,7 @@ mod mac {
         let repo = Repo::new();
         let state = State::open(&repo.checkout()).unwrap();
         let pidfile = repo.tmp.path().join("sleeper.pid");
-        let mut run = start(&state, LockKey::branch("x")).unwrap();
+        let run = start(&state, LockKey::branch("x")).unwrap();
         let started = Instant::now();
         let step = run
             .step(
@@ -505,7 +505,7 @@ mod mac {
     fn what_ends_on_its_own_just_after_the_step_is_not_left_behind() {
         let repo = Repo::new();
         let state = State::open(&repo.checkout()).unwrap();
-        let mut run = start(&state, LockKey::branch("x")).unwrap();
+        let run = start(&state, LockKey::branch("x")).unwrap();
         // A background child that ends 600 ms after the step.
         let s = run
             .step("bg", &sh("/bin/sleep 0.6 & exit 0"), &repo.root, &[])
@@ -540,7 +540,7 @@ mod mac {
     fn a_marked_process_outside_the_jobs_is_reported_by_the_marker_scan_and_never_signalled() {
         let repo = Repo::new();
         let state = State::open(&repo.checkout()).unwrap();
-        let mut run = start(&state, LockKey::branch("x")).unwrap();
+        let run = start(&state, LockKey::branch("x")).unwrap();
         // A sleeper in its own session, outside every job's coalition, that carries this run's
         // marker: the coalition scan does not see it, the marker scan does. It is this test
         // program: macOS shows no other process the environment of Apple's own programs.
@@ -589,7 +589,7 @@ mod mac {
         let state = State::open(&repo.checkout()).unwrap();
         let pidfile = repo.tmp.path().join("sleeper.pid");
         let inner_file = repo.tmp.path().join("inner");
-        let mut run = start(&state, LockKey::Gate).unwrap();
+        let run = start(&state, LockKey::Gate).unwrap();
         let outer = run.id().to_owned();
         let step = run
             .step(
@@ -661,7 +661,7 @@ mod mac {
         let other = repo.tmp.path().join("other-state");
         let pidfile = repo.tmp.path().join("sleeper.pid");
         let inner_file = repo.tmp.path().join("inner");
-        let mut run = start(&state, LockKey::Gate).unwrap();
+        let run = start(&state, LockKey::Gate).unwrap();
         let step = run
             .step(
                 "nested",
@@ -800,7 +800,7 @@ mod mac {
         fs::write(&deny, "").unwrap();
         coalition::deny_signals_listed_in(&deny);
         let pidfile = repo.tmp.path().join("sleeper.pid");
-        let mut run = start(&state, LockKey::branch("x")).unwrap();
+        let run = start(&state, LockKey::branch("x")).unwrap();
         let t = Instant::now();
         let step = run
             .step(
@@ -865,7 +865,7 @@ mod mac {
         }
         let dir = tempfile::tempdir_in(&docs).unwrap();
         let state = State::open_at(dir.path().join("state")).unwrap();
-        let mut run = start(&state, LockKey::branch("x")).unwrap();
+        let run = start(&state, LockKey::branch("x")).unwrap();
         fs::write(dir.path().join("in.txt"), "hello\n").unwrap();
         let s = run
             .step("read", &sh("cat in.txt"), dir.path(), &[])
@@ -923,7 +923,7 @@ mod mac {
     fn a_step_in_a_missing_folder_does_not_start() {
         let repo = Repo::new();
         let state = State::open(&repo.checkout()).unwrap();
-        let mut run = start(&state, LockKey::branch("x")).unwrap();
+        let run = start(&state, LockKey::branch("x")).unwrap();
         let s = run
             .step("lost", &sh("true"), &repo.root.join("nope"), &[])
             .unwrap();
@@ -970,7 +970,7 @@ mod mac {
     fn a_trivial_step_costs_tens_of_milliseconds() {
         let repo = Repo::new();
         let state = State::open(&repo.checkout()).unwrap();
-        let mut run = start(&state, LockKey::branch("x")).unwrap();
+        let run = start(&state, LockKey::branch("x")).unwrap();
         let n = 5;
         let t = Instant::now();
         for _ in 0..n {

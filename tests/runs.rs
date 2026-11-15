@@ -62,7 +62,7 @@ fn probe_run() -> i32 {
             return e.exit.code();
         }
     };
-    let mut run = run.with_grace(Duration::from_millis(1500));
+    let run = run.with_grace(Duration::from_millis(1500));
     fs::write(run.dir().join("probe-started"), "").unwrap();
     run.step(
         "work",
@@ -82,7 +82,7 @@ fn probe_run() -> i32 {
 fn probe_nested() -> i32 {
     let state_root = PathBuf::from(std::env::var("ATELIER_TEST_STATE").unwrap());
     let state = State::open_at(state_root).unwrap();
-    let mut run = Run::start(
+    let run = Run::start(
         &state,
         LockKey::branch("inner"),
         RunKind::Gate,
@@ -118,7 +118,7 @@ fn probe_after_run() -> i32 {
     let state_root = PathBuf::from(std::env::var("ATELIER_TEST_STATE").unwrap());
     let flag = PathBuf::from(std::env::var("ATELIER_TEST_PIDFILE").unwrap());
     let state = State::open_at(state_root).unwrap();
-    let mut run = Run::start(
+    let run = Run::start(
         &state,
         LockKey::branch("after"),
         RunKind::Check,
@@ -327,7 +327,7 @@ fn a_step_runs_as_its_own_group_leader_with_the_run_marker() {
 fn a_failing_or_missing_program_fails_the_run() {
     let repo = Repo::new();
     let state = State::open(&repo.checkout()).unwrap();
-    let mut run = start_after_release(
+    let run = start_after_release(
         &state,
         LockKey::branch("x"),
         RunKind::Check,
@@ -388,7 +388,7 @@ fn a_step_that_leaves_its_group_populated_fails_and_the_group_is_stopped() {
     let repo = Repo::new();
     let state = State::open(&repo.checkout()).unwrap();
     let pidfile = repo.tmp.path().join("bg.pid");
-    let mut run = start_after_release(
+    let run = start_after_release(
         &state,
         LockKey::branch("x"),
         RunKind::Check,
@@ -443,7 +443,7 @@ fn a_member_that_ignores_term_is_killed() {
         &repo.root,
     )
     .unwrap();
-    let mut run = run.with_grace(Duration::from_millis(300));
+    let run = run.with_grace(Duration::from_millis(300));
     let started = Instant::now();
     let step = run
         .step(
@@ -473,7 +473,7 @@ fn a_survivor_that_left_its_group_makes_the_run_red_and_blocks_the_next_run() {
     let state = State::open(&repo.checkout()).unwrap();
     let pidfile = repo.tmp.path().join("sleeper.pid");
     let me = std::env::current_exe().unwrap();
-    let mut run = start_after_release(
+    let run = start_after_release(
         &state,
         LockKey::branch("x"),
         RunKind::Check,
@@ -823,7 +823,7 @@ fn run_files_name_the_kind_the_lock_key_and_where_the_run_ran() {
 fn a_step_environment_cannot_replace_the_run_markers() {
     let repo = Repo::new();
     let state = State::open(&repo.checkout()).unwrap();
-    let mut run = start_after_release(
+    let run = start_after_release(
         &state,
         LockKey::branch("x"),
         RunKind::Check,
@@ -865,7 +865,7 @@ fn a_step_environment_cannot_replace_the_run_markers() {
 fn a_program_name_starting_with_a_dash_is_refused() {
     let repo = Repo::new();
     let state = State::open(&repo.checkout()).unwrap();
-    let mut run = start_after_release(
+    let run = start_after_release(
         &state,
         LockKey::branch("x"),
         RunKind::Check,
@@ -893,7 +893,7 @@ fn an_outer_run_finds_what_a_nested_atelier_left_behind() {
     let state = State::open(&repo.checkout()).unwrap();
     let pidfile = repo.tmp.path().join("sleeper.pid");
     let inner_file = repo.tmp.path().join("inner");
-    let mut run =
+    let run =
         start_after_release(&state, LockKey::Gate, RunKind::Gate, "outer", &repo.root).unwrap();
     let outer = run.id().to_owned();
     let step = run

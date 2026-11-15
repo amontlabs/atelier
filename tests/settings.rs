@@ -95,7 +95,7 @@ fn unknown_keys_are_rejected_at_every_level() {
         ("version = \"1.30.0\"", "path = \"x\""),
         ("expect = \"v24.\"", "timeout = 3"),
         ("name = \"npm-ci\"", "when = \"always\""),
-        ("compile = true", "parallel = true"),
+        ("compile = true", "serial = true"),
         ("commit = \"Regenerate API files\"", "amend = true"),
         ("run = \"check\"", "machine = \"mac\""),
     ] {
@@ -153,5 +153,28 @@ fn rust_exclusions_need_a_reason() {
         e.message.contains("filter and reason are both required"),
         "{}",
         e.message
+    );
+}
+
+#[test]
+fn a_project_step_runs_in_parallel_unless_it_says_otherwise() {
+    let repo = silo_repo();
+    let text = SILO.replacen("compile = true", "compile = true\nparallel = false", 1);
+    repo.write(".atelier/atelier.toml", &text);
+    let s = Settings::load(&repo.root).unwrap();
+    let parallel: Vec<(&str, bool)> = s
+        .check
+        .steps
+        .iter()
+        .map(|s| (s.name.as_str(), s.parallel))
+        .collect();
+    assert_eq!(
+        parallel,
+        [
+            ("frontend", true),
+            ("typecheck", false),
+            ("scripts", true),
+            ("links", true)
+        ]
     );
 }

@@ -32,9 +32,10 @@ run = ["npm", "--prefix", "app/SiloUI", "ci"]
 name = "runtime"
 run = [".atelier/hooks/runtime.sh"]
 
-[[check.steps]]                        # after the Rust steps; each is a script CI calls too
+[[check.steps]]                        # after compile, while the tests run, one after another; each is a script CI calls too
 name = "frontend"
 run = ["app/SiloUI/scripts/ci/frontend.sh"]
+# parallel = false                     # run alone: after the tests and the steps above, the ones below after it
 [[check.steps]]
 name = "typecheck"
 run = ["npm", "--prefix", "app/SiloUI", "run", "typecheck"]

@@ -139,6 +139,16 @@ impl Fx {
     }
 
     fn run_cmd_env(&self, cmd: &mut Command, dir: &Path, env: &[(&str, &str)]) -> Output {
+        self.prepare(cmd, dir, env).output().expect("runs")
+    }
+
+    /// `cmd` in `dir` with this fixture's environment, then `env`.
+    fn prepare<'c>(
+        &self,
+        cmd: &'c mut Command,
+        dir: &Path,
+        env: &[(&str, &str)],
+    ) -> &'c mut Command {
         cmd.current_dir(dir)
             .env("PATH", self.path())
             .env("HOME", &self.repo.home)
@@ -170,7 +180,7 @@ impl Fx {
         for (k, v) in env {
             cmd.env(k, v);
         }
-        cmd.output().expect("runs")
+        cmd
     }
 
     fn check(&self, args: &[&str]) -> Output {
@@ -1157,4 +1167,240 @@ fn a_prerequisite_command_that_leaves_a_process_behind_is_refused() {
         stderr(&out)
     );
     assert!(fx.runs().is_empty());
+}
+
+// The tests and the project steps run at the same time
+
+/// A library whose one test meets the project steps through files in `$MEET_DIR`: it writes
+/// `tests-started`, then by `$MEET_MODE` waits for `project-started` (`wait`), sleeps two
+/// seconds (`slow`) or sleeps five minutes (`hang`), then writes `tests-ended`.
+const MEET_LIB: &str = "pub fn add(a: u32, b: u32) -> u32 {
+    a + b
+}
+
+#[cfg(test)]
+mod tests {
+    use std::path::PathBuf;
+    use std::time::{Duration, Instant};
+
+    fn meet() -> PathBuf {
+        PathBuf::from(std::env::var(\"MEET_DIR\").unwrap())
+    }
+
+    fn appears(name: &str) -> bool {
+        let start = Instant::now();
+        while start.elapsed() < Duration::from_secs(60) {
+            if meet().join(name).exists() {
+                return true;
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        false
+    }
+
+    #[test]
+    fn meets() {
+        std::fs::write(meet().join(\"tests-started\"), \"\").unwrap();
+        match std::env::var(\"MEET_MODE\").unwrap().as_str() {
+            \"wait\" => assert!(appears(\"project-started\")),
+            \"slow\" => std::thread::sleep(Duration::from_secs(2)),
+            _ => std::thread::sleep(Duration::from_secs(300)),
+        }
+        std::fs::write(meet().join(\"tests-ended\"), \"\").unwrap();
+    }
+}
+";
+
+/// A shell loop that waits up to a minute for `$MEET_DIR/<name>`, failing otherwise.
+fn waits_for(name: &str) -> String {
+    format!(
+        "i=0; while [ ! -f \"$MEET_DIR/{name}\" ]; do i=$((i+1)); [ $i -gt 600 ] && exit 9; sleep 0.1; done"
+    )
+}
+
+/// A fixture with [`MEET_LIB`] and `steps`, and its meeting folder.
+fn meet_fx(steps: &str) -> (Fx, PathBuf) {
+    let fx = Fx::new(steps);
+    fx.repo.write("a/src/lib.rs", MEET_LIB);
+    fx.repo.commit_all("meeting test");
+    let dir = fx.repo.tmp.path().join("meet");
+    fs::create_dir(&dir).unwrap();
+    (fx, dir)
+}
+
+fn step_status(result: &RunResult, name: &str) -> atelier::runs::StepStatus {
+    result
+        .steps
+        .iter()
+        .find(|s| s.name == name)
+        .unwrap_or_else(|| panic!("no step {name}: {:?}", result.steps))
+        .status
+}
+
+#[test]
+fn the_tests_and_a_project_step_run_at_the_same_time() {
+    // Each waits for the other to have started: run one after the other, the first times out.
+    let script = format!(
+        "touch \"$MEET_DIR/project-started\"; {}",
+        waits_for("tests-started")
+    );
+    let (fx, dir) = meet_fx(&shell_step("frontend", &script));
+    let out = fx.check_env(
+        &[],
+        &[("MEET_DIR", dir.to_str().unwrap()), ("MEET_MODE", "wait")],
+    );
+    assert_eq!(code(&out), 0, "{}\n{}", stdout(&out), stderr(&out));
+    let text = stdout(&out);
+    assert!(text.contains("  tests: ok"), "{text}");
+    assert!(text.contains("  frontend: ok"), "{text}");
+    let result = RunResult::read(&fx.last_run()).unwrap().unwrap();
+    let names: Vec<&str> = result.steps.iter().map(|s| s.name.as_str()).collect();
+    for name in ["fmt", "compile", "tests", "frontend"] {
+        assert!(names.contains(&name), "{names:?}");
+    }
+    for log in ["tests.log", "frontend.log"] {
+        assert!(fx.last_run().join(log).is_file(), "{log}");
+    }
+}
+
+#[test]
+fn a_step_that_is_not_parallel_runs_alone_after_the_tests() {
+    let before = format!(
+        "touch \"$MEET_DIR/before-started\"; {}",
+        waits_for("tests-started")
+    );
+    // Alone: the tests have ended and nothing else runs until it ends.
+    let alone = "test -f \"$MEET_DIR/tests-ended\" || exit 7; touch \"$MEET_DIR/alone-started\"; \
+                 sleep 1; touch \"$MEET_DIR/alone-ended\"";
+    let after = "test -f \"$MEET_DIR/alone-ended\" || exit 8";
+    let steps = format!(
+        "{}{}parallel = false\n{}",
+        shell_step("before", &before),
+        shell_step("alone", alone),
+        shell_step("after", after)
+    );
+    let (fx, dir) = meet_fx(&steps);
+    let out = fx.check_env(
+        &[],
+        &[("MEET_DIR", dir.to_str().unwrap()), ("MEET_MODE", "slow")],
+    );
+    assert_eq!(code(&out), 0, "{}\n{}", stdout(&out), stderr(&out));
+    let text = stdout(&out);
+    for name in ["tests", "before", "alone", "after"] {
+        assert!(text.contains(&format!("  {name}: ok")), "{text}");
+    }
+    // The steps after compile ended in this order: `before` and the tests (either first), then
+    // `alone`, then `after`.
+    let result = RunResult::read(&fx.last_run()).unwrap().unwrap();
+    let names: Vec<&str> = result.steps.iter().map(|s| s.name.as_str()).collect();
+    let tail = &names[names.len() - 2..];
+    assert_eq!(tail, ["alone", "after"], "{names:?}");
+}
+
+#[test]
+fn a_failing_project_step_does_not_stop_the_tests_but_the_check_is_red() {
+    let (fx, dir) = meet_fx(&shell_step(
+        "frontend",
+        "touch \"$MEET_DIR/project-started\"; echo broken >&2; exit 1",
+    ));
+    let out = fx.check_env(
+        &[],
+        &[("MEET_DIR", dir.to_str().unwrap()), ("MEET_MODE", "wait")],
+    );
+    assert_eq!(code(&out), 1, "{}\n{}", stdout(&out), stderr(&out));
+    let text = stdout(&out);
+    assert!(text.contains("  tests: ok"), "{text}");
+    assert!(text.contains("  frontend: FAILED"), "{text}");
+    let line = last_line(&out);
+    assert!(line.starts_with("check: RED — "), "{line}");
+    assert!(line.contains("failed: frontend;"), "{line}");
+    assert!(dir.join("tests-ended").is_file());
+    let result = RunResult::read(&fx.last_run()).unwrap().unwrap();
+    assert_eq!(
+        step_status(&result, "tests"),
+        atelier::runs::StepStatus::Passed
+    );
+    assert_eq!(
+        step_status(&result, "frontend"),
+        atelier::runs::StepStatus::Failed
+    );
+    assert_eq!(
+        result.tests,
+        Some(TestCounts {
+            passed: 1,
+            ..TestCounts::default()
+        })
+    );
+}
+
+#[test]
+fn a_stop_signal_ends_the_tests_and_the_project_step_together() {
+    use std::time::{Duration, Instant};
+    let script = "touch \"$MEET_DIR/project-started\"; sleep 300";
+    let (fx, dir) = meet_fx(&format!(
+        "{}{}",
+        shell_step("frontend", script),
+        shell_step("later", "touch \"$MEET_DIR/later-ran\"")
+    ));
+    let mut cmd = Command::new(atelier_bin());
+    cmd.arg("check")
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped());
+    fx.prepare(
+        &mut cmd,
+        &fx.repo.root,
+        &[("MEET_DIR", dir.to_str().unwrap()), ("MEET_MODE", "hang")],
+    );
+    let mut child = cmd.spawn().unwrap();
+    let deadline = Instant::now() + Duration::from_secs(300);
+    while !(dir.join("tests-started").exists() && dir.join("project-started").exists()) {
+        if Instant::now() > deadline || child.try_wait().unwrap().is_some() {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    let both = dir.join("tests-started").exists() && dir.join("project-started").exists();
+    // SAFETY: our own child's pid.
+    unsafe { libc::kill(child.id() as i32, libc::SIGTERM) };
+    let stopped = Instant::now();
+    let mut status = None;
+    while stopped.elapsed() < Duration::from_secs(60) {
+        status = child.try_wait().unwrap();
+        if status.is_some() {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    if status.is_none() {
+        let _ = child.kill();
+        let _ = child.wait();
+        panic!("atelier check did not end within a minute of SIGTERM");
+    }
+    let out = child.wait_with_output().unwrap();
+    assert!(both, "{}\n{}", stdout(&out), stderr(&out));
+    assert_eq!(code(&out), 1, "{}\n{}", stdout(&out), stderr(&out));
+    assert!(
+        last_line(&out).starts_with("check: INTERRUPTED — "),
+        "{}",
+        stdout(&out)
+    );
+    let result = RunResult::read(&fx.last_run()).unwrap().unwrap();
+    assert_eq!(result.outcome, atelier::runs::Outcome::Interrupted);
+    assert_eq!(result.signal.as_deref(), Some("SIGTERM"));
+    assert_eq!(
+        step_status(&result, "tests"),
+        atelier::runs::StepStatus::Interrupted
+    );
+    assert_eq!(
+        step_status(&result, "frontend"),
+        atelier::runs::StepStatus::Interrupted
+    );
+    assert!(result.survivors.is_empty(), "{:?}", result.survivors);
+    assert!(!dir.join("tests-ended").exists());
+    assert!(!dir.join("later-ran").exists());
+    assert!(
+        !result.steps.iter().any(|s| s.name == "later"),
+        "{:?}",
+        result.steps
+    );
 }

@@ -114,7 +114,7 @@ Shared holders change only their own lines. When nothing lives, the record is re
 | `survivors` | array of strings | processes left at the end: marked ones (never signalled), macOS coalition members (stopped) |
 | `test_results` | string, optional | per-test results file, relative to the run folder |
 | `tests` | table, optional | `passed`, `failed`, `flaky`, `skipped`, `excluded` |
-| `steps` | array of tables | `name`, `status` (`passed`, `failed`, `left-processes`, `interrupted`, `not-started`), `exit`, `signal`, `log`, `left`, `unstoppable` (`<pid> <program>`, or `cannot stop <pid> (owned by <user>)`) |
+| `steps` | array of tables | in the order steps ended (tests and project steps run at once): `name`, `status` (`passed`, `failed`, `left-processes`, `interrupted`, `not-started`), `exit`, `signal`, `log`, `left`, `unstoppable` (`<pid> <program>`, or `cannot stop <pid> (owned by <user>)`) |
 
 ## Branch records
 
