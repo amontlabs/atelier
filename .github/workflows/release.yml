@@ -1,0 +1,59 @@
+name: Release
+
+# Pushing a tag vX.Y.Z publishes a GitHub Release with a built binary per platform and its SHA-256, then tells
+# amontlabs.com to refresh. The tag must match the version in Cargo.toml.
+on:
+  push:
+    tags: ["v[0-9]+.[0-9]+.[0-9]+"]
+
+permissions:
+  contents: write
+
+jobs:
+  create:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Tag matches Cargo.toml
+        run: |
+          want="v$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)"
+          if [ "$want" != "$GITHUB_REF_NAME" ]; then echo "::error::tag $GITHUB_REF_NAME, Cargo.toml says $want"; exit 1; fi
+      - name: Create the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release create "$GITHUB_REF_NAME" --verify-tag --generate-notes --title "$GITHUB_REF_NAME"
+
+  binaries:
+    needs: create
+    strategy:
+      matrix:
+        include:
+          - target: aarch64-apple-darwin
+            os: macos-latest
+          - target: x86_64-unknown-linux-gnu
+            os: ubuntu-latest
+          - target: aarch64-unknown-linux-gnu
+            os: ubuntu-24.04-arm
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: taiki-e/upload-rust-binary-action@v1
+        with:
+          bin: atelier
+          target: ${{ matrix.target }}
+          archive: atelier-$target
+          checksum: sha256
+          locked: true
+          token: ${{ github.token }}
+
+  notify-site:
+    needs: binaries
+    runs-on: ubuntu-latest
+    permissions: {}
+    steps:
+      - name: Refresh amontlabs.com
+        env:
+          GH_TOKEN: ${{ secrets.SITE_DISPATCH_TOKEN }}
+        run: |
+          if [ -z "$GH_TOKEN" ]; then echo "::warning::No SITE_DISPATCH_TOKEN; amontlabs.com refreshes on its schedule"; exit 0; fi
+          gh api repos/amontlabs/amontlabs.com/dispatches -f event_type=release
