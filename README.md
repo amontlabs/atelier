@@ -13,7 +13,7 @@ atelier is a command-line tool the agents run themselves. An *orchestrator* plan
 
 `main` moves only to a tree that passed, and only with the exact commits that were reviewed. A platform with no machine fails; nothing is skipped or cached.
 
-> **Status: early (0.2.2).** Used on one real project. macOS and Linux only.
+> **Status: early (0.2.3).** Used on one real project. macOS and Linux only.
 
 ## Rules that ship with it
 
@@ -26,7 +26,7 @@ atelier is a command-line tool the agents run themselves. An *orchestrator* plan
 Download the binary for your machine from [Releases](https://github.com/amontlabs/atelier/releases) (macOS arm64, Linux x86_64 and arm64):
 
 ```sh
-v=0.2.2 t=aarch64-apple-darwin   # or x86_64-unknown-linux-gnu, aarch64-unknown-linux-gnu
+v=0.2.3 t=aarch64-apple-darwin   # or x86_64-unknown-linux-gnu, aarch64-unknown-linux-gnu
 mkdir -p ~/.local/share/atelier/$v/bin
 curl -fsSL https://github.com/amontlabs/atelier/releases/download/v$v/atelier-$t.tar.gz | tar -xz -C ~/.local/share/atelier/$v/bin
 # The dispatcher, once.
@@ -36,7 +36,7 @@ mkdir -p ~/.local/bin && cp ~/.local/share/atelier/$v/bin/atelier ~/.local/bin/a
 Or build it from source with git and Rust 1.100.0 (via rustup):
 
 ```sh
-cargo +1.100.0 install --git https://github.com/amontlabs/atelier --tag v0.2.2 --locked --root ~/.local/share/atelier/0.2.2
+cargo +1.100.0 install --git https://github.com/amontlabs/atelier --tag v0.2.3 --locked --root ~/.local/share/atelier/0.2.3
 ```
 
 Versions sit side by side. `~/.local/bin` must be on `PATH` for you and your agents. The `atelier` on `PATH` reads the `atelier = "<version>"` pin from `.atelier/atelier.toml` and runs `~/.local/share/atelier/<version>/bin/atelier`. A missing version exits 4 with the install command; nothing installs itself.
@@ -44,7 +44,7 @@ Versions sit side by side. `~/.local/bin` must be on `PATH` for you and your age
 ## Quickstart
 
 ```sh
-cd shop && atelier init --version 0.2.2
+cd shop && atelier init --version 0.2.3
 ```
 
 This writes `.atelier/`, the generated rules (`AGENTS.md`, `CLAUDE.md`, `.atelier/rules/`) and the stop hook (`.claude/settings.json`, `.codex/hooks.json`). In Codex, run `/hooks` once to trust the hook.
@@ -52,7 +52,7 @@ This writes `.atelier/`, the generated rules (`AGENTS.md`, `CLAUDE.md`, `.atelie
 Say what your check is in `.atelier/atelier.toml`:
 
 ```toml
-atelier = "0.2.2"
+atelier = "0.2.3"
 integration_branch = "main"
 workspaces = ["."]            # Cargo workspaces: fmt, compile, nextest
 min_free_gb = 20              # start, check, test and merge refuse below this much free disk; 0 disables
