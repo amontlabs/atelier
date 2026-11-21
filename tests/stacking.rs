@@ -9,7 +9,9 @@ use std::path::{Path, PathBuf};
 use std::process::Output;
 
 use atelier::git::Checkout;
-use atelier::records::{BranchRecord, BranchState};
+use std::os::unix::fs::MetadataExt;
+
+use atelier::records::{BranchRecord, BranchState, Throwaway};
 use atelier::stack::{Behind, Currency, Stack, Why};
 use atelier::state::State;
 use common::*;
@@ -294,6 +296,60 @@ fn start_inside_a_fresh_detached_worktree() {
     let out = p.run(&wt2, &["start", "child", "--on", "feat"]);
     assert_eq!(code(&out), 0, "{}", stderr(&out));
     assert_eq!(p.record("child").lower, "feat");
+}
+
+#[test]
+fn start_throwaway_records_the_worktree_it_checks_the_branch_out_in() {
+    let p = Proj::new();
+    // In a new worktree.
+    let wt = p.wt("try");
+    let out = p.run(
+        p.main(),
+        &[
+            "start",
+            "try",
+            "--throwaway",
+            "--path",
+            wt.to_str().unwrap(),
+        ],
+    );
+    assert_eq!(code(&out), 0, "{}", stderr(&out));
+    assert!(
+        stdout(&out).contains("throwaway: try is never merged"),
+        "{}",
+        stdout(&out)
+    );
+    let rec = p.record("try");
+    // Still `active` for every version: the throwaway is a table older versions keep unread.
+    assert_eq!(rec.state, BranchState::Active);
+    assert!(rec.starting.is_none());
+    let t = Throwaway::read(&rec).unwrap().expect("a throwaway");
+    let canonical = fs::canonicalize(&wt).unwrap();
+    assert_eq!(t.worktree, canonical);
+    let meta = fs::metadata(&wt).unwrap();
+    assert_eq!((t.dev, t.ino), (Some(meta.dev()), Some(meta.ino())));
+    let text = fs::read_to_string(p.main().join(".git/atelier/branches/try.toml")).unwrap();
+    assert!(text.contains("state = \"active\""), "{text}");
+    assert!(text.contains("[throwaway]"), "{text}");
+
+    // In the fresh detached worktree it runs in.
+    let here = p.base.join("t3-try");
+    git(
+        p.main(),
+        &["worktree", "add", "-q", "--detach", here.to_str().unwrap()],
+    );
+    let out = p.run(&here, &["start", "try2", "--throwaway"]);
+    assert_eq!(code(&out), 0, "{}", stderr(&out));
+    let t = Throwaway::read(&p.record("try2")).unwrap().unwrap();
+    assert_eq!(t.worktree, fs::canonicalize(&here).unwrap());
+    assert!(t.dev.is_some() && t.ino.is_some());
+
+    // An ordinary start is no throwaway.
+    p.start("plain", None);
+    assert!(!Throwaway::marks(&p.record("plain")));
+    // --abandon takes no --throwaway.
+    let out = p.run(p.main(), &["start", "x", "--abandon", "--throwaway"]);
+    assert_eq!(code(&out), 2, "{}", stderr(&out));
 }
 
 // ---------------------------------------------------------------------------------------------

@@ -37,9 +37,22 @@ pub fn resolve_commit(dir: &Path, arg: &str) -> Result<String> {
     Ok(String::from_utf8_lossy(&out.stdout).trim().to_owned())
 }
 
-/// Refuses (4) a branch that has a merge commit of its own or is not current.
+/// Refuses (4) a branch started as a throwaway: its work is never merged.
+pub fn refuse_throwaway(rec: &crate::records::BranchRecord) -> Result<()> {
+    if crate::records::Throwaway::marks(rec) {
+        return Err(Failure::refused(format!(
+            "{b} was started as a throwaway (atelier start --throwaway): it is never approved or merged; atelier clean {b} --yes deletes it",
+            b = rec.name
+        )));
+    }
+    Ok(())
+}
+
+/// Refuses (4) a throwaway, a branch that has a merge commit of its own, or one that is not
+/// current.
 pub fn require_mergeable(stack: &Stack, dir: &Path, branch: &str) -> Result<()> {
     let (rec, tip) = stack.started(branch)?;
+    refuse_throwaway(&rec)?;
     let merges = stack.own_merges(&rec, &tip)?;
     if !merges.is_empty() {
         return Err(Failure::refused(format!(
@@ -61,6 +74,7 @@ pub fn run(ctx: &Context, branch: &str, commit: &str) -> Result<Exit> {
     let _lock = HeldLock::acquire(&ctx.state, LockKey::branch(branch))?;
     let stack = Stack::new(&ctx.checkout, &ctx.state, &ctx.settings.integration_branch);
     let (rec, tip) = stack.prepare(branch)?;
+    refuse_throwaway(&rec)?;
     let wanted = resolve_commit(root, commit)?;
     if wanted != tip {
         return Err(Failure::refused(format!(

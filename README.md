@@ -109,7 +109,7 @@ A branch is merged only when `merged <branch> <commit>` is printed. On any probl
 | `rules` | owner | Regenerates the rules after a settings or `.atelier/project/` edit |
 | `status [--json]` | anyone | Read-only overview ([STATUS.md](docs/STATUS.md)) |
 | `agents` | orchestrator | Lists your roles |
-| `start <branch> [--on <lower>] [--path <worktree>]` | orchestrator | Creates a branch and worktree |
+| `start <branch> [--on <lower>] [--path <worktree>] [--throwaway]` | orchestrator | Creates a branch and worktree. A throwaway is never approved or merged |
 | `task <role> <branch>\|- [field=value…] [--fixes]` | orchestrator | Writes a task file, prints the agent's prompt |
 | `follow` | worker | Rebases the branch onto what it builds on |
 | `check [--compile-only]` | worker, gate | Prerequisites, format, compile, tests (no retry), your steps |
@@ -118,7 +118,7 @@ A branch is merged only when `merged <branch> <commit>` is printed. On any probl
 | `approve <branch> <commit>` | orchestrator | Marks this exact commit reviewed |
 | `merge <branch>… [--waive <platform> --reason "<words>"]` | orchestrator | Merges, checks every platform, moves `main` if green |
 | `promote [--discard]` | orchestrator | Finishes a green merge that found the main checkout busy |
-| `clean [<branch>…] [--yes] [--discard <commit>…]` | orchestrator | Removes merged branches, worktrees and temp folders |
+| `clean [<branch>…] [--yes] [--discard <commit>…]` | orchestrator | Removes merged branches, worktrees and temp folders, and a throwaway named here; forgets records whose branch was deleted by hand |
 | `machines [init <name> [--yes]]` | owner | Lists machines; sets one up over ssh |
 | `hook stop` | harness | Stop hook: sends a worker back while work is unfinished |
 

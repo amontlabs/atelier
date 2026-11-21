@@ -858,6 +858,9 @@ fn preconditions(
     let root = &ctx.checkout.root;
     let mut items: Vec<Item> = Vec::new();
     for b in branches {
+        if let Some(rec) = stack.record(b)? {
+            crate::approve::refuse_throwaway(&rec)?;
+        }
         let approval = Approval::read(v, b)?.ok_or_else(|| {
             Failure::refused(format!(
                 "{b} is not approved: atelier approve {b} <the reviewed commit>"

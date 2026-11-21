@@ -17,8 +17,10 @@ Each section shows at most 10 entries, newest first, then `... N more not shown`
 | `last runs` | id, kind, outcome, branch, platform, machine, tree. No result: `RUNNING` or `NO RESULT (killed)`. Bad result: `<id> unreadable: ...`. Workers' `check` and `test` runs appear only here |
 | `platforms` | per platform, the last gate that ran it: `PASS` with the machine, `WAIVED` with the reason, or `FAIL`; then `last passed: ...` if that was not a pass; else `no gate has run it` |
 | `machines` | the `atelier machines` table |
-| `must follow` | active branches that are not current, a follow that cannot be settled, an unfinished start, an unreadable record |
-| `worktrees with no merge record` | linked worktrees (`active`, `no record`, `detached`) that `clean` will never touch |
+| `must follow` | active branches that are not current, a follow that cannot be settled, an unfinished start, an unreadable record; not throwaways, nor records whose branch is gone |
+| `worktrees with no merge record` | linked worktrees (`active`, `no record`, `detached`) that `clean` will never touch; not a throwaway's |
+| `throwaway branches` | each throwaway: its tip and the worktree its start recorded, which `atelier clean <branch> --yes` deletes |
+| `records whose branch is gone` | active records whose branch was deleted by hand, which `atelier clean --yes` forgets |
 | `flaky tests` | see below |
 | `conflict forecast` | see below |
 

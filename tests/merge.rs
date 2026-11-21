@@ -408,6 +408,55 @@ fn a_branch_with_a_merge_commit_of_its_own_is_refused() {
     );
 }
 
+#[test]
+fn approve_and_merge_refuse_a_throwaway_and_say_why() {
+    let p = Proj::new();
+    let wt = p.wt("try");
+    let out = p.run(&[
+        "start",
+        "try",
+        "--throwaway",
+        "--path",
+        wt.to_str().unwrap(),
+    ]);
+    assert_eq!(code(&out), 0, "{}", both(&out));
+    let tip = commit(&wt, "t.txt", "t\n", "t");
+    let old = p.main_tip();
+
+    let out = p.run(&["approve", "try", &tip]);
+    assert_eq!(code(&out), 4, "{}", both(&out));
+    assert!(
+        stderr(&out).contains("try was started as a throwaway"),
+        "{}",
+        stderr(&out)
+    );
+    assert!(p.approval("try").is_none());
+    let out = p.merge(&["try"]);
+    assert_eq!(code(&out), 4, "{}", both(&out));
+    assert!(
+        stderr(&out).contains("try was started as a throwaway"),
+        "{}",
+        stderr(&out)
+    );
+
+    // Approved before it was marked (as an older atelier, which knows no throwaway, would
+    // approve it): merge still refuses it, and nothing moves.
+    let c = p.ready("late", "l.txt", "l\n");
+    let mut rec = p.record("late");
+    atelier::records::Throwaway::mark(&mut rec, &p.wt("late")).unwrap();
+    rec.write(&p.state()).unwrap();
+    let out = p.merge(&["late"]);
+    assert_eq!(code(&out), 4, "{}", both(&out));
+    assert!(
+        stderr(&out).contains("late was started as a throwaway"),
+        "{}",
+        stderr(&out)
+    );
+    assert_eq!(p.main_tip(), old);
+    assert!(!p.gate().exists(), "nothing was started");
+    assert_eq!(p.approval("late").unwrap().commit, c);
+}
+
 // ---------------------------------------------------------------------------------------------
 // merge: refusals before the gate (failure table)
 

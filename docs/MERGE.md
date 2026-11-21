@@ -2,7 +2,7 @@
 
 ## approve
 
-`atelier approve <branch> <commit>`, under the branch's lock. Refused (4) unless `<commit>` is the branch's tip, the branch has no merge commit of its own, it is current (not behind a rewrite of what it builds on, transitively), and it is checked out in exactly one worktree that is neither the main checkout nor the gate.
+`atelier approve <branch> <commit>`, under the branch's lock. A throwaway (`start --throwaway`) is refused (4): it is never approved or merged. Otherwise refused (4) unless `<commit>` is the branch's tip, the branch has no merge commit of its own, it is current (not behind a rewrite of what it builds on, transitively), and it is checked out in exactly one worktree that is neither the main checkout nor the gate.
 
 ## merge
 
@@ -10,7 +10,7 @@
 
 1. **Checks** (refused before anything merges):
    - A pending promotion is settled first (see promote).
-   - Each branch: approved, still at the approved commit, same lifetime, current, no merge commit of its own, no rebase open. A stacked branch's lower branch must be earlier in the batch, approved at a commit containing the upper's base.
+   - Each branch: not a throwaway, approved, still at the approved commit, same lifetime, current, no merge commit of its own, no rebase open. A stacked branch's lower branch must be earlier in the batch, approved at a commit containing the upper's base.
    - A *rules item* (own commits touch `.atelier/`, `AGENTS.md` or an import file) merges alone. Its committed settings are the batch's; otherwise the integration branch's.
    - Every platform has a machine or a waiver (else exit 3). A waiver names a platform of the old or the merged settings. This computer runs a `run = "check"` platform only with the pinned atelier installed (else 4, naming the install command).
    - A forecast of each batch branch against `main` and every open branch prints `warning: forecast: <branch> x <branch>: <files>` (or `would be refused: …`). It refuses nothing.

@@ -130,6 +130,7 @@ Shared holders change only their own lines. When nothing lives, the record is re
 | `pending` | table, optional | an unsettled `follow`: `target`, `old_base` (full commit ids) |
 | `merged` | table, optional | the merge facts below; removed at `cleaned` |
 | `starting` | table, optional | an unfinished `start`: `worktree` (absolute UTF-8 path) and `new_worktree` (boolean: `start` created it, or switched the detached worktree it ran in) |
+| `throwaway` | table, optional | the branch was started with `--throwaway` ([below](#throwaways)); since 0.2.3 |
 
 A writer holds the branch lock. Commit ids are checked on read and write.
 
@@ -146,6 +147,19 @@ A writer holds the branch lock. Commit ids are checked on read and write.
 - **`follow`** writes `pending` before its rebase and settles it from ancestry. The rebase's process group is recorded under the branch lock. Any open rebase of the branch makes every reader refuse.
 - **A base the branch no longer contains** is refused (4) until the worker restores the branch. Once the lower branch is merged, `follow` sets `lower` to the integration branch.
 - A record is removed only when `cleaned` and no `active` record names it as its lower.
+
+## Throwaways
+
+The `throwaway` table. `start --throwaway` writes it with the record and keeps `state = "active"`, so a version that does not know it reads the record as an ordinary active branch. `approve` and `merge` refuse such a branch (from 0.2.3; an older version approves and merges it). `clean` removes the table with `cleaned` once the branch is deleted.
+
+| Field | Type | Meaning |
+|---|---|---|
+| `worktree` | string | the one worktree `clean` may delete: absolute, UTF-8; canonical once `dev` and `ino` are set |
+| `dev`, `ino` | integers, optional | that folder's identity, written when the start finishes |
+
+`clean` deletes a throwaway only when it is named, and the worktree only if it is still that folder with the branch checked out; the branch is deleted at its tip as read at the plan.
+
+**A record whose branch is gone.** An `active` record whose start finished and whose branch ref no longer exists (deleted with plain git). `clean` forgets it, with its temp folders, unless the branch is still checked out somewhere, a rebase or bisect of it is open, or an `active` record names it as its lower. It writes `cleaned` first, then removes the record.
 
 ## Merge facts
 

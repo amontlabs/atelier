@@ -208,6 +208,106 @@ impl MergeFacts {
     }
 }
 
+/// What makes a branch a throwaway: work that is never merged and that `clean` deletes when it
+/// is named. It is the `throwaway` table of the branch's record (`docs/FROZEN-LAYER.md`), kept
+/// among the fields other versions do not know, so the record stays `active` for every version:
+/// `start --throwaway` writes it with the worktree the branch is checked out in, and fills the
+/// folder's identity once that worktree exists. It names the one worktree `clean` may delete
+/// for the branch, as [`MergeFacts`] does for a merged one.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct Throwaway {
+    /// The worktree `start` checked the branch out in: absolute, UTF-8; canonical once `dev`
+    /// and `ino` are set.
+    pub worktree: PathBuf,
+    /// That folder's identity, absent until the start finished.
+    pub dev: Option<u64>,
+    pub ino: Option<u64>,
+    /// Fields written by a later version, kept as they are.
+    #[serde(flatten)]
+    pub later: toml::Table,
+}
+
+impl Throwaway {
+    /// The record's key for these facts.
+    const KEY: &'static str = "throwaway";
+
+    /// True when the record was started as a throwaway, whether or not its table can be read.
+    pub fn marks(rec: &BranchRecord) -> bool {
+        rec.later.contains_key(Self::KEY)
+    }
+
+    /// The facts a record holds. `None` when it is not a throwaway; refuses (4) a table this
+    /// version cannot read.
+    pub fn read(rec: &BranchRecord) -> Result<Option<Throwaway>> {
+        let Some(v) = rec.later.get(Self::KEY) else {
+            return Ok(None);
+        };
+        let t: Throwaway = v.clone().try_into().map_err(|e: toml::de::Error| {
+            Failure::refused(format!("{}: throwaway: {}", rec.name, e.to_string().trim()))
+        })?;
+        if !t.worktree.is_absolute() || t.worktree.to_str().is_none() {
+            return Err(Failure::refused(format!(
+                "{}: throwaway.worktree must be an absolute UTF-8 path",
+                rec.name
+            )));
+        }
+        Ok(Some(t))
+    }
+
+    /// Marks `rec` a throwaway checked out in `worktree`, identity not yet known.
+    pub fn mark(rec: &mut BranchRecord, worktree: &Path) -> Result<()> {
+        Throwaway {
+            worktree: worktree.to_path_buf(),
+            dev: None,
+            ino: None,
+            later: toml::Table::new(),
+        }
+        .put(rec)
+    }
+
+    /// Records the identity of the existing folder `worktree` in a throwaway record, under its
+    /// canonical path. Does nothing to a record that is not a throwaway.
+    pub fn identify(rec: &mut BranchRecord, worktree: &Path) -> Result<()> {
+        let Some(mut t) = Throwaway::read(rec)? else {
+            return Ok(());
+        };
+        let entry = TmpEntry::of(worktree)?;
+        t.worktree = entry.path;
+        t.dev = Some(entry.dev);
+        t.ino = Some(entry.ino);
+        t.put(rec)
+    }
+
+    /// The facts `clean` deletes by: the branch's tip now and the recorded worktree. `None`
+    /// until the folder's identity is recorded.
+    pub fn facts(&self, tip: &str) -> Option<MergeFacts> {
+        Some(MergeFacts {
+            commit: tip.to_owned(),
+            worktree: self.worktree.clone(),
+            dev: self.dev?,
+            ino: self.ino?,
+            later: toml::Table::new(),
+        })
+    }
+
+    fn put(&self, rec: &mut BranchRecord) -> Result<()> {
+        let table = toml::Table::try_from(self).map_err(|e| Failure::refused(e.to_string()))?;
+        rec.later
+            .insert(Self::KEY.to_owned(), toml::Value::Table(table));
+        Ok(())
+    }
+
+    /// The write `clean` makes when everything of a throwaway, or of a record whose branch is
+    /// gone, is deleted: state `cleaned`, the throwaway table removed (it grants nothing more).
+    /// The caller holds the branch's lock.
+    pub fn retire(state: &State, branch: &str, lifetime: &str) -> Result<()> {
+        let mut rec = of_lifetime(state, branch, lifetime)?;
+        rec.later.remove(Self::KEY);
+        rec.state = BranchState::Cleaned;
+        rec.write(state)
+    }
+}
+
 fn of_lifetime(state: &State, branch: &str, lifetime: &str) -> Result<BranchRecord> {
     BranchRecord::read(state, branch)?
         .filter(|r| r.lifetime == lifetime)

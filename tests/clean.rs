@@ -12,7 +12,7 @@ use std::time::{Duration, Instant};
 
 use atelier::git::Checkout;
 use atelier::locks::{HeldLock, LockKey};
-use atelier::records::{BranchRecord, BranchState, MergeFacts, TmpEntry};
+use atelier::records::{BranchRecord, BranchState, MergeFacts, Throwaway, TmpEntry};
 use atelier::state::State;
 use common::*;
 
@@ -1683,4 +1683,175 @@ fn the_temp_root_is_per_user_and_private() {
     assert_eq!(code(&out), 0, "{}", all_out(&out));
     assert!(!entry.path.exists());
     let _ = fs::remove_dir(entry.path.parent().unwrap().parent().unwrap());
+}
+
+// ---------------------------------------------------------------------------------------------
+// clean: throwaways and records whose branch is gone
+
+impl Proj {
+    /// `atelier start <branch> --throwaway --path <its worktree>`, with one commit of work.
+    fn start_throwaway(&self, branch: &str) -> (PathBuf, String) {
+        let wt = self.wt(branch);
+        let out = self.run(
+            self.main(),
+            &[
+                "start",
+                branch,
+                "--throwaway",
+                "--path",
+                wt.to_str().unwrap(),
+            ],
+        );
+        assert_eq!(code(&out), 0, "start {branch}: {}", stderr(&out));
+        let c = commit(&wt, "try.txt", "try\n", "try");
+        (wt, c)
+    }
+}
+
+#[test]
+fn a_named_throwaway_is_planned_then_deleted_with_its_worktree_and_record() {
+    let p = Proj::new();
+    let (wt, tip) = p.start_throwaway("trial/x");
+    let out = p.tmp(&wt, false, "touch \"$ATELIER_TMP/f\"");
+    assert_eq!(code(&out), 0, "{}", stderr(&out));
+    let folders = p.folders("trial/x");
+    assert_eq!(folders.len(), 1);
+
+    let out = p.clean(&["trial/x"]);
+    assert_eq!(code(&out), 0, "{}", all_out(&out));
+    let text = stdout(&out);
+    assert!(text.contains("would remove worktree"), "{text}");
+    assert!(
+        text.contains(&format!(
+            "would delete branch trial/x at {} (a throwaway, never merged: the 1 commit(s) only it holds go with it)",
+            &tip[..12]
+        )),
+        "{text}"
+    );
+    assert!(
+        text.contains("would forget the record of throwaway trial/x"),
+        "{text}"
+    );
+    assert!(wt.is_dir() && p.branch_exists("trial/x"));
+
+    let out = p.clean(&["trial/x", "--yes"]);
+    assert_eq!(code(&out), 0, "{}", all_out(&out));
+    assert!(!wt.exists());
+    assert!(!p.branch_exists("trial/x"));
+    assert!(!folders[0].path.exists());
+    assert!(p.record("trial/x").is_none(), "record forgotten");
+    // Nothing of main moved: the throwaway's commit was never merged.
+    assert!(!p.main().join("try.txt").exists());
+}
+
+#[test]
+fn an_unnamed_clean_lists_a_throwaway_and_never_deletes_it() {
+    let p = Proj::new();
+    let (wt, tip) = p.start_throwaway("try");
+    let out = p.clean(&["--yes"]);
+    assert_eq!(code(&out), 0, "{}", all_out(&out));
+    let text = stdout(&out);
+    assert!(
+        text.contains("try\n  throwaway: deleted only when named"),
+        "{text}"
+    );
+    assert!(wt.is_dir());
+    assert_eq!(git(p.main(), &["rev-parse", "try"]), tip);
+    assert!(Throwaway::marks(&p.record("try").unwrap()));
+}
+
+#[test]
+fn an_ordinary_unmerged_branch_is_still_refused_beside_a_throwaway() {
+    let p = Proj::new();
+    let active = p.start("active", None);
+    p.start_throwaway("try");
+    // Named together: the throwaway goes, the ordinary branch is refused as before.
+    let out = p.clean(&["active", "try", "--yes"]);
+    refused(
+        &out,
+        "active is not merged (no merge record): it is not touched",
+    );
+    assert!(active.is_dir());
+    assert!(p.branch_exists("active"));
+    assert_eq!(p.record("active").unwrap().state, BranchState::Active);
+    assert!(!p.branch_exists("try"));
+    // Not listed when nothing is named.
+    let out = p.clean(&[]);
+    assert_eq!(code(&out), 0, "{}", all_out(&out));
+    assert!(!stdout(&out).contains("active"), "{}", stdout(&out));
+}
+
+#[test]
+fn a_throwaway_keeps_the_checks_of_a_merged_branch() {
+    let p = Proj::new();
+    let (wt, _) = p.start_throwaway("try");
+    // Uncommitted work stops it.
+    fs::write(wt.join("notes.txt"), "x").unwrap();
+    refused(
+        &p.clean(&["try", "--yes"]),
+        "uncommitted or untracked files",
+    );
+    fs::remove_file(wt.join("notes.txt")).unwrap();
+    // A worktree that is not the recorded one is left alone, and the branch checked out there
+    // is kept.
+    let other = p.base.join("elsewhere");
+    git(&wt, &["switch", "-q", "--detach"]);
+    git(
+        p.main(),
+        &["worktree", "add", "-q", other.to_str().unwrap(), "try"],
+    );
+    refused(&p.clean(&["try", "--yes"]), "try is checked out in");
+    assert!(other.is_dir() && wt.is_dir() && p.branch_exists("try"));
+    // Another active branch built on it keeps it.
+    git(p.main(), &["worktree", "remove", other.to_str().unwrap()]);
+    git(&wt, &["switch", "-q", "try"]);
+    p.start("child", Some("try"));
+    refused(&p.clean(&["try", "--yes"]), "child is built on try");
+    assert!(wt.is_dir() && p.branch_exists("try"));
+}
+
+#[test]
+fn a_record_whose_branch_was_deleted_by_hand_is_listed_and_forgotten() {
+    let p = Proj::new();
+    // As the three trial records were left: started, then worktree and branch deleted with git.
+    for b in ["trial/a", "trial/b"] {
+        let wt = p.start(b, None);
+        git(
+            p.main(),
+            &["worktree", "remove", "--force", wt.to_str().unwrap()],
+        );
+        git(p.main(), &["branch", "-D", b]);
+    }
+    let kept = p.start("kept", None);
+    let text = fs::read_to_string(p.main().join(".git/atelier/branches/trial%2Fa.toml")).unwrap();
+    assert!(text.contains("state = \"active\""), "{text}");
+
+    let out = p.clean(&[]);
+    assert_eq!(code(&out), 0, "{}", all_out(&out));
+    let text = stdout(&out);
+    for b in ["trial/a", "trial/b"] {
+        assert!(
+            text.contains(&format!(
+                "{b}\n  would forget the record of {b}: its branch is gone"
+            )),
+            "{text}"
+        );
+        assert!(p.record(b).is_some());
+    }
+    let out = p.clean(&["--yes"]);
+    assert_eq!(code(&out), 0, "{}", all_out(&out));
+    assert!(p.record("trial/a").is_none() && p.record("trial/b").is_none());
+    assert!(kept.is_dir() && p.branch_exists("kept"));
+    assert_eq!(p.record("kept").unwrap().state, BranchState::Active);
+
+    // Named, the same; one that another active branch is built on is kept.
+    let low = p.start("low", None);
+    p.start("high", Some("low"));
+    git(
+        p.main(),
+        &["worktree", "remove", "--force", low.to_str().unwrap()],
+    );
+    git(p.main(), &["branch", "-D", "low"]);
+    refused(&p.clean(&["low", "--yes"]), "high is built on low");
+    assert!(p.record("low").is_some());
 }

@@ -62,8 +62,11 @@ pub enum Cmd {
         #[arg(long, value_name = "WORKTREE")]
         path: Option<PathBuf>,
         /// Only undo an earlier start of this branch that did not finish.
-        #[arg(long, conflicts_with_all = ["on", "path"])]
+        #[arg(long, conflicts_with_all = ["on", "path", "throwaway"])]
         abandon: bool,
+        /// Work that is never merged: approve and merge refuse it, clean deletes it when named.
+        #[arg(long)]
+        throwaway: bool,
     },
     /// Rebase this branch's own commits onto what it is built on.
     Follow,
@@ -408,9 +411,18 @@ pub fn run(cmd: Cmd, cwd: &Path) -> Result<Exit> {
             on,
             path,
             abandon,
+            throwaway,
         } => {
             let ctx = preflight::run(cwd, cmd.name(), cmd.needs())?;
-            return crate::start::run(&ctx, cwd, branch, on.as_deref(), path.as_deref(), *abandon);
+            return crate::start::run(
+                &ctx,
+                cwd,
+                branch,
+                on.as_deref(),
+                path.as_deref(),
+                *abandon,
+                *throwaway,
+            );
         }
         Cmd::Follow => {
             let ctx = preflight::run(cwd, cmd.name(), cmd.needs())?;

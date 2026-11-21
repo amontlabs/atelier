@@ -17,6 +17,9 @@ How the commands work and where they live in `src/`. Every command runs its pref
 - **`machines`, `test`.** See [MACHINES.md](MACHINES.md).
 - **`tmp`.** Runs a command with a registered temp folder in `ATELIER_TMP`, holding the branch lock shared until it ends.
 - **`clean`.** Prints a plan; `--yes` deletes, in order, the registered temp folders, the worktree `approve` recorded, the branch, and its mbx build, re-checking each at deletion. It refuses, changing nothing, when a mount, a nested repository or a hidden local edit is inside, or when the branch's reflog holds work nothing else has.
+  - A throwaway (`start --throwaway`) goes the same way, only when named: the worktree its start recorded, and the branch at its tip; the plan counts the commits only it holds. Unnamed, it is listed and kept.
+  - An active record whose branch was deleted by hand is listed and, with `--yes`, forgotten with its temp folders. Its worktree, if any, is left alone.
+  - Neither goes while another active branch is built on it. Any other branch with no merge record is refused, as before.
 - **`approve`, `merge`, `promote`.** See [MERGE.md](MERGE.md).
 - **`status`.** See [STATUS.md](STATUS.md).
 - **`hook stop`.** See [HOOKS.md](HOOKS.md).

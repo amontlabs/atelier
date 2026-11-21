@@ -29,6 +29,7 @@
    - Anything else goes through `atelier merge`, however small.
 5. A test `atelier status` lists as flaky is a fix item, with its failing output, before anything else.
 6. Clean right after every green merge, before starting new items: `atelier clean`, read the plan, then `atelier clean --yes`.
+6b. Work that is never merged (a trial, a probe) starts with `atelier start <branch> --throwaway --path <worktree>`; when it is done, `atelier clean <branch>`, read the plan, then `atelier clean <branch> --yes`.
 7. Done when everything is merged{{#single_platform}} and{{/single_platform}}{{#multi_platform}},{{/multi_platform}} no promotion is pending{{#multi_platform}}, and every platform passed on `main` or the owner waived it{{/multi_platform}}.
 
 Agents: pick by role from `atelier agents`. Effort: low for lookups and mechanical edits, medium for an ordinary item, high for cross-crate, concurrency, migration or security work and for reviews of risky diffs. Never name models, retries or CI in a task. Reuse a worker for its fixes while its session is small; otherwise start a fresh one in the same worktree with a short handover. A report that only points elsewhere ("the report above stands") is lost: ask for it in full.

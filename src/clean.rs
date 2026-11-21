@@ -5,7 +5,17 @@
 //! nothing is trusted that is not re-read from the disk now. The facts that grant authority are
 //! the branch's record (state `merged`) and its [`MergeFacts`]: the commit that was merged and
 //! the one worktree `approve` recorded, by canonical path and file-system identity. A branch
-//! whose record is missing, active, or without those facts is never touched.
+//! whose record is missing, active, or without those facts is never touched, with two
+//! exceptions:
+//!
+//! - a throwaway (`start --throwaway`), only when it is named: its record's `throwaway` table
+//!   names the one worktree `clean` may delete, by canonical path and identity, and the branch is
+//!   deleted at its tip as read now. The same steps and checks run as for a merged branch, and
+//!   the commits only it holds are counted in the plan. Unnamed, it is listed and never deleted;
+//! - an active record whose branch is gone (deleted by hand): with nothing else using it, it is
+//!   forgotten, with its registered temp folders. Its worktree, if any, is left alone.
+//!
+//! Neither is cleaned while another active branch is built on it.
 //!
 //! The plan checks every condition of every step below before anything is deleted for the
 //! branch, so a refusal (4) changes nothing. Without `--yes` it is printed. With it, the steps run
@@ -56,7 +66,7 @@ use crate::git::{self, Checkout, canonical};
 use crate::locks::{HeldLock, LockKey};
 use crate::names;
 use crate::preflight::Context;
-use crate::records::{BranchRecord, BranchState, MergeFacts, TmpEntry};
+use crate::records::{BranchRecord, BranchState, MergeFacts, Throwaway, TmpEntry};
 use crate::refs;
 use crate::stack::Stack;
 
@@ -174,6 +184,17 @@ struct Plan {
     discarded: Vec<Lost>,
     tmps: Vec<Tmp>,
     mbx: bool,
+    /// For a throwaway: the commits only its branch holds, deleted with it.
+    own: Option<usize>,
+}
+
+/// Why `clean` may delete a branch.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Grant {
+    /// Its record is `merged`, with the merge facts.
+    Merged,
+    /// It was started as a throwaway and is named on the command line.
+    Throwaway,
 }
 
 pub fn run(ctx: &Context, branches: &[String], yes: bool, discard: &[String]) -> Result<Exit> {
@@ -192,13 +213,24 @@ pub fn run(ctx: &Context, branches: &[String], yes: bool, discard: &[String]) ->
         uid: unsafe { libc::geteuid() },
     };
 
+    let named = !branches.is_empty();
     let targets: Vec<String> = if branches.is_empty() {
-        cx.stack
-            .all_records()?
-            .into_iter()
-            .filter(|r| r.state == BranchState::Merged)
-            .map(|r| r.name)
-            .collect()
+        // Merged records, throwaways (only listed) and active records whose branch is gone.
+        let mut t = Vec::new();
+        for r in cx.stack.all_records()? {
+            let take = match r.state {
+                BranchState::Merged => true,
+                BranchState::Cleaned => false,
+                BranchState::Active => {
+                    r.starting.is_none()
+                        && (Throwaway::marks(&r) || cx.stack.tip(&r.name)?.is_none())
+                }
+            };
+            if take {
+                t.push(r.name);
+            }
+        }
+        t
     } else {
         let mut seen: Vec<String> = Vec::new();
         for b in branches {
@@ -236,7 +268,7 @@ pub fn run(ctx: &Context, branches: &[String], yes: bool, discard: &[String]) ->
     let mut used: Vec<String> = Vec::new();
     for branch in &targets {
         println!("{branch}");
-        match process(&cx, branch, yes, &discards, &mut used) {
+        match process(&cx, branch, named, yes, &discards, &mut used) {
             Outcome::Done => {}
             Outcome::Refused(reasons) => {
                 refused += 1;
@@ -284,7 +316,7 @@ pub fn run(ctx: &Context, branches: &[String], yes: bool, discard: &[String]) ->
     }
     if failed > 0 {
         return Err(Failure::fail(format!(
-            "clean: {failed} branch(es) not finished (the record stays merged; run clean again){}",
+            "clean: {failed} branch(es) not finished (the record stays as it was; run clean again){}",
             if refused > 0 {
                 format!(", {refused} refused")
             } else {
@@ -309,6 +341,7 @@ enum Outcome {
 fn process(
     cx: &Cx,
     branch: &str,
+    named: bool,
     yes: bool,
     discards: &[String],
     used: &mut Vec<String>,
@@ -327,11 +360,27 @@ fn process(
         }
         Err(f) => return Outcome::Refused(vec![f.message]),
     };
-    match rec.state {
+    let grant = match rec.state {
         BranchState::Active => {
-            return Outcome::Refused(vec![format!(
-                "{branch} is not merged (no merge record): it is not touched"
-            )]);
+            let tip = match cx.stack.tip(branch) {
+                Ok(t) => t,
+                Err(f) => return Outcome::Refused(vec![f.message]),
+            };
+            if rec.starting.is_none() && tip.is_none() {
+                return forget_gone(cx, &rec, yes);
+            }
+            if !Throwaway::marks(&rec) {
+                return Outcome::Refused(vec![format!(
+                    "{branch} is not merged (no merge record): it is not touched"
+                )]);
+            }
+            if !named {
+                println!(
+                    "  throwaway: deleted only when named (atelier clean {branch} --yes deletes it and its worktree)"
+                );
+                return Outcome::Done;
+            }
+            Grant::Throwaway
         }
         BranchState::Cleaned => {
             println!("  already cleaned");
@@ -340,27 +389,39 @@ fn process(
             }
             return Outcome::Done;
         }
-        BranchState::Merged => {}
-    }
+        BranchState::Merged => Grant::Merged,
+    };
     if rec.starting.is_some() {
         return Outcome::Refused(vec![format!(
             "{branch}: its start did not finish: run atelier start {branch} again"
         )]);
     }
-    let facts = match MergeFacts::read(&rec) {
-        Ok(Some(f)) => f,
-        Ok(None) => {
-            return Outcome::Refused(vec![format!(
-                "{branch} is marked merged but has no merge facts (the merged commit and the worktree approve recorded): it is not touched"
-            )]);
-        }
-        Err(f) => return Outcome::Refused(vec![f.message]),
+    let facts = match grant {
+        Grant::Merged => match MergeFacts::read(&rec) {
+            Ok(Some(f)) => f,
+            Ok(None) => {
+                return Outcome::Refused(vec![format!(
+                    "{branch} is marked merged but has no merge facts (the merged commit and the worktree approve recorded): it is not touched"
+                )]);
+            }
+            Err(f) => return Outcome::Refused(vec![f.message]),
+        },
+        Grant::Throwaway => match throwaway_facts(cx, &rec) {
+            Ok(f) => f,
+            Err(why) => return Outcome::Refused(vec![why]),
+        },
     };
 
-    let plan = match plan(cx, &rec, &facts, discards) {
+    let mut plan = match plan(cx, &rec, &facts, discards) {
         Ok(p) => p,
         Err(reasons) => return Outcome::Refused(reasons),
     };
+    if grant == Grant::Throwaway && matches!(plan.br, Br::Delete) {
+        match own_commits(cx, &rec, &facts.commit) {
+            Ok(n) => plan.own = Some(n),
+            Err(why) => return Outcome::Refused(vec![why]),
+        }
+    }
     used.extend(plan.discarded.iter().map(|l| l.commit.clone()));
     // A `check` in the worktree holds its run lock: wait for none, refuse.
     let wt_lock = match &plan.wt {
@@ -378,12 +439,12 @@ fn process(
     };
 
     if !yes {
-        for line in describe(&plan, &rec, &facts) {
+        for line in describe(&plan, &rec, &facts, grant) {
             println!("  would {line}");
         }
         return Outcome::Done;
     }
-    match execute(cx, &rec, &facts, &plan, discards) {
+    match execute(cx, &rec, &facts, &plan, discards, grant) {
         Ok(()) => {
             drop(wt_lock);
             Outcome::Done
@@ -392,20 +453,168 @@ fn process(
     }
 }
 
-fn describe(plan: &Plan, rec: &BranchRecord, facts: &MergeFacts) -> Vec<String> {
-    let mut lines = Vec::new();
-    let p = facts.worktree.display();
-    for t in &plan.tmps {
-        match t {
-            Tmp::Remove { entry, .. } => {
-                lines.push(format!("remove temp folder {}", entry.path.display()))
-            }
-            Tmp::Forget { file, why } => lines.push(format!(
-                "forget registered temp folder {} ({why})",
-                file.display()
+/// The facts a throwaway is deleted by: the worktree its start recorded and the branch's tip as
+/// it is now. Refuses one that another active branch is built on, and one whose worktree identity
+/// was never recorded.
+fn throwaway_facts(cx: &Cx, rec: &BranchRecord) -> Check<MergeFacts> {
+    let branch = &rec.name;
+    let deps = cx
+        .stack
+        .dependents(branch, &rec.lifetime)
+        .map_err(|f| f.message)?;
+    if !deps.is_empty() {
+        return Err(format!(
+            "{} {} built on {branch}: it is kept while they are",
+            deps.join(", "),
+            if deps.len() == 1 { "is" } else { "are" }
+        ));
+    }
+    let t = Throwaway::read(rec)
+        .map_err(|f| f.message)?
+        .ok_or_else(|| format!("{branch} is not a throwaway"))?;
+    let tip = cx
+        .stack
+        .tip(branch)
+        .map_err(|f| f.message)?
+        .ok_or_else(|| format!("{branch} does not exist"))?;
+    t.facts(&tip).ok_or_else(|| {
+        format!(
+            "{branch}: its record does not name the identity of {}: it is not touched",
+            t.worktree.display()
+        )
+    })
+}
+
+/// How many commits only `tip` holds: reached by no other branch, tag or remote branch. The
+/// worktrees' `HEAD`s are not counted as holding them: the throwaway's own goes with it.
+fn own_commits(cx: &Cx, rec: &BranchRecord, tip: &str) -> Check<usize> {
+    // For --branches, git matches the pattern against the name without refs/heads/; a branch
+    // name has no glob character. The pattern applies to --branches only.
+    let exclude = format!("--exclude={}", rec.name);
+    let out = git::output(
+        cx.dir(),
+        [
+            "rev-list",
+            "--count",
+            tip,
+            "--not",
+            &exclude,
+            "--branches",
+            "--tags",
+            "--remotes",
+        ],
+    )
+    .map_err(|f| f.message)?;
+    if !out.status.success() {
+        return Err(format!(
+            "git rev-list: {}",
+            String::from_utf8_lossy(&out.stderr).trim()
+        ));
+    }
+    String::from_utf8_lossy(&out.stdout)
+        .trim()
+        .parse()
+        .map_err(|e| format!("git rev-list --count: {e}"))
+}
+
+/// An active record whose branch is gone, deleted by hand: the plan to forget it, or with `yes`
+/// forgetting it, with its registered temp folders. Refused while the branch is still in use
+/// (a rebase or bisect of it open, a worktree on its name) or another active branch is built on
+/// it. The caller holds the branch's lock.
+fn forget_gone(cx: &Cx, rec: &BranchRecord, yes: bool) -> Outcome {
+    let branch = &rec.name;
+    let mut reasons = Vec::new();
+    for open in [
+        cx.stack.rebase_open(branch).map(|o| ("a rebase", o)),
+        cx.stack.bisect_open(branch).map(|o| ("a bisect", o)),
+    ] {
+        match open {
+            Ok((what, Some(wt))) => reasons.push(format!(
+                "{branch} has {what} open in {}: finish it first",
+                wt.display()
             )),
+            Ok(_) => {}
+            Err(f) => reasons.push(f.message),
         }
     }
+    match cx.stack.dependents(branch, &rec.lifetime) {
+        Ok(deps) if !deps.is_empty() => reasons.push(format!(
+            "{} {} built on {branch}: its record is kept while they are",
+            deps.join(", "),
+            if deps.len() == 1 { "is" } else { "are" }
+        )),
+        Ok(_) => {}
+        Err(f) => reasons.push(f.message),
+    }
+    let refname = names::branch_ref(branch);
+    match worktree_list(cx.dir()) {
+        Ok(list) => {
+            for w in list
+                .iter()
+                .filter(|w| w.branch.as_deref() == Some(refname.as_str()))
+            {
+                reasons.push(format!(
+                    "{} is on {branch}, whose ref is gone: switch it to another branch first",
+                    w.path.display()
+                ));
+            }
+        }
+        Err(why) => reasons.push(why),
+    }
+    let mut tmps = Vec::new();
+    match TmpEntry::list(&cx.ctx.state, &rec.lifetime) {
+        Ok(list) => {
+            for (file, entry) in list {
+                match inspect_tmp(cx, rec, &file, &entry) {
+                    Ok(t) => tmps.push(t),
+                    Err(why) => reasons.push(why),
+                }
+            }
+        }
+        Err(f) => reasons.push(f.message),
+    }
+    if !reasons.is_empty() {
+        return Outcome::Refused(reasons);
+    }
+    if !yes {
+        for line in describe_tmps(&tmps) {
+            println!("  would {line}");
+        }
+        println!("  would forget the record of {branch}: its branch is gone (deleted by hand)");
+        return Outcome::Done;
+    }
+    let done = remove_tmps(cx, rec, &tmps)
+        .and_then(|()| {
+            Throwaway::retire(&cx.ctx.state, branch, &rec.lifetime).map_err(|f| f.message)
+        })
+        .and_then(|()| {
+            cx.stack
+                .drop_if_unneeded(branch, &rec.lifetime)
+                .map_err(|f| f.message)
+        });
+    match done {
+        Ok(_) => {
+            println!("  forgot the record of {branch}: its branch is gone");
+            Outcome::Done
+        }
+        Err(why) => Outcome::Failed(why),
+    }
+}
+
+fn describe_tmps(tmps: &[Tmp]) -> Vec<String> {
+    tmps.iter()
+        .map(|t| match t {
+            Tmp::Remove { entry, .. } => format!("remove temp folder {}", entry.path.display()),
+            Tmp::Forget { file, why } => {
+                format!("forget registered temp folder {} ({why})", file.display())
+            }
+        })
+        .collect()
+}
+
+fn describe(plan: &Plan, rec: &BranchRecord, facts: &MergeFacts, grant: Grant) -> Vec<String> {
+    let mut lines = describe_tmps(&plan.tmps);
+    let p = facts.worktree.display();
     match &plan.wt {
         Wt::Ours(_) if plan.ignored.is_empty() => lines.push(format!("remove worktree {p}")),
         Wt::Ours(_) => lines.push(format!(
@@ -419,9 +628,15 @@ fn describe(plan: &Plan, rec: &BranchRecord, facts: &MergeFacts) -> Vec<String> 
     }
     if let Br::Delete = plan.br {
         lines.push(format!(
-            "delete branch {} at {}",
+            "delete branch {} at {}{}",
             rec.name,
-            &facts.commit[..12.min(facts.commit.len())]
+            &facts.commit[..12.min(facts.commit.len())],
+            match plan.own {
+                Some(n) => format!(
+                    " (a throwaway, never merged: the {n} commit(s) only it holds go with it)"
+                ),
+                None => String::new(),
+            }
         ));
         for l in &plan.discarded {
             lines.push(format!("  discarding {}", describe_lost(l)));
@@ -430,7 +645,10 @@ fn describe(plan: &Plan, rec: &BranchRecord, facts: &MergeFacts) -> Vec<String> 
     if plan.mbx {
         lines.push(format!("run mbx clean --under {p}"));
     }
-    lines.push(format!("mark {} cleaned", rec.name));
+    lines.push(match grant {
+        Grant::Merged => format!("mark {} cleaned", rec.name),
+        Grant::Throwaway => format!("forget the record of throwaway {}", rec.name),
+    });
     lines
 }
 
@@ -527,6 +745,7 @@ fn plan(
         discarded,
         tmps,
         mbx,
+        own: None,
     })
 }
 
@@ -825,39 +1044,11 @@ fn execute(
     facts: &MergeFacts,
     plan: &Plan,
     discards: &[String],
+    grant: Grant,
 ) -> std::result::Result<(), String> {
     let p = &facts.worktree;
     let branch = &rec.name;
-    for t in &plan.tmps {
-        match t {
-            Tmp::Forget { file, why } => {
-                remove_entry(file)?;
-                println!("  forgot {} ({why})", file.display());
-            }
-            Tmp::Remove { file, entry } => {
-                match inspect_tmp(cx, rec, file, entry)? {
-                    Tmp::Remove { .. } => {
-                        let (Some(parent), Some(name)) =
-                            (entry.path.parent(), entry.path.file_name())
-                        else {
-                            return Err(format!("{}: not a folder path", entry.path.display()));
-                        };
-                        dirfd::remove_tree(parent, name, (entry.dev, entry.ino))
-                            .map_err(|e| e.to_string())?;
-                        println!("  removed temp folder {}", entry.path.display());
-                        if parent.file_name().and_then(|n| n.to_str())
-                            == Some(names::key(branch).as_str())
-                        {
-                            let _ = fs::remove_dir(parent);
-                        }
-                    }
-                    Tmp::Forget { .. } => {}
-                }
-                remove_entry(file)?;
-            }
-        }
-    }
-    let _ = fs::remove_dir(cx.ctx.state.tmp_dir().join(&rec.lifetime));
+    remove_tmps(cx, rec, &plan.tmps)?;
 
     if let Wt::Ours(_) = plan.wt {
         match inspect_worktree(cx, rec, facts)? {
@@ -906,11 +1097,51 @@ fn execute(
             ),
         }
     }
-    MergeFacts::retire(&cx.ctx.state, branch, &rec.lifetime).map_err(|f| f.message)?;
+    match grant {
+        Grant::Merged => MergeFacts::retire(&cx.ctx.state, branch, &rec.lifetime),
+        Grant::Throwaway => Throwaway::retire(&cx.ctx.state, branch, &rec.lifetime),
+    }
+    .map_err(|f| f.message)?;
     cx.stack
         .drop_if_unneeded(branch, &rec.lifetime)
         .map_err(|f| f.message)?;
     println!("  {branch} is cleaned");
+    Ok(())
+}
+
+/// Removes the planned temp folders, each checked again first, and their entries.
+fn remove_tmps(cx: &Cx, rec: &BranchRecord, tmps: &[Tmp]) -> std::result::Result<(), String> {
+    let branch = &rec.name;
+    for t in tmps {
+        match t {
+            Tmp::Forget { file, why } => {
+                remove_entry(file)?;
+                println!("  forgot {} ({why})", file.display());
+            }
+            Tmp::Remove { file, entry } => {
+                match inspect_tmp(cx, rec, file, entry)? {
+                    Tmp::Remove { .. } => {
+                        let (Some(parent), Some(name)) =
+                            (entry.path.parent(), entry.path.file_name())
+                        else {
+                            return Err(format!("{}: not a folder path", entry.path.display()));
+                        };
+                        dirfd::remove_tree(parent, name, (entry.dev, entry.ino))
+                            .map_err(|e| e.to_string())?;
+                        println!("  removed temp folder {}", entry.path.display());
+                        if parent.file_name().and_then(|n| n.to_str())
+                            == Some(names::key(branch).as_str())
+                        {
+                            let _ = fs::remove_dir(parent);
+                        }
+                    }
+                    Tmp::Forget { .. } => {}
+                }
+                remove_entry(file)?;
+            }
+        }
+    }
+    let _ = fs::remove_dir(cx.ctx.state.tmp_dir().join(&rec.lifetime));
     Ok(())
 }
 

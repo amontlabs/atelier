@@ -1,5 +1,7 @@
-//! `atelier start <branch> [--on <lower>] [--path <worktree>]`: creates the branch
-//! at the tip of its lower branch and records what it is built on. `atelier start <branch>
+//! `atelier start <branch> [--on <lower>] [--path <worktree>] [--throwaway]`: creates the branch
+//! at the tip of its lower branch and records what it is built on. A throwaway is also recorded
+//! with the worktree it is checked out in: `approve` and `merge` refuse it, and `clean` deletes
+//! it when it is named. `atelier start <branch>
 //! --abandon` only undoes an earlier start of that name that did not finish.
 //!
 //! Where the branch is checked out: in a new worktree at `--path`; otherwise in the worktree
@@ -26,7 +28,7 @@ use crate::git;
 use crate::locks::{HeldLock, LockKey};
 use crate::names;
 use crate::preflight::Context;
-use crate::records::{self, BranchRecord, BranchState, Starting};
+use crate::records::{self, BranchRecord, BranchState, Starting, Throwaway};
 use crate::refs::{self, Expected};
 use crate::stack::{self, Stack};
 use crate::state::State;
@@ -38,6 +40,7 @@ pub fn run(
     on: Option<&str>,
     path: Option<&Path>,
     abandon: bool,
+    throwaway: bool,
 ) -> Result<Exit> {
     let root = &ctx.checkout.root;
     let branch = names::validate_branch(root, branch)?;
@@ -156,6 +159,9 @@ pub fn run(
         }),
         later: toml::Table::new(),
     };
+    if throwaway {
+        Throwaway::mark(&mut record, place.path())?;
+    }
     // Written atomically: on failure the old record is still there and nothing else moved.
     record.write(&ctx.state)?;
 
@@ -182,7 +188,9 @@ pub fn run(
         return Err(start.undo(&record, old.as_ref(), true, e));
     }
     record.starting = None;
-    record.write(&ctx.state).map_err(|e| {
+    Throwaway::identify(&mut record, place.path())
+        .and_then(|()| record.write(&ctx.state))
+        .map_err(|e| {
         e.context(format!(
             "{branch} is checked out but its record still says the start did not finish: run atelier start {branch} again to finish it"
         ))
@@ -192,6 +200,11 @@ pub fn run(
         "start: {branch} on {lower} at {}",
         stack::short(root, &base)
     );
+    if throwaway {
+        println!(
+            "throwaway: {branch} is never merged; atelier clean {branch} --yes deletes it and its worktree"
+        );
+    }
     if let Place::NewWorktree(p) = &place {
         println!("worktree: {}", git::canonical(p).display());
     }
@@ -243,6 +256,7 @@ impl Start<'_> {
             {
                 let mut done = rec.clone();
                 done.starting = None;
+                Throwaway::identify(&mut done, recorded)?;
                 done.write(self.state)?;
                 println!(
                     "start: finished the interrupted start of {branch} on {} at {}",

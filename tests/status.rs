@@ -255,6 +255,8 @@ fn a_fresh_project_reports_every_section_and_exits_0() {
         "machines",
         "must follow",
         "worktrees with no merge record",
+        "throwaway branches",
+        "records whose branch is gone",
         "flaky tests",
         "conflict forecast",
     ] {
@@ -487,6 +489,53 @@ fn a_dependent_behind_a_rewritten_lower_branch_must_follow() {
         follow.contains("fresh: its start did not finish"),
         "{follow}"
     );
+}
+
+#[test]
+fn throwaways_and_records_whose_branch_is_gone_have_their_own_sections() {
+    let p = Proj::new();
+    let wt = p.wt("try");
+    let out = p.run(&[
+        "start",
+        "try",
+        "--throwaway",
+        "--path",
+        wt.to_str().unwrap(),
+    ]);
+    assert_eq!(code(&out), 0, "{}", stderr(&out));
+    // A throwaway behind a rewrite of main would otherwise have to follow.
+    git(
+        p.main(),
+        &["commit", "-q", "--amend", "-m", "pin, rewritten"],
+    );
+    let gone = p.start("trial/gone", None);
+    git(
+        p.main(),
+        &["worktree", "remove", "--force", gone.to_str().unwrap()],
+    );
+    git(p.main(), &["branch", "-D", "trial/gone"]);
+
+    let text = p.status();
+    let throwaways = section(&text, "throwaway branches").join("\n");
+    assert!(
+        throwaways.contains(&format!(
+            "try at {} in {}: never merged; atelier clean try --yes deletes it",
+            atelier::stack::short(p.main(), &git(p.main(), &["rev-parse", "try"])),
+            fs::canonicalize(&wt).unwrap().display()
+        )),
+        "{throwaways}"
+    );
+    assert_eq!(
+        section(&text, "records whose branch is gone"),
+        ["trial/gone: its branch was deleted by hand: atelier clean --yes forgets the record"]
+    );
+    let follow = section(&text, "must follow").join("\n");
+    assert!(
+        !follow.contains("try") && !follow.contains("trial/gone"),
+        "{follow}"
+    );
+    let worktrees = section(&text, "worktrees with no merge record").join("\n");
+    assert!(!worktrees.contains("wt-try"), "{worktrees}");
 }
 
 #[test]

@@ -19,7 +19,7 @@ use crate::platform::Platform;
 use crate::preflight::{self, Context, Report};
 use crate::procs;
 use crate::promote::{self, Facts};
-use crate::records::{BranchState, MergeFacts};
+use crate::records::{BranchRecord, BranchState, MergeFacts, Throwaway};
 use crate::runs::{self, Outcome, RunInfo, RunKind, RunResult};
 use crate::stack::{Currency, Settlement, Stack, short};
 use crate::state::{CURRENT_FORMAT, Versioned};
@@ -301,6 +301,9 @@ fn project(ctx: &Context, pinned_here: bool) -> Vec<Section> {
         "worktrees with no merge record",
         worktrees(&ctx.checkout, &records),
     ));
+    let (throwaways, gone) = throwaway_and_gone(root, &stack, &records);
+    out.push(Section::new("throwaway branches", throwaways));
+    out.push(Section::new("records whose branch is gone", gone));
     out.push(Section::new("flaky tests", flaky(&rows)));
     out.push(forecast_section(ctx, &stack, &integration));
     out
@@ -669,9 +672,61 @@ fn platform_lines(
 }
 
 /// Branches that must `atelier follow`, and starts that did not finish.
+/// True for an active record whose start finished and whose branch no longer exists: it was
+/// deleted by hand, and `clean` forgets the record.
+fn gone(stack: &Stack, rec: &BranchRecord) -> bool {
+    rec.state == BranchState::Active
+        && rec.starting.is_none()
+        && matches!(stack.tip(&rec.name), Ok(None))
+}
+
+/// Active throwaways, with where they are checked out, and records whose branch is gone. Neither
+/// is shown under `must follow` or `worktrees with no merge record`.
+fn throwaway_and_gone(
+    root: &Path,
+    stack: &Stack,
+    records: &[BranchRecord],
+) -> (Vec<String>, Vec<String>) {
+    let (mut throwaways, mut gone_lines) = (Vec::new(), Vec::new());
+    for rec in records.iter().filter(|r| r.state == BranchState::Active) {
+        if gone(stack, rec) {
+            gone_lines.push(format!(
+                "{}: its branch was deleted by hand: atelier clean --yes forgets the record",
+                rec.name
+            ));
+        } else if Throwaway::marks(rec) {
+            let at = match stack.tip(&rec.name) {
+                Ok(Some(t)) => format!(" at {}", short(root, &t)),
+                _ => String::new(),
+            };
+            let place = match Throwaway::read(rec) {
+                Ok(Some(t)) => format!(" in {}", t.worktree.display()),
+                Ok(None) => String::new(),
+                Err(e) => format!(" (record unreadable: {})", e.message),
+            };
+            let unfinished = if rec.starting.is_some() {
+                format!(
+                    "; its start did not finish: run atelier start {} again",
+                    rec.name
+                )
+            } else {
+                String::new()
+            };
+            throwaways.push(format!(
+                "{}{at}{place}: never merged; atelier clean {} --yes deletes it{unfinished}",
+                rec.name, rec.name
+            ));
+        }
+    }
+    (throwaways, gone_lines)
+}
+
 fn follow_lines(stack: &Stack, records: &[crate::records::BranchRecord]) -> Vec<String> {
     let mut out = Vec::new();
-    for rec in records.iter().filter(|r| r.state == BranchState::Active) {
+    for rec in records
+        .iter()
+        .filter(|r| r.state == BranchState::Active && !Throwaway::marks(r) && !gone(stack, r))
+    {
         if rec.starting.is_some() {
             out.push(format!(
                 "{}: its start did not finish: run atelier start {} again",
@@ -720,6 +775,9 @@ fn worktrees(checkout: &Checkout, records: &[crate::records::BranchRecord]) -> R
         let rec = branch
             .as_ref()
             .and_then(|b| records.iter().find(|r| &r.name == b));
+        if rec.is_some_and(|r| r.state == BranchState::Active && Throwaway::marks(r)) {
+            continue;
+        }
         let facts = rec
             .filter(|r| r.state == BranchState::Merged)
             .and_then(|r| MergeFacts::read(r).ok().flatten());
