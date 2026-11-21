@@ -292,7 +292,14 @@ fn status_changes_nothing_and_a_usage_error_exits_2() {
     let before = git_dir_snapshot(p.main());
     let objects = object_count(p.main());
     let second = p.status();
-    assert_eq!(first, second);
+    // The free-disk line moves with whatever else writes to the disk meanwhile.
+    let steady = |t: &str| {
+        t.lines()
+            .filter(|l| !l.starts_with("ok     disk: "))
+            .collect::<Vec<_>>()
+            .join("\n")
+    };
+    assert_eq!(steady(&first), steady(&second));
     let after = git_dir_snapshot(p.main());
     let changed: Vec<_> = after.iter().filter(|e| !before.contains(e)).collect();
     assert!(changed.is_empty(), "changed under .git: {changed:?}");
